@@ -10,6 +10,7 @@ from typing import Any
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -31,6 +32,10 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 ENV_PATH = Path(__file__).with_name(".env")
+try:
+    DISPLAY_TIMEZONE = ZoneInfo("Europe/Stockholm")
+except ZoneInfoNotFoundError:
+    DISPLAY_TIMEZONE = timezone.utc
 
 BUDGET_OPTIONS = [
     {"key": "under_50", "label": "Under $50", "floor": 0, "ceiling": 49, "priority": "low"},
@@ -124,6 +129,67 @@ def parse_iso(value: str | None) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def format_datetime_for_user(value: str | datetime | None, *, empty: str = "Not set") -> str:
+    if isinstance(value, datetime):
+        parsed = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+        parsed = parsed.astimezone(timezone.utc)
+    else:
+        parsed = parse_iso(value)
+    if parsed is None:
+        return empty
+    return parsed.astimezone(DISPLAY_TIMEZONE).strftime("%d %b %Y, %H:%M")
+
+
+def format_duration_for_user(seconds: float | int | None) -> str:
+    if seconds is None:
+        return "Unknown"
+    value = f"{float(seconds):.1f}".rstrip("0").rstrip(".")
+    return f"{value}s"
+
+
+def display_name(user_data: dict[str, Any]) -> str:
+    parts = [
+        str(user_data.get("first_name") or "").strip(),
+        str(user_data.get("last_name") or "").strip(),
+    ]
+    full_name = " ".join(part for part in parts if part).strip()
+    if full_name:
+        return full_name
+    username = str(user_data.get("telegram_username") or "").strip()
+    if username:
+        return f"@{username}"
+    return "Unknown"
+
+
+def telegram_handle(user_data: dict[str, Any]) -> str | None:
+    username = str(user_data.get("telegram_username") or "").strip()
+    if username:
+        return f"@{username}"
+    return None
+
+
+def clean_text(value: Any, *, empty: str = "Not provided") -> str:
+    text = str(value or "").strip()
+    return text or empty
+
+
+def access_status_line(record: dict[str, Any]) -> str:
+    if record.get("status") == "approved":
+        return f"Approved until {format_datetime_for_user(record.get('expires_at'))}"
+    if record.get("status") == "expired":
+        return "Expired"
+    return "Not approved yet"
+
+
+def verification_badge(record: dict[str, Any]) -> str:
+    status = record.get("subscription_status") or "unknown"
+    if status == "active":
+        return "✅"
+    if status == "inactive":
+        return "❌"
+    return "?"
+
+
 def load_state() -> dict[str, Any]:
     state_path = get_state_path()
     if not state_path.exists():
@@ -204,15 +270,11 @@ def get_user_record(state: dict[str, Any], user_id: int) -> dict[str, Any]:
 
 
 def user_label(user_id: int, user_data: dict[str, Any]) -> str:
-    parts = [
-        str(user_data.get("first_name") or "").strip(),
-        str(user_data.get("last_name") or "").strip(),
-    ]
-    full_name = " ".join(part for part in parts if part).strip()
-    tg_username = user_data.get("telegram_username")
-    if tg_username:
-        return f"{full_name or 'Unknown'} (@{tg_username}, id={user_id})"
-    return f"{full_name or 'Unknown'} (id={user_id})"
+    name = display_name(user_data)
+    handle = telegram_handle(user_data)
+    if handle and handle != name:
+        return f"{name} ({handle})"
+    return name
 
 
 def is_access_active(record: dict[str, Any], now: datetime | None = None) -> bool:
@@ -249,7 +311,7 @@ def subscription_status_line(record: dict[str, Any]) -> str:
     expires_at = record.get("subscription_expires_at")
     if status == "active":
         if expires_at:
-            return f"✅ Verified until {expires_at}"
+            return f"✅ Verified until {format_datetime_for_user(expires_at)}"
         return "✅ Verified"
     if status == "inactive":
         return "❌ Unverified"
@@ -293,24 +355,27 @@ def build_admin_review_keyboard(user_id: int) -> InlineKeyboardMarkup:
 
 
 def format_review_card(user_id: int, record: dict[str, Any], heading: str) -> str:
+    handle = telegram_handle(record)
     lines = [
         heading,
         "",
-        f"Applicant: {user_label(user_id, record)}",
-        f"OF username: {record.get('of_username') or 'Not provided'}",
-        f"Planned first spend: {budget_line(record)}",
-        f"Queue: {priority_label(record)}",
-        f"Looking to buy: {record.get('purchase_intent') or 'Not provided'}",
+        f"Name: {display_name(record)}",
+        f"Telegram: {handle or 'Not provided'}",
+        f"User ID: {user_id}",
+        "",
+        f"OnlyFans: {clean_text(record.get('of_username'))}",
         f"Verification: {subscription_status_line(record)}",
+        f"Budget: {budget_line(record)}",
+        f"Priority: {priority_label(record)}",
+        f"Wants: {clean_text(record.get('purchase_intent'))}",
     ]
     return "\n".join(lines)
 
 
 def format_pending_line(user_id: int, record: dict[str, Any]) -> str:
     return (
-        f"{user_label(user_id, record)} | spend={budget_line(record)} | "
-        f"queue={priority_label(record)} | OF={record.get('of_username')} | "
-        f"verification={subscription_status_line(record)}"
+        f"{user_id} | {display_name(record)} | {clean_text(record.get('of_username'))} | "
+        f"{budget_line(record)} | {priority_label(record)} | {verification_badge(record)}"
     )
 
 
@@ -326,18 +391,18 @@ def get_low_priority_records(state: dict[str, Any]) -> list[tuple[int, dict[str,
 def format_low_priority_digest(state: dict[str, Any]) -> str:
     records = get_low_priority_records(state)
     if not records:
-        return "Weekly low-priority review:\n\nNo low-priority inquiries are waiting."
+        return "Weekly low-priority review\n\nNo low-priority requests are waiting."
 
     lines = [
         "Weekly low-priority review",
         "",
-        "These inquiries were not forwarded immediately because they stated an initial spend below $100.",
+        "These requests were held back because they stated an initial spend below $100.",
         "",
     ]
     for user_id, record in records[:50]:
         lines.append(
-            f"{user_id} | {user_label(user_id, record)} | spend={budget_line(record)} | "
-            f"OF={record.get('of_username')} | wants={record.get('purchase_intent') or 'Not provided'}"
+            f"{user_id} | {display_name(record)} | {clean_text(record.get('of_username'))} | "
+            f"{budget_line(record)} | {clean_text(record.get('purchase_intent'))}"
         )
     lines.append("")
     lines.append("Use /approve <user_id>, /reject <user_id>, /priority <user_id>, or /status <user_id>.")
@@ -774,21 +839,29 @@ def sync_subscribers(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def format_sync_summary(summary: dict[str, Any]) -> str:
-    message = (
-        "OnlyFans sync complete.\n\n"
-        f"Checked at: {summary['checked_at']}\n"
-        f"Active subscribers seen: {summary['active_subscribers_seen']}\n"
-        f"Matched users: {summary['matched']}\n"
-        f"Renewed access: {summary['renewed']}\n"
-        f"Expired access: {summary['expired']}\n"
-        f"Inactive claims: {summary['inactive']}\n"
-        f"Skipped inactive checks: {summary['skipped_inactive_due_to_partial_sync']}\n"
-        f"Duration: {summary['duration_seconds']}s"
-    )
+    lines = [
+        "OnlyFans sync finished",
+        "",
+        f"Checked: {format_datetime_for_user(summary.get('checked_at'))}",
+        f"Subscribers found: {summary['active_subscribers_seen']}",
+        f"Matched: {summary['matched']}",
+        f"Renewed: {summary['renewed']}",
+        f"Expired: {summary['expired']}",
+        f"Inactive: {summary['inactive']}",
+        f"Duration: {format_duration_for_user(summary.get('duration_seconds'))}",
+    ]
+    skipped = int(summary.get("skipped_inactive_due_to_partial_sync") or 0)
+    if skipped:
+        lines.append(f"Skipped inactive removals: {skipped}")
     warnings = summary.get("warnings") or []
     if warnings:
-        message += "\n\nWarnings:\n- " + "\n- ".join(str(item) for item in warnings[:5])
-    return message
+        lines.extend(
+            [
+                "",
+                "Note: OFAuth only returned a partial subscriber list, so this sync did not enforce inactive removals.",
+            ]
+        )
+    return "\n".join(lines)
 
 
 def format_expired_access_alert(summary: dict[str, Any]) -> str | None:
@@ -796,15 +869,35 @@ def format_expired_access_alert(summary: dict[str, Any]) -> str | None:
     if not expired_users:
         return None
     lines = [
-        "Access expired for these users after the OnlyFans check:",
+        "Access expired after the OnlyFans check:",
         "",
     ]
     for item in expired_users[:50]:
         lines.append(
-            f"{item['user_id']} | {item['label']} | OF={item['of_username']} | spend={item['budget']}"
+            f"{item['user_id']} | {item['label']} | {clean_text(item['of_username'])} | {item['budget']}"
         )
     lines.append("")
     lines.append("Remove these contacts or remind them to resubscribe if you want to continue.")
+    return "\n".join(lines)
+
+
+def format_status_message(user_id: int, record: dict[str, Any]) -> str:
+    lines = [
+        "Request details",
+        "",
+        f"Name: {display_name(record)}",
+        f"Telegram: {telegram_handle(record) or 'Not provided'}",
+        f"User ID: {user_id}",
+        f"Request: {str(record.get('status') or 'unknown').replace('_', ' ').title()}",
+        "",
+        f"OnlyFans: {clean_text(record.get('of_username'))}",
+        f"Verification: {subscription_status_line(record)}",
+        f"Budget: {budget_line(record)}",
+        f"Priority: {priority_label(record)}",
+        f"Wants: {clean_text(record.get('purchase_intent'))}",
+        f"Access: {access_status_line(record)}",
+        f"Last OF check: {format_datetime_for_user(record.get('last_checked_at'), empty='Not checked yet')}",
+    ]
     return "\n".join(lines)
 
 
@@ -872,7 +965,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "/renew <user_id>\n"
             "/status <user_id>\n"
             "/expiring\n"
-            "/syncsubs"
+            "/syncsubs\n"
+            "/verifyof <onlyfans_username>\n"
+            "/ofdiag"
         )
         return
 
@@ -880,7 +975,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         private_username = get_required_env("PRIVATE_TELEGRAM_USERNAME")
         save_state(state)
         await update.message.reply_text(
-            f"You are approved until {record['expires_at']}. You can contact me at {private_username}"
+            f"You’re approved. You can message me at {private_username}.\n\n"
+            f"Access ends {format_datetime_for_user(record.get('expires_at'))}."
         )
         return
 
@@ -924,16 +1020,9 @@ async def complete_application(
                 record["subscription_status"] = "active"
                 record["onlyfans_user_id"] = verification_result.get("id")
                 record["subscription_expires_at"] = verification_result.get("expired_at")
-                exact_match_note = (
-                    "✅ Exact active username match found "
-                    f"(expires {verification_result.get('expired_at') or 'unknown'})"
-                )
             else:
                 record["subscription_status"] = "inactive"
                 record["subscription_expires_at"] = None
-                exact_match_note = "❌ No exact active username match found"
-                if verification_result.get("reason"):
-                    exact_match_note += f" ({verification_result['reason']})"
 
     record["queued_at"] = to_iso(utc_now())
     if classify_low_priority(record):
@@ -993,7 +1082,8 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         private_username = get_required_env("PRIVATE_TELEGRAM_USERNAME")
         save_state(state)
         await update.message.reply_text(
-            f"You are approved until {record['expires_at']}. You can contact me at {private_username}"
+            f"You’re approved. You can message me at {private_username}.\n\n"
+            f"Access ends {format_datetime_for_user(record.get('expires_at'))}."
         )
         return
 
@@ -1094,9 +1184,8 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await context.bot.send_message(
             chat_id=user_id,
             text=(
-                "Approved. You can contact me here: "
-                f"{private_username}\n\n"
-                f"Access is valid until {record['expires_at']}."
+                f"Approved. You can message me at {private_username}.\n\n"
+                f"Access ends {format_datetime_for_user(record.get('expires_at'))}."
             ),
         )
         await query.edit_message_text(format_review_card(user_id, record, "Approved"))
@@ -1189,11 +1278,11 @@ async def expiring(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         expires_at = parse_iso(record.get("expires_at"))
         if record.get("status") == "approved" and expires_at and expires_at <= soon:
             items.append(
-                f"{user_label(int(user_id_text), record)} | expires={record.get('expires_at')} | spend={budget_line(record)} | OF={record.get('of_username')}"
+                f"{int(user_id_text)} | {display_name(record)} | expires {format_datetime_for_user(record.get('expires_at'))} | {budget_line(record)} | {clean_text(record.get('of_username'))}"
             )
         elif record.get("status") == "expired":
             items.append(
-                f"{user_label(int(user_id_text), record)} | expired | spend={budget_line(record)} | OF={record.get('of_username')}"
+                f"{int(user_id_text)} | {display_name(record)} | expired | {budget_line(record)} | {clean_text(record.get('of_username'))}"
             )
 
     if not items:
@@ -1257,6 +1346,7 @@ async def verifyof(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     claimed_username = normalize_of_username(context.args[0])
+    show_debug = len(context.args) > 1 and normalize_username(context.args[1]) in {"debug", "verbose"}
     if not claimed_username:
         await update.message.reply_text("Usage: /verifyof <onlyfans_username>")
         return
@@ -1274,10 +1364,16 @@ async def verifyof(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "✅ Verified",
             "",
             f"OF username: {verification_result.get('username') or claimed_username}",
-            f"OnlyFans user id: {verification_result.get('id')}",
-            f"Subscription expires: {verification_result.get('expired_at') or 'Unknown'}",
-            f"Source: {verification_result.get('source')}",
+            f"Subscription: active until {format_datetime_for_user(verification_result.get('expired_at'), empty='an unknown date')}",
         ]
+        if show_debug:
+            lines.extend(
+                [
+                    "",
+                    f"OnlyFans user id: {verification_result.get('id')}",
+                    f"Source: {verification_result.get('source')}",
+                ]
+            )
         await update.message.reply_text("\n".join(lines))
         return
 
@@ -1285,12 +1381,12 @@ async def verifyof(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "❌ Unverified",
         "",
         f"OF username: {verification_result.get('username') or claimed_username}",
-        f"Source: {verification_result.get('source')}",
+        "No active subscription found.",
     ]
-    if verification_result.get("reason"):
-        lines.append(f"Reason: {verification_result['reason']}")
-    else:
-        lines.append("No exact active subscriber match was found.")
+    if show_debug:
+        lines.append(f"Source: {verification_result.get('source')}")
+        if verification_result.get("reason"):
+            lines.append(f"Reason: {verification_result['reason']}")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -1362,18 +1458,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     user_id = int(context.args[0])
     record = get_user_record(state, user_id)
-    await update.message.reply_text(
-        f"{user_label(user_id, record)}\n"
-        f"Status: {record.get('status')}\n"
-        f"OF username: {record.get('of_username')}\n"
-        f"Planned first spend: {budget_line(record)}\n"
-        f"Queue: {priority_label(record)}\n"
-        f"Looking to buy: {record.get('purchase_intent')}\n"
-        f"Access until: {record.get('expires_at')}\n"
-        f"Last checked: {record.get('last_checked_at')}\n"
-        f"Verification: {subscription_status_line(record)}\n"
-        f"OnlyFans user id: {record.get('onlyfans_user_id')}"
-    )
+    await update.message.reply_text(format_status_message(user_id, record))
 
 
 async def approve_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1442,7 +1527,9 @@ async def renew_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     record = get_user_record(state, user_id)
     grant_access(record)
     save_state(state)
-    await update.message.reply_text(f"Renewed through {record['expires_at']}.")
+    await update.message.reply_text(
+        f"Renewed. Access now ends {format_datetime_for_user(record.get('expires_at'))}."
+    )
 
 
 async def manual_decision(
@@ -1476,12 +1563,11 @@ async def manual_decision(
         await context.bot.send_message(
             chat_id=user_id,
             text=(
-                "Approved. You can contact me here: "
-                f"{private_username}\n\n"
-                f"Access is valid until {record['expires_at']}."
+                f"Approved. You can message me at {private_username}.\n\n"
+                f"Access ends {format_datetime_for_user(record.get('expires_at'))}."
             ),
         )
-        await update.message.reply_text("Approved.")
+        await update.message.reply_text("Approved and sent.")
         return
 
     record["status"] = "rejected"
