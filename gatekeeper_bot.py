@@ -102,6 +102,17 @@ def get_ofauth_page_size() -> int:
     return int(os.getenv("OFAUTH_PAGE_SIZE", "10"))
 
 
+def get_relay_group_id() -> int | None:
+    value = get_optional_env("RELAY_ADMIN_GROUP_ID")
+    if not value:
+        return None
+    return int(value)
+
+
+def relay_is_configured() -> bool:
+    return get_relay_group_id() is not None
+
+
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -226,12 +237,16 @@ def count_line(count: int, singular: str, plural: str | None = None) -> str:
 def load_state() -> dict[str, Any]:
     state_path = get_state_path()
     if not state_path.exists():
-        return {"admin_chat_id": None, "users": {}}
+        return {"admin_chat_id": None, "users": {}, "relay_topics": {}}
     try:
-        return json.loads(state_path.read_text(encoding="utf-8"))
+        state = json.loads(state_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         LOGGER.warning("State file was invalid JSON, starting fresh.")
-        return {"admin_chat_id": None, "users": {}}
+        return {"admin_chat_id": None, "users": {}, "relay_topics": {}}
+    state.setdefault("admin_chat_id", None)
+    state.setdefault("users", {})
+    state.setdefault("relay_topics", {})
+    return state
 
 
 def save_state(state: dict[str, Any]) -> None:
@@ -291,15 +306,105 @@ def default_user_record() -> dict[str, Any]:
         "review_priority": "normal",
         "purchase_intent": None,
         "queued_at": None,
+        "contact_mode": None,
+        "relay_topic_id": None,
+        "relay_topic_name": None,
+        "relay_enabled_at": None,
+        "relay_closed_at": None,
+        "direct_shared_at": None,
+        "identity_proof_requested_at": None,
+        "identity_proof_sent_at": None,
     }
 
 
 def get_user_record(state: dict[str, Any], user_id: int) -> dict[str, Any]:
     users = state.setdefault("users", {})
+    state.setdefault("relay_topics", {})
     record = users.setdefault(str(user_id), default_user_record())
     for key, value in default_user_record().items():
         record.setdefault(key, value)
     return record
+
+
+def get_relay_topics(state: dict[str, Any]) -> dict[str, Any]:
+    return state.setdefault("relay_topics", {})
+
+
+def set_contact_mode(record: dict[str, Any], mode: str, *, now: datetime | None = None) -> None:
+    current_time = now or utc_now()
+    previous_mode = record.get("contact_mode")
+    record["contact_mode"] = mode
+    if mode == "relay":
+        record["relay_enabled_at"] = to_iso(current_time)
+    elif mode == "direct":
+        record["direct_shared_at"] = to_iso(current_time)
+        if previous_mode == "relay":
+            record["relay_closed_at"] = to_iso(current_time)
+
+
+def relay_mode_enabled(record: dict[str, Any]) -> bool:
+    return (
+        record.get("status") == "approved"
+        and record.get("contact_mode") == "relay"
+        and record.get("relay_topic_id") is not None
+    )
+
+
+def contact_mode_label(record: dict[str, Any]) -> str:
+    mode = str(record.get("contact_mode") or "").strip().lower()
+    if mode == "relay":
+        return "Relay"
+    if mode == "direct" or (not mode and record.get("status") == "approved"):
+        return "Direct"
+    return "Not set"
+
+
+def truncate_text(value: str, limit: int) -> str:
+    text = value.strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(limit - 1, 1)].rstrip() + "…"
+
+
+def build_relay_topic_name(record: dict[str, Any]) -> str:
+    parts = [display_name(record)]
+    of_username = clean_text(record.get("of_username"), empty="").strip()
+    if of_username:
+        parts.append(of_username)
+    topic_name = " | ".join(part for part in parts if part)
+    return truncate_text(topic_name or "Buyer relay", 120)
+
+
+def relay_intro_text(user_id: int, record: dict[str, Any]) -> str:
+    lines = [
+        "Relay opened",
+        format_person_label(record),
+        f"ID: {user_id}",
+        f"OF: {clean_text(record.get('of_username'))}",
+        verification_summary(record),
+        f"Budget: {budget_line(record)}",
+        f"Wants: {clean_text(record.get('purchase_intent'))}",
+        "",
+        "Reply in this topic to message this buyer.",
+        "Messages starting with // stay in this topic only.",
+    ]
+    return "\n".join(lines)
+
+
+def relay_access_message(record: dict[str, Any]) -> str:
+    return (
+        "You’re approved.\n\n"
+        "I reply personally here through this bot to keep access private and organized.\n"
+        "If you want identity confirmation first, just ask and I’ll send a short hello video saying your name.\n\n"
+        f"Access ends {format_date_for_user(record.get('expires_at'))}."
+    )
+
+
+def direct_access_message(private_username: str, record: dict[str, Any]) -> str:
+    return (
+        f"Approved. You can message me at {private_username}.\n\n"
+        f"Access ends {format_date_for_user(record.get('expires_at'))}."
+    )
 
 
 def user_label(user_id: int, user_data: dict[str, Any]) -> str:
@@ -364,11 +469,14 @@ def build_admin_review_keyboard(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("Approve", callback_data=f"a:{user_id}"),
-                InlineKeyboardButton("Reject", callback_data=f"r:{user_id}"),
+                InlineKeyboardButton("Approve Relay", callback_data=f"ar:{user_id}"),
+                InlineKeyboardButton("Approve Direct", callback_data=f"ad:{user_id}"),
             ],
             [
+                InlineKeyboardButton("Reject", callback_data=f"r:{user_id}"),
                 InlineKeyboardButton("Priority", callback_data=f"p:{user_id}"),
+            ],
+            [
                 InlineKeyboardButton("Low Priority", callback_data=f"l:{user_id}"),
             ],
         ]
@@ -385,6 +493,8 @@ def format_review_card(user_id: int, record: dict[str, Any], heading: str) -> st
         f"Budget: {budget_line(record)}",
         f"Wants: {clean_text(record.get('purchase_intent'))}",
     ]
+    if record.get("contact_mode"):
+        lines.append(f"Contact: {contact_mode_label(record)}")
     if record.get("review_priority") != "normal":
         lines.append(f"Queue: {priority_label(record)}")
     return "\n".join(lines)
@@ -424,7 +534,9 @@ def format_low_priority_digest(state: dict[str, Any]) -> str:
         lines.append(
             f"{user_id} | {display_name(record)} | {clean_text(record.get('of_username'))} | {budget_line(record)}"
         )
-    lines.append("Use /approve <user_id>, /reject <user_id>, /priority <user_id>, or /status <user_id>.")
+    lines.append(
+        "Use /approve <user_id>, /approverelay <user_id>, /reject <user_id>, /priority <user_id>, or /status <user_id>."
+    )
     return "\n".join(lines)
 
 
@@ -907,6 +1019,7 @@ def format_status_message(user_id: int, record: dict[str, Any]) -> str:
     lines = [
         format_person_label(record),
         f"Status: {str(record.get('status') or 'unknown').replace('_', ' ').title()}",
+        f"Contact: {contact_mode_label(record)}",
         f"OF: {clean_text(record.get('of_username'))}",
         verification_summary(record),
         f"Budget: {budget_line(record)}",
@@ -946,6 +1059,162 @@ def begin_application(record: dict[str, Any]) -> None:
     record["queued_at"] = None
 
 
+async def ensure_relay_topic(
+    bot: Any,
+    state: dict[str, Any],
+    user_id: int,
+    record: dict[str, Any],
+) -> tuple[int, str]:
+    relay_group_id = get_relay_group_id()
+    if relay_group_id is None:
+        raise RuntimeError("Relay mode is not configured. Set RELAY_ADMIN_GROUP_ID first.")
+
+    existing_topic_id = record.get("relay_topic_id")
+    existing_topic_name = str(record.get("relay_topic_name") or "").strip()
+    if isinstance(existing_topic_id, int):
+        get_relay_topics(state)[str(existing_topic_id)] = user_id
+        return existing_topic_id, existing_topic_name or build_relay_topic_name(record)
+
+    topic_name = build_relay_topic_name(record)
+    topic = await bot.create_forum_topic(chat_id=relay_group_id, name=topic_name)
+    topic_id = int(topic.message_thread_id)
+    record["relay_topic_id"] = topic_id
+    record["relay_topic_name"] = topic_name
+    get_relay_topics(state)[str(topic_id)] = user_id
+    await bot.send_message(
+        chat_id=relay_group_id,
+        message_thread_id=topic_id,
+        text=relay_intro_text(user_id, record),
+    )
+    return topic_id, topic_name
+
+
+async def send_direct_contact(
+    bot: Any,
+    user_id: int,
+    record: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> None:
+    current_time = now or utc_now()
+    private_username = get_required_env("PRIVATE_TELEGRAM_USERNAME")
+    set_contact_mode(record, "direct", now=current_time)
+    await bot.send_message(chat_id=user_id, text=direct_access_message(private_username, record))
+
+
+async def send_relay_contact(
+    bot: Any,
+    state: dict[str, Any],
+    user_id: int,
+    record: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> tuple[int, str]:
+    current_time = now or utc_now()
+    topic_id, topic_name = await ensure_relay_topic(bot, state, user_id, record)
+    set_contact_mode(record, "relay", now=current_time)
+    await bot.send_message(chat_id=user_id, text=relay_access_message(record), protect_content=True)
+    return topic_id, topic_name
+
+
+def get_relay_user_id(state: dict[str, Any], topic_id: int | None) -> int | None:
+    if topic_id is None:
+        return None
+    raw = get_relay_topics(state).get(str(topic_id))
+    if raw is None:
+        return None
+    return int(raw)
+
+
+def is_internal_topic_note(message: Any) -> bool:
+    text = str(message.text or message.caption or "").strip()
+    return text.startswith("//")
+
+
+async def relay_buyer_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    state: dict[str, Any],
+    record: dict[str, Any],
+) -> None:
+    if not update.effective_user or not update.effective_chat or not update.message:
+        return
+
+    relay_group_id = get_relay_group_id()
+    relay_topic_id = record.get("relay_topic_id")
+    if relay_group_id is None or not isinstance(relay_topic_id, int):
+        await update.message.reply_text("Your relay chat is not ready yet. Please wait a moment.")
+        return
+    get_relay_topics(state)[str(relay_topic_id)] = update.effective_user.id
+    save_state(state)
+
+    try:
+        await context.bot.copy_message(
+            chat_id=relay_group_id,
+            from_chat_id=update.effective_chat.id,
+            message_id=update.message.message_id,
+            message_thread_id=relay_topic_id,
+        )
+    except Exception as exc:
+        LOGGER.exception("Could not relay buyer message for user %s.", update.effective_user.id)
+        save_state(state)
+        await update.message.reply_text("I couldn’t send that through just now. Please try again in a moment.")
+        admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
+        if admin_chat_id:
+            try:
+                await context.bot.send_message(
+                    chat_id=admin_chat_id,
+                    text=f"Relay send failed for {update.effective_user.id}: {exc}",
+                )
+            except Exception:
+                LOGGER.exception("Could not alert admin about buyer relay failure.")
+
+
+async def relay_admin_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_chat or not update.message or not update.effective_user:
+        return
+    relay_group_id = get_relay_group_id()
+    if relay_group_id is None or update.effective_chat.id != relay_group_id:
+        return
+    if update.effective_chat.type != "supergroup":
+        return
+    if update.effective_user.is_bot:
+        return
+    if is_internal_topic_note(update.message):
+        return
+
+    state = load_state()
+    user_id = get_relay_user_id(state, update.message.message_thread_id)
+    if user_id is None:
+        return
+
+    record = get_user_record(state, user_id)
+    mark_expired_if_needed(record)
+    if not relay_mode_enabled(record):
+        save_state(state)
+        await context.bot.send_message(
+            chat_id=relay_group_id,
+            message_thread_id=update.message.message_thread_id,
+            text="Relay is inactive for this buyer. Renew access or send them your direct handle if you want to continue.",
+        )
+        return
+
+    try:
+        await context.bot.copy_message(
+            chat_id=user_id,
+            from_chat_id=update.effective_chat.id,
+            message_id=update.message.message_id,
+            protect_content=True,
+        )
+    except Exception as exc:
+        LOGGER.exception("Could not relay admin message to user %s.", user_id)
+        await context.bot.send_message(
+            chat_id=relay_group_id,
+            message_thread_id=record.get("relay_topic_id"),
+            text=f"Delivery failed for this buyer: {exc}",
+        )
+
+
 async def ask_budget_question(message_target: Any) -> None:
     await message_target.reply_text(
         "My time is limited and I prioritize serious buyers. "
@@ -977,10 +1246,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Commands:\n"
             "/pending [all|low|normal|priority|expired]\n"
             "/approve <user_id>\n"
+            "/approverelay <user_id>\n"
             "/reject <user_id>\n"
             "/priority <user_id>\n"
             "/lowpriority <user_id>\n"
             "/renew <user_id>\n"
+            "/senddirect <user_id>\n"
             "/status <user_id>\n"
             "/expiring\n"
             "/syncsubs\n"
@@ -990,12 +1261,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if is_access_active(record):
-        private_username = get_required_env("PRIVATE_TELEGRAM_USERNAME")
         save_state(state)
-        await update.message.reply_text(
-            f"You’re approved. You can message me at {private_username}.\n\n"
-            f"Access ends {format_date_for_user(record.get('expires_at'))}."
-        )
+        if record.get("contact_mode") == "relay":
+            await update.message.reply_text(relay_access_message(record))
+        else:
+            private_username = get_required_env("PRIVATE_TELEGRAM_USERNAME")
+            await update.message.reply_text(direct_access_message(private_username, record))
         return
 
     if record.get("status") == "pending":
@@ -1088,8 +1359,8 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     admin_chat_id = resolve_admin_chat_id(state, user)
     if admin_chat_id == update.effective_chat.id:
         await update.message.reply_text(
-            "Use /pending [all|low|normal|priority|expired], /approve <user_id>, /reject <user_id>, "
-            "/priority <user_id>, /lowpriority <user_id>, /renew <user_id>, /status <user_id>, "
+            "Use /pending [all|low|normal|priority|expired], /approve <user_id>, /approverelay <user_id>, /reject <user_id>, "
+            "/priority <user_id>, /lowpriority <user_id>, /renew <user_id>, /senddirect <user_id>, /status <user_id>, "
             "/expiring, /syncsubs, /verifyof <onlyfans_username> or /ofdiag here."
         )
         state["admin_chat_id"] = admin_chat_id
@@ -1097,12 +1368,12 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     if is_access_active(record):
+        if record.get("contact_mode") == "relay":
+            await relay_buyer_message(update, context, state, record)
+            return
         private_username = get_required_env("PRIVATE_TELEGRAM_USERNAME")
         save_state(state)
-        await update.message.reply_text(
-            f"You’re approved. You can message me at {private_username}.\n\n"
-            f"Access ends {format_date_for_user(record.get('expires_at'))}."
-        )
+        await update.message.reply_text(direct_access_message(private_username, record))
         return
 
     status = record.get("status")
@@ -1195,19 +1466,37 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await query.answer("This request is no longer reviewable.", show_alert=True)
         return
 
-    if action == "a":
-        grant_access(record)
-        save_state(state)
-        private_username = get_required_env("PRIVATE_TELEGRAM_USERNAME")
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=(
-                f"Approved. You can message me at {private_username}.\n\n"
-                f"Access ends {format_date_for_user(record.get('expires_at'))}."
-            ),
-        )
-        await query.edit_message_text(format_review_card(user_id, record, "Approved"))
-        await query.answer("Approved.")
+    if action in {"a", "ad", "ar"}:
+        current_time = utc_now()
+        grant_access(record, now=current_time)
+        try:
+            if action == "ar":
+                topic_id, topic_name = await send_relay_contact(
+                    context.bot,
+                    state,
+                    user_id,
+                    record,
+                    now=current_time,
+                )
+                save_state(state)
+                await query.edit_message_text(
+                    format_review_card(user_id, record, f"Approved in relay mode\nTopic: {topic_name}")
+                )
+                await query.answer(f"Relay approved in topic {topic_id}.")
+            else:
+                await send_direct_contact(context.bot, user_id, record, now=current_time)
+                save_state(state)
+                await query.edit_message_text(format_review_card(user_id, record, "Approved direct"))
+                await query.answer("Approved direct.")
+        except Exception as exc:
+            LOGGER.exception("Approval flow failed for user %s.", user_id)
+            record["status"] = "pending"
+            save_state(state)
+            await query.answer("Approval failed.", show_alert=True)
+            await context.bot.send_message(
+                chat_id=query.message.chat.id,
+                text=f"Approval failed for {user_id}: {exc}",
+            )
         return
 
     if action == "r":
@@ -1492,11 +1781,15 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def approve_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await manual_decision(update, context, approved=True)
+    await manual_decision(update, context, approved=True, approval_mode="direct")
+
+
+async def approverelay_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await manual_decision(update, context, approved=True, approval_mode="relay")
 
 
 async def reject_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await manual_decision(update, context, approved=False)
+    await manual_decision(update, context, approved=False, approval_mode="direct")
 
 
 async def priority_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1562,8 +1855,37 @@ async def renew_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+async def senddirect_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.effective_chat or not update.message:
+        return
+    if update.effective_chat.type != "private":
+        return
+
+    state = load_state()
+    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
+    if admin_chat_id != update.effective_chat.id:
+        return
+
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: /senddirect <user_id>")
+        return
+
+    user_id = int(context.args[0])
+    record = get_user_record(state, user_id)
+    if record.get("status") != "approved":
+        await update.message.reply_text("That buyer needs to be approved first.")
+        return
+
+    await send_direct_contact(context.bot, user_id, record, now=utc_now())
+    save_state(state)
+    await update.message.reply_text("Direct handle sent.")
+
+
 async def manual_decision(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, approved: bool
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    approved: bool,
+    approval_mode: str,
 ) -> None:
     if not update.effective_user or not update.effective_chat or not update.message:
         return
@@ -1576,7 +1898,10 @@ async def manual_decision(
         return
 
     if not context.args or not context.args[0].isdigit():
-        command_name = "approve" if approved else "reject"
+        if approved and approval_mode == "relay":
+            command_name = "approverelay"
+        else:
+            command_name = "approve" if approved else "reject"
         await update.message.reply_text(f"Usage: /{command_name} <user_id>")
         return
 
@@ -1587,17 +1912,22 @@ async def manual_decision(
         return
 
     if approved:
-        grant_access(record)
-        save_state(state)
-        private_username = get_required_env("PRIVATE_TELEGRAM_USERNAME")
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=(
-                f"Approved. You can message me at {private_username}.\n\n"
-                f"Access ends {format_date_for_user(record.get('expires_at'))}."
-            ),
-        )
-        await update.message.reply_text("Approved and sent.")
+        current_time = utc_now()
+        grant_access(record, now=current_time)
+        try:
+            if approval_mode == "relay":
+                await send_relay_contact(context.bot, state, user_id, record, now=current_time)
+                save_state(state)
+                await update.message.reply_text("Approved in relay mode.")
+            else:
+                await send_direct_contact(context.bot, user_id, record, now=current_time)
+                save_state(state)
+                await update.message.reply_text("Approved and sent.")
+        except Exception as exc:
+            LOGGER.exception("Manual approval failed for user %s.", user_id)
+            record["status"] = "pending"
+            save_state(state)
+            await update.message.reply_text(f"Approval failed: {exc}")
         return
 
     record["status"] = "rejected"
@@ -1617,6 +1947,10 @@ async def non_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     state = load_state()
     record = get_user_record(state, update.effective_user.id)
+    mark_expired_if_needed(record)
+    if relay_mode_enabled(record):
+        await relay_buyer_message(update, context, state, record)
+        return
     if record.get("status") == "awaiting_of_username":
         await update.message.reply_text("Please send your OF-username as text.")
     elif record.get("status") == "awaiting_budget_range":
@@ -1635,16 +1969,22 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("pending", pending))
     app.add_handler(CommandHandler("approve", approve_manual))
+    app.add_handler(CommandHandler("approverelay", approverelay_manual))
     app.add_handler(CommandHandler("reject", reject_manual))
     app.add_handler(CommandHandler("priority", priority_manual))
     app.add_handler(CommandHandler("lowpriority", lowpriority_manual))
     app.add_handler(CommandHandler("renew", renew_manual))
+    app.add_handler(CommandHandler("senddirect", senddirect_manual))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("expiring", expiring))
     app.add_handler(CommandHandler("syncsubs", sync_subs))
     app.add_handler(CommandHandler("verifyof", verifyof))
     app.add_handler(CommandHandler("ofdiag", ofdiag))
     app.add_handler(CallbackQueryHandler(button_click))
+    app.add_handler(
+        MessageHandler(filters.ChatType.SUPERGROUP & ~filters.COMMAND, relay_admin_group_message),
+        group=-1,
+    )
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
     app.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, non_text_message))
 
