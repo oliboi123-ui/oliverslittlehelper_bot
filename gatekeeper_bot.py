@@ -32,6 +32,15 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 ENV_PATH = Path(__file__).with_name(".env")
 
+BUDGET_OPTIONS = [
+    {"key": "under_50", "label": "Under $50", "floor": 0, "ceiling": 49, "priority": "low"},
+    {"key": "50_99", "label": "$50-$99", "floor": 50, "ceiling": 99, "priority": "low"},
+    {"key": "100_199", "label": "$100-$199", "floor": 100, "ceiling": 199, "priority": "normal"},
+    {"key": "200_249", "label": "$200-$249", "floor": 200, "ceiling": 249, "priority": "priority"},
+    {"key": "250_499", "label": "$250-$499", "floor": 250, "ceiling": 499, "priority": "priority"},
+    {"key": "500_plus", "label": "$500+", "floor": 500, "ceiling": None, "priority": "priority"},
+]
+
 
 def load_dotenv_file() -> None:
     if not ENV_PATH.exists():
@@ -153,6 +162,13 @@ def normalize_of_username(value: str) -> str:
     return normalize_username(value)
 
 
+def get_budget_option(key: str | None) -> dict[str, Any] | None:
+    for option in BUDGET_OPTIONS:
+        if option["key"] == key:
+            return option
+    return None
+
+
 def default_user_record() -> dict[str, Any]:
     return {
         "status": "new",
@@ -166,6 +182,12 @@ def default_user_record() -> dict[str, Any]:
         "subscription_status": "unknown",
         "subscription_expires_at": None,
         "onlyfans_user_id": None,
+        "budget_range_key": None,
+        "budget_range_label": None,
+        "budget_floor": None,
+        "review_priority": "normal",
+        "purchase_intent": None,
+        "queued_at": None,
     }
 
 
@@ -214,12 +236,125 @@ def grant_access(record: dict[str, Any], now: datetime | None = None) -> None:
     record["expires_at"] = to_iso(current_time + timedelta(days=get_access_duration_days()))
 
 
+def budget_line(record: dict[str, Any]) -> str:
+    return str(record.get("budget_range_label") or "Not set")
+
+
 def subscription_status_line(record: dict[str, Any]) -> str:
     status = record.get("subscription_status") or "unknown"
     expires_at = record.get("subscription_expires_at")
     if expires_at:
         return f"{status} until {expires_at}"
     return status
+
+
+def priority_label(record: dict[str, Any]) -> str:
+    priority = record.get("review_priority") or "normal"
+    return priority.replace("_", " ").title()
+
+
+def classify_low_priority(record: dict[str, Any]) -> bool:
+    budget_floor = int(record.get("budget_floor") or 0)
+    return budget_floor < 100
+
+
+def build_budget_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    for start in range(0, len(BUDGET_OPTIONS), 2):
+        row = [
+            InlineKeyboardButton(option["label"], callback_data=f"budget:{option['key']}")
+            for option in BUDGET_OPTIONS[start : start + 2]
+        ]
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+
+def build_admin_review_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Approve", callback_data=f"a:{user_id}"),
+                InlineKeyboardButton("Reject", callback_data=f"r:{user_id}"),
+            ],
+            [
+                InlineKeyboardButton("Priority", callback_data=f"p:{user_id}"),
+                InlineKeyboardButton("Low Priority", callback_data=f"l:{user_id}"),
+            ],
+        ]
+    )
+
+
+def format_review_card(user_id: int, record: dict[str, Any], heading: str) -> str:
+    lines = [
+        heading,
+        "",
+        f"Applicant: {user_label(user_id, record)}",
+        f"OF username: {record.get('of_username') or 'Not provided'}",
+        f"Planned first spend: {budget_line(record)}",
+        f"Queue: {priority_label(record)}",
+        f"Looking to buy: {record.get('purchase_intent') or 'Not provided'}",
+        f"OFAuth: {subscription_status_line(record)}",
+    ]
+    return "\n".join(lines)
+
+
+def format_pending_line(user_id: int, record: dict[str, Any]) -> str:
+    return (
+        f"{user_label(user_id, record)} | spend={budget_line(record)} | "
+        f"queue={priority_label(record)} | OF={record.get('of_username')} | "
+        f"OFAuth={record.get('subscription_status')}"
+    )
+
+
+def get_low_priority_records(state: dict[str, Any]) -> list[tuple[int, dict[str, Any]]]:
+    items: list[tuple[int, dict[str, Any]]] = []
+    for user_id_text, record in state.get("users", {}).items():
+        if record.get("status") == "low_priority":
+            items.append((int(user_id_text), record))
+    items.sort(key=lambda item: item[1].get("queued_at") or "", reverse=False)
+    return items
+
+
+def format_low_priority_digest(state: dict[str, Any]) -> str:
+    records = get_low_priority_records(state)
+    if not records:
+        return "Weekly low-priority review:\n\nNo low-priority inquiries are waiting."
+
+    lines = [
+        "Weekly low-priority review",
+        "",
+        "These inquiries were not forwarded immediately because they stated an initial spend below $100.",
+        "",
+    ]
+    for user_id, record in records[:50]:
+        lines.append(
+            f"{user_id} | {user_label(user_id, record)} | spend={budget_line(record)} | "
+            f"OF={record.get('of_username')} | wants={record.get('purchase_intent') or 'Not provided'}"
+        )
+    lines.append("")
+    lines.append("Use /approve <user_id>, /reject <user_id>, /priority <user_id>, or /status <user_id>.")
+    return "\n".join(lines)
+
+
+def send_telegram_text(chat_id: int, text: str) -> None:
+    token = get_required_env("BOT_TOKEN")
+    payload = urllib_parse.urlencode(
+        {
+            "chat_id": str(chat_id),
+            "text": text,
+        }
+    ).encode("utf-8")
+    request = urllib_request.Request(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urllib_request.urlopen(request, timeout=30) as response:
+            json.loads(response.read().decode("utf-8"))
+    except urllib_error.URLError as exc:
+        raise RuntimeError(f"Could not notify Telegram chat {chat_id}: {exc.reason}") from exc
 
 
 def ofauth_is_configured() -> bool:
@@ -260,9 +395,7 @@ def ofauth_request_json(
         body = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"OFAuth request failed with {exc.code}: {body}") from exc
     except urllib_error.URLError as exc:
-        if isinstance(exc.reason, TimeoutError):
-            raise RuntimeError(f"OFAuth request timed out after {timeout:g}s.") from exc
-        if isinstance(exc.reason, socket.timeout):
+        if isinstance(exc.reason, (TimeoutError, socket.timeout)):
             raise RuntimeError(f"OFAuth request timed out after {timeout:g}s.") from exc
         raise RuntimeError(f"OFAuth request failed: {exc.reason}") from exc
     try:
@@ -359,9 +492,11 @@ def sync_subscribers(state: dict[str, Any]) -> dict[str, Any]:
         "inactive": 0,
         "matched": 0,
         "duration_seconds": 0.0,
+        "expired_users": [],
     }
 
     for user_id_text, record in state.get("users", {}).items():
+        user_id = int(user_id_text)
         mark_expired_if_needed(record, now=now)
         claimed_username = normalize_of_username(str(record.get("of_username") or ""))
         if not claimed_username:
@@ -374,7 +509,7 @@ def sync_subscribers(state: dict[str, Any]) -> dict[str, Any]:
         if subscriber is None:
             subscriber = by_username.get(claimed_username)
 
-        record["last_checked_at"] = summary["checked_at"]
+        record["last_checked_at"] = to_iso(now)
 
         if subscriber:
             summary["matched"] += 1
@@ -388,9 +523,18 @@ def sync_subscribers(state: dict[str, Any]) -> dict[str, Any]:
                     summary["renewed"] += 1
             continue
 
-        if record.get("status") == "approved":
+        was_approved = record.get("status") == "approved"
+        if was_approved:
             record["status"] = "expired"
             summary["expired"] += 1
+            summary["expired_users"].append(
+                {
+                    "user_id": user_id,
+                    "label": user_label(user_id, record),
+                    "of_username": record.get("of_username"),
+                    "budget": budget_line(record),
+                }
+            )
         record["subscription_status"] = "inactive"
         record["subscription_expires_at"] = None
         summary["inactive"] += 1
@@ -413,6 +557,23 @@ def format_sync_summary(summary: dict[str, Any]) -> str:
     )
 
 
+def format_expired_access_alert(summary: dict[str, Any]) -> str | None:
+    expired_users = summary.get("expired_users") or []
+    if not expired_users:
+        return None
+    lines = [
+        "Access expired for these users after the OnlyFans check:",
+        "",
+    ]
+    for item in expired_users[:50]:
+        lines.append(
+            f"{item['user_id']} | {item['label']} | OF={item['of_username']} | spend={item['budget']}"
+        )
+    lines.append("")
+    lines.append("Remove these contacts or remind them to resubscribe if you want to continue.")
+    return "\n".join(lines)
+
+
 def resolve_admin_chat_id(state: dict[str, Any], user: Any) -> int | None:
     env_admin_chat_id = os.getenv("ADMIN_CHAT_ID", "").strip()
     if env_admin_chat_id:
@@ -427,6 +588,25 @@ def resolve_admin_chat_id(state: dict[str, Any], user: Any) -> int | None:
     if configured_username and configured_username == current_username:
         return user.id
     return None
+
+
+def begin_application(record: dict[str, Any]) -> None:
+    record["status"] = "awaiting_of_username"
+    record["of_username"] = None
+    record["budget_range_key"] = None
+    record["budget_range_label"] = None
+    record["budget_floor"] = None
+    record["purchase_intent"] = None
+    record["review_priority"] = "normal"
+    record["queued_at"] = None
+
+
+async def ask_budget_question(message_target: Any) -> None:
+    await message_target.reply_text(
+        "My time is limited and I prioritize serious buyers. "
+        "What range are you planning to spend in our first interaction?",
+        reply_markup=build_budget_keyboard(),
+    )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -450,13 +630,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(
             "Admin chat registered. New requests will be sent here.\n\n"
             "Commands:\n"
-            "/pending - show pending requests\n"
-            "/approve <user_id> - approve manually\n"
-            "/reject <user_id> - reject manually\n"
-            "/renew <user_id> - extend access 30 days\n"
-            "/status <user_id> - show one user\n"
-            "/expiring - show access that is expiring soon\n"
-            "/syncsubs - sync active subscribers from OFAuth"
+            "/pending [all|low|normal|priority|expired]\n"
+            "/approve <user_id>\n"
+            "/reject <user_id>\n"
+            "/priority <user_id>\n"
+            "/lowpriority <user_id>\n"
+            "/renew <user_id>\n"
+            "/status <user_id>\n"
+            "/expiring\n"
+            "/syncsubs"
         )
         return
 
@@ -468,17 +650,79 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    if record.get("status") == "expired":
-        record["status"] = "awaiting_of_username"
-        save_state(state)
+    if record.get("status") == "pending":
+        await update.message.reply_text("Your request is already pending review. Please wait for a decision.")
+        return
+
+    if record.get("status") == "low_priority":
         await update.message.reply_text(
-            "Your access period has ended. Please send your OF-username again to request renewed access."
+            "Your request is in a lower-priority review queue. I check that queue weekly."
         )
         return
 
-    record["status"] = "awaiting_of_username"
+    begin_application(record)
     save_state(state)
-    await update.message.reply_text("Please state your OF-username to continue")
+    await update.message.reply_text("Please state your OF-username to continue.")
+
+
+async def complete_application(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    state: dict[str, Any],
+    record: dict[str, Any],
+) -> None:
+    user = update.effective_user
+    if user is None or update.message is None:
+        return
+
+    admin_chat_id = resolve_admin_chat_id(state, user)
+    exact_match_note = ""
+    if ofauth_is_configured():
+        try:
+            subscriber = await asyncio.to_thread(find_active_subscriber_by_username, str(record.get("of_username") or ""))
+        except Exception as exc:
+            exact_match_note = f"OFAuth check: error ({exc})"
+        else:
+            if subscriber:
+                record["subscription_status"] = "active"
+                record["onlyfans_user_id"] = subscriber.get("id")
+                record["subscription_expires_at"] = subscriber.get("expiredAt")
+                exact_match_note = (
+                    "OFAuth check: exact active username match found "
+                    f"(expires {subscriber.get('expiredAt') or 'unknown'})"
+                )
+            else:
+                record["subscription_status"] = "inactive"
+                record["subscription_expires_at"] = None
+                exact_match_note = "OFAuth check: no exact active username match found"
+
+    record["queued_at"] = to_iso(utc_now())
+    if classify_low_priority(record):
+        record["status"] = "low_priority"
+        record["review_priority"] = "low"
+        save_state(state)
+        await update.message.reply_text(
+            "Thanks. Based on your stated budget, your request has been placed in a slower review queue. "
+            "I check that queue weekly."
+        )
+        return
+
+    record["status"] = "pending"
+    save_state(state)
+    await update.message.reply_text("Thanks. Your request is pending manual review.")
+
+    if not admin_chat_id:
+        LOGGER.warning("No admin chat configured yet. Request stored but not delivered.")
+        return
+
+    admin_text = format_review_card(user.id, record, "New gatekeeper request")
+    if exact_match_note:
+        admin_text = f"{admin_text}\n{exact_match_note}"
+    await context.bot.send_message(
+        chat_id=admin_chat_id,
+        text=admin_text,
+        reply_markup=build_admin_review_keyboard(user.id),
+    )
 
 
 async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -498,7 +742,9 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     admin_chat_id = resolve_admin_chat_id(state, user)
     if admin_chat_id == update.effective_chat.id:
         await update.message.reply_text(
-            "Use /pending, /approve <user_id>, /reject <user_id>, /renew <user_id>, /status <user_id>, /expiring or /syncsubs here."
+            "Use /pending [all|low|normal|priority|expired], /approve <user_id>, /reject <user_id>, "
+            "/priority <user_id>, /lowpriority <user_id>, /renew <user_id>, /status <user_id>, "
+            "/expiring or /syncsubs here."
         )
         state["admin_chat_id"] = admin_chat_id
         save_state(state)
@@ -512,83 +758,40 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
-    if record["status"] in {"new", "rejected", "expired"}:
-        record["status"] = "awaiting_of_username"
+    status = record.get("status")
+    if status in {"new", "rejected", "expired"}:
+        begin_application(record)
         save_state(state)
-        await update.message.reply_text("Please state your OF-username to continue")
+        await update.message.reply_text("Please state your OF-username to continue.")
         return
 
-    if record["status"] != "awaiting_of_username":
+    if status == "awaiting_of_username":
+        record["of_username"] = update.message.text.strip()
+        record["status"] = "awaiting_budget_range"
+        save_state(state)
+        await ask_budget_question(update.message)
+        return
+
+    if status == "awaiting_budget_range":
+        await update.message.reply_text("Please choose a budget range using the buttons above.")
+        return
+
+    if status == "awaiting_purchase_intent":
+        record["purchase_intent"] = update.message.text.strip()
+        await complete_application(update, context, state, record)
+        return
+
+    if status == "pending":
+        await update.message.reply_text("Your request is already pending review. Please wait for a decision.")
+        return
+
+    if status == "low_priority":
         await update.message.reply_text(
-            "Your request is already pending review. Please wait for a decision."
+            "Your request is in a lower-priority review queue. I check that queue weekly."
         )
-        save_state(state)
         return
 
-    claimed_username = update.message.text.strip()
-    record["status"] = "pending"
-    record["of_username"] = claimed_username
-    record["subscription_status"] = "unknown"
-    record["subscription_expires_at"] = None
-    save_state(state)
-
-    await update.message.reply_text(
-        "Thanks. Your request is pending review."
-    )
-
-    if not admin_chat_id:
-        LOGGER.warning("No admin chat configured yet. Request stored but not delivered.")
-        return
-
-    exact_match_note = ""
-    if ofauth_is_configured():
-        try:
-            subscriber = await asyncio.to_thread(find_active_subscriber_by_username, claimed_username)
-        except Exception as exc:
-            exact_match_note = f"\nOFAuth check: error ({exc})"
-        else:
-            if subscriber:
-                record["subscription_status"] = "active"
-                record["onlyfans_user_id"] = subscriber.get("id")
-                record["subscription_expires_at"] = subscriber.get("expiredAt")
-                save_state(state)
-                exact_match_note = (
-                    "\nOFAuth check: exact active username match found"
-                    f" (expires {subscriber.get('expiredAt') or 'unknown'})"
-                )
-            else:
-                record["subscription_status"] = "inactive"
-                save_state(state)
-                exact_match_note = "\nOFAuth check: no exact active username match found"
-
-    try:
-        await context.bot.forward_message(
-            chat_id=admin_chat_id,
-            from_chat_id=update.effective_chat.id,
-            message_id=update.message.message_id,
-        )
-    except Exception:
-        LOGGER.exception("Failed to forward applicant message to admin.")
-
-    keyboard = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("Approve", callback_data=f"a:{user.id}"),
-                InlineKeyboardButton("Reject", callback_data=f"r:{user.id}"),
-            ]
-        ]
-    )
-
-    await context.bot.send_message(
-        chat_id=admin_chat_id,
-        text=(
-            "New gatekeeper request\n\n"
-            f"Applicant: {user_label(user.id, record)}\n"
-            f"OF username: {record['of_username']}"
-            f"{exact_match_note}"
-        ),
-        reply_markup=keyboard,
-    )
+    await update.message.reply_text("Please send /start to begin.")
 
 
 async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -597,20 +800,52 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     state = load_state()
+    data = query.data or ""
+
+    if data.startswith("budget:"):
+        record = get_user_record(state, query.from_user.id)
+        mark_expired_if_needed(record)
+        if record.get("status") != "awaiting_budget_range":
+            await query.answer("That budget step is no longer active.", show_alert=True)
+            return
+        option = get_budget_option(data.partition(":")[2])
+        if option is None:
+            await query.answer("Invalid budget range.", show_alert=True)
+            return
+        record["budget_range_key"] = option["key"]
+        record["budget_range_label"] = option["label"]
+        record["budget_floor"] = option["floor"]
+        record["review_priority"] = option["priority"]
+        record["status"] = "awaiting_purchase_intent"
+        save_state(state)
+        await query.answer("Budget range saved.")
+        if query.message is not None:
+            await query.edit_message_text(
+                text=(
+                    "My time is limited and I prioritize serious buyers. "
+                    f"You selected: {option['label']}"
+                )
+            )
+            await context.bot.send_message(
+                chat_id=query.message.chat.id,
+                text="What are you looking to purchase in our first interaction?",
+            )
+        return
+
     admin_chat_id = resolve_admin_chat_id(state, query.from_user)
     if not admin_chat_id or query.message is None or query.message.chat.id != admin_chat_id:
         await query.answer("Not allowed.", show_alert=True)
         return
 
-    action, _, user_id_text = (query.data or "").partition(":")
+    action, _, user_id_text = data.partition(":")
     if not user_id_text.isdigit():
         await query.answer("Invalid action.", show_alert=True)
         return
 
     user_id = int(user_id_text)
     record = get_user_record(state, user_id)
-    if record["status"] != "pending":
-        await query.answer("This request is no longer pending.", show_alert=True)
+    if record.get("status") not in {"pending", "low_priority"}:
+        await query.answer("This request is no longer reviewable.", show_alert=True)
         return
 
     if action == "a":
@@ -625,15 +860,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 f"Access is valid until {record['expires_at']}."
             ),
         )
-        await query.edit_message_text(
-            text=(
-                "Approved\n\n"
-                f"Applicant: {user_label(user_id, record)}\n"
-                f"OF username: {record['of_username']}\n"
-                f"Access until: {record['expires_at']}\n"
-                f"Subscriber status: {subscription_status_line(record)}"
-            )
-        )
+        await query.edit_message_text(format_review_card(user_id, record, "Approved"))
         await query.answer("Approved.")
         return
 
@@ -644,14 +871,28 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             chat_id=user_id,
             text="Sorry, this request was not approved.",
         )
-        await query.edit_message_text(
-            text=(
-                "Rejected\n\n"
-                f"Applicant: {user_label(user_id, record)}\n"
-                f"OF username: {record['of_username']}"
-            )
-        )
+        await query.edit_message_text(format_review_card(user_id, record, "Rejected"))
         await query.answer("Rejected.")
+        return
+
+    if action == "p":
+        record["review_priority"] = "priority"
+        if record.get("status") == "low_priority":
+            record["status"] = "pending"
+        save_state(state)
+        await query.edit_message_text(
+            format_review_card(user_id, record, "Marked priority"),
+            reply_markup=build_admin_review_keyboard(user_id),
+        )
+        await query.answer("Marked priority.")
+        return
+
+    if action == "l":
+        record["review_priority"] = "low"
+        record["status"] = "low_priority"
+        save_state(state)
+        await query.edit_message_text(format_review_card(user_id, record, "Moved to low-priority queue"))
+        await query.answer("Moved to low-priority queue.")
         return
 
     await query.answer("Unknown action.", show_alert=True)
@@ -668,15 +909,24 @@ async def pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if admin_chat_id != update.effective_chat.id:
         return
 
+    mode = normalize_username(context.args[0]) if context.args else "all"
     items = []
     for user_id_text, record in state.get("users", {}).items():
-        if record.get("status") == "pending":
-            items.append(
-                f"{user_label(int(user_id_text), record)} | OF={record.get('of_username')} | OFAuth={record.get('subscription_status')}"
-            )
+        status = record.get("status")
+        priority = record.get("review_priority")
+        if mode == "all" and status in {"pending", "low_priority"}:
+            items.append(format_pending_line(int(user_id_text), record))
+        elif mode == "low" and status == "low_priority":
+            items.append(format_pending_line(int(user_id_text), record))
+        elif mode == "normal" and status == "pending" and priority == "normal":
+            items.append(format_pending_line(int(user_id_text), record))
+        elif mode == "priority" and status == "pending" and priority == "priority":
+            items.append(format_pending_line(int(user_id_text), record))
+        elif mode == "expired" and status == "expired":
+            items.append(format_pending_line(int(user_id_text), record))
 
     if not items:
-        await update.message.reply_text("No pending requests.")
+        await update.message.reply_text(f"No requests found for filter '{mode}'.")
         return
 
     await update.message.reply_text("\n".join(items[:50]))
@@ -700,11 +950,11 @@ async def expiring(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         expires_at = parse_iso(record.get("expires_at"))
         if record.get("status") == "approved" and expires_at and expires_at <= soon:
             items.append(
-                f"{user_label(int(user_id_text), record)} | expires={record.get('expires_at')} | OF={record.get('of_username')}"
+                f"{user_label(int(user_id_text), record)} | expires={record.get('expires_at')} | spend={budget_line(record)} | OF={record.get('of_username')}"
             )
         elif record.get("status") == "expired":
             items.append(
-                f"{user_label(int(user_id_text), record)} | expired | OF={record.get('of_username')}"
+                f"{user_label(int(user_id_text), record)} | expired | spend={budget_line(record)} | OF={record.get('of_username')}"
             )
 
     if not items:
@@ -741,6 +991,9 @@ async def sync_subs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     save_state(state)
     await update.message.reply_text(format_sync_summary(summary))
+    expired_alert = format_expired_access_alert(summary)
+    if expired_alert:
+        await update.message.reply_text(expired_alert)
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -764,6 +1017,9 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"{user_label(user_id, record)}\n"
         f"Status: {record.get('status')}\n"
         f"OF username: {record.get('of_username')}\n"
+        f"Planned first spend: {budget_line(record)}\n"
+        f"Queue: {priority_label(record)}\n"
+        f"Looking to buy: {record.get('purchase_intent')}\n"
         f"Access until: {record.get('expires_at')}\n"
         f"Last checked: {record.get('last_checked_at')}\n"
         f"Subscription: {subscription_status_line(record)}\n"
@@ -777,6 +1033,45 @@ async def approve_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def reject_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await manual_decision(update, context, approved=False)
+
+
+async def priority_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await reprioritize(update, context, "priority")
+
+
+async def lowpriority_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await reprioritize(update, context, "low")
+
+
+async def reprioritize(update: Update, context: ContextTypes.DEFAULT_TYPE, new_priority: str) -> None:
+    if not update.effective_user or not update.effective_chat or not update.message:
+        return
+    if update.effective_chat.type != "private":
+        return
+
+    state = load_state()
+    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
+    if admin_chat_id != update.effective_chat.id:
+        return
+
+    if not context.args or not context.args[0].isdigit():
+        command_name = "priority" if new_priority == "priority" else "lowpriority"
+        await update.message.reply_text(f"Usage: /{command_name} <user_id>")
+        return
+
+    user_id = int(context.args[0])
+    record = get_user_record(state, user_id)
+    if record.get("status") not in {"pending", "low_priority"}:
+        await update.message.reply_text("That request is not in a review queue.")
+        return
+
+    record["review_priority"] = new_priority
+    if new_priority == "priority":
+        record["status"] = "pending"
+    else:
+        record["status"] = "low_priority"
+    save_state(state)
+    await update.message.reply_text(f"Updated queue to {new_priority}.")
 
 
 async def renew_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -821,8 +1116,8 @@ async def manual_decision(
 
     user_id = int(context.args[0])
     record = get_user_record(state, user_id)
-    if record["status"] != "pending":
-        await update.message.reply_text("That request is not pending.")
+    if record.get("status") not in {"pending", "low_priority"}:
+        await update.message.reply_text("That request is not reviewable.")
         return
 
     if approved:
@@ -857,8 +1152,12 @@ async def non_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     state = load_state()
     record = get_user_record(state, update.effective_user.id)
-    if record["status"] == "awaiting_of_username":
+    if record.get("status") == "awaiting_of_username":
         await update.message.reply_text("Please send your OF-username as text.")
+    elif record.get("status") == "awaiting_budget_range":
+        await update.message.reply_text("Please choose a budget range using the buttons above.")
+    elif record.get("status") == "awaiting_purchase_intent":
+        await update.message.reply_text("Please tell me what you are looking to purchase in text.")
 
 
 def main() -> None:
@@ -872,6 +1171,8 @@ def main() -> None:
     app.add_handler(CommandHandler("pending", pending))
     app.add_handler(CommandHandler("approve", approve_manual))
     app.add_handler(CommandHandler("reject", reject_manual))
+    app.add_handler(CommandHandler("priority", priority_manual))
+    app.add_handler(CommandHandler("lowpriority", lowpriority_manual))
     app.add_handler(CommandHandler("renew", renew_manual))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("expiring", expiring))

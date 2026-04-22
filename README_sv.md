@@ -1,195 +1,78 @@
 # Telegram gatekeeper-bot
 
-Det här är en enkel mall för exakt ditt flöde:
+Det har projektet ar byggt for att filtrera leads innan de far tillgang till din privata Telegram.
+
+## Flode
 
 1. En ny person startar boten.
-2. Boten svarar: `Please state your OF-username to continue`
-3. Personen skickar sitt OF-username.
-4. Boten vidarebefordrar ansökan till dig i Telegram.
-5. Du jämför manuellt.
-6. Du trycker `Approve` eller `Reject`.
+2. Boten ber om deras OF-username.
+3. Boten visar budgetknappar for planerad spend i forsta interaction.
+4. Boten fragar vad personen vill kopa i den forsta interaction.
+5. Budget under `$100` laggs i en lagprioriterad ko och skickas inte direkt till dig.
+6. Budget `$100+` skickas till dig i Telegram for manuell review.
 7. Bara vid `Approve` skickar boten ditt privata Telegram-username.
 
-## Viktigt först
+## Viktigt forst
 
-Din tidigare bot-token måste betraktas som komprometterad eftersom den delades i chatten.
+Om en gammal bot-token har delats offentligt ska den betraktas som komprometterad.
 
-Gör detta först i `@BotFather`:
+Gor detta i `@BotFather`:
 
-1. Öppna `@BotFather`
-2. Kör `/revoke` eller skapa en ny token via botinställningarna
-3. Använd bara den nya tokenen i `.env`
+1. Oppna `@BotFather`
+2. Kor `/revoke` eller skapa en ny token
+3. Anvand bara den nya tokenen i Railway eller `.env`
 
 ## Filer
 
-- `gatekeeper_bot.py` - själva boten
+- `gatekeeper_bot.py` - huvudboten
+- `sync_onlyfans.py` - OFAuth-sync som fornyar eller expires access
+- `weekly_low_priority_review.py` - veckovis paminnelse om lagprioriterade leads
 - `requirements.txt` - Python-paket
-- `.env.example` - exempel på miljövariabler
-- `bot_state.json` - skapas automatiskt när boten körs
+- `.env.example` - exempel pa miljo variabler
+- `PRIVACY_POLICY.md` - enkel policy som kan anvandas i OFAuth setup
 
-## Innan du startar
-
-Du behöver:
-
-- Python installerat
-- ett nytt bot-token
-- ditt privata Telegram-username
-- ditt vanliga Telegram-username som admin
-
-## Installera
-
-I den här mappen:
-
-```powershell
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
-
-Om du vill göra det enklare på Windows kan du i stället dubbelklicka på:
-
-- `setup_bot.bat` - för att installera allt på en ny dator
-- `start_bot.bat` - för att starta boten
-
-Skapa sedan en `.env` baserat på `.env.example`.
-
-Exempel:
+## Miljo variabler
 
 ```env
 BOT_TOKEN=din_nya_token
 ADMIN_USERNAME=ditttelegramusername
 PRIVATE_TELEGRAM_USERNAME=@ditt_privata_username
 ACCESS_DURATION_DAYS=30
-OFAUTH_API_KEY=valfritt_for_ofauth
-OFAUTH_CONNECTION_ID=valfritt_for_ofauth
+OFAUTH_API_KEY=din_ofauth_nyckel
+OFAUTH_CONNECTION_ID=din_connection_id
+OFAUTH_TIMEOUT_SECONDS=10
+OFAUTH_MAX_PAGES=5
 ```
 
-## Starta boten
+## Admin-kommandon
 
-Ladda miljövariablerna i PowerShell och kör:
-
-```powershell
-$env:BOT_TOKEN="din_nya_token"
-$env:ADMIN_USERNAME="ditttelegramusername"
-$env:PRIVATE_TELEGRAM_USERNAME="@ditt_privata_username"
-python .\gatekeeper_bot.py
-```
-
-På Windows kan du också bara dubbelklicka på `start_bot.bat`.
-
-## Första admin-steget
-
-1. Sök upp din bot i Telegram
-2. Från ditt eget konto, tryck `/start`
-3. Boten registrerar då din admin-chat automatiskt
-
-Efter det skickas nya förfrågningar till dig.
-
-## Hur du övervakar konversationer
-
-Ja, men med en viktig begränsning:
-
-- Du kan övervaka allt som användare skickar direkt till boten
-- Du kan inte läsa deras vanliga privata Telegram-chattar med andra personer
-
-Den här mallen övervakar genom att:
-
-- vidarebefordra användarens OF-svar till dig
-- skicka ett admin-meddelande med `Approve` och `Reject`
-- låta dig se väntande ärenden med `/pending`
-
-## Manuella admin-kommandon
-
-- `/pending`
+- `/pending [all|low|normal|priority|expired]`
 - `/approve <user_id>`
 - `/reject <user_id>`
+- `/priority <user_id>`
+- `/lowpriority <user_id>`
 - `/renew <user_id>`
 - `/status <user_id>`
 - `/expiring`
 - `/syncsubs`
 
-## Begränsningar
+## Railway setup
 
-- Boten vet inte vem som är en "ny kontakt" för dig i Telegrams sociala mening. Den vet bara om en användare är ny för boten.
-- Säkerheten bygger på din manuella kontroll av OF-username.
-- Om du vill ha bättre loggning senare kan du spara ansökningar i en databas eller skicka kopior till en privat admin-kanal.
+Det basta upplagget ar tre services i samma Railway-projekt.
 
-## Rekommenderad nästa nivå
+### 1. Telegram-boten
 
-Om du vill kan nästa steg vara att lägga till:
+Detta ar den vanliga langkorande servicen.
 
-- autosvar på svenska eller engelska
-- tidsstämplar på varje ansökan
-- export till CSV
-- blocklista
-- engångsgodkännande per användare
-
-## Köra från flera Windows-datorer
-
-Ja, projektmappen kan ligga i exempelvis Google Drive eller OneDrive, men gör så här:
-
-- dela eller synka själva projektmappen
-- låt varje dator skapa sin egen `.venv` lokalt via `setup_bot.bat`
-- ha en `.env` på varje dator med samma bot-token och admin-uppgifter
-
-Det enklaste arbetsflödet är:
-
-1. Öppna projektmappen på den dator du vill använda
-2. Kör `setup_bot.bat` första gången på den datorn
-3. Kör `start_bot.bat` när du vill starta boten
-
-## Köra på Railway
-
-Om du vill köra boten utan att din egen dator är igång kan du lägga projektet på Railway.
-
-Det här projektet är nu förberett för det med en `Dockerfile`, så Railway kan starta boten direkt.
-
-### Rekommenderat upplägg
-
-1. Lägg projektet i ett GitHub-repo
-2. Skapa ett nytt projekt i Railway
-3. Importera repot
-4. Lägg in dessa variabler i Railway:
-
-```env
-BOT_TOKEN=din_nya_token
-ADMIN_USERNAME=ditttelegramusername
-PRIVATE_TELEGRAM_USERNAME=@ditt_privata_username
-```
-
-5. Deploya tjänsten
-6. Öppna boten i Telegram och kör `/start` från ditt admin-konto en gång
-
-### Viktigt om botens minne
-
-Den här boten sparar godkännanden och admin-chat i `bot_state.json`.
-
-Om du vill att det ska överleva omstarter och nya deployer på Railway bör du koppla en Volume till tjänsten.
-
-Rekommenderad mount path på Railway:
+Startas via `Dockerfile`:
 
 ```text
-/app/data
+python -u gatekeeper_bot.py
 ```
 
-När en Volume är monterad där använder boten den automatiskt för `bot_state.json`.
+### 2. OFAuth-sync
 
-Om du inte använder en Volume kan botens sparade status försvinna vid omstart eller redeploy.
-
-### Två Railway-tjänster
-
-För automatiska subscriber-kontroller är det bäst att köra två tjänster i samma Railway-projekt:
-
-1. En vanlig långkörande service för Telegram-boten
-2. En Cron Job som kör `sync_onlyfans.py` och sedan avslutas
-
-### Telegram-boten
-
-Den vanliga bot-servicen kör som tidigare från `Dockerfile`.
-
-### OFAuth-sync som Cron Job
-
-Skapa en till service i samma Railway-projekt från samma repo och använd den som Cron Job.
+Cron Job som kontrollerar vilka som fortfarande ar aktiva subscribers.
 
 Startkommando:
 
@@ -197,47 +80,55 @@ Startkommando:
 python sync_onlyfans.py
 ```
 
-Exempel på schema för två körningar per månad:
+Exempel pa schema tva ganger per manad:
 
 ```text
 0 4 1,15 * *
 ```
 
-Det betyder den 1:a och 15:e varje månad klockan 04:00 UTC.
+### 3. Veckovis review av lagprioriterad ko
 
-### Samma miljövariabler i båda tjänsterna
+Cron Job som paminner dig att ga igenom leads under `$100`.
 
-Både bot-servicen och cron-servicen behöver samma värden för:
+Startkommando:
 
-```env
-BOT_TOKEN=...
-ADMIN_USERNAME=...
-PRIVATE_TELEGRAM_USERNAME=...
-ACCESS_DURATION_DAYS=30
-OFAUTH_API_KEY=...
-OFAUTH_CONNECTION_ID=...
+```text
+python weekly_low_priority_review.py
 ```
 
-Om du använder en Railway Volume ska båda tjänsterna ha samma mount path:
+Exempel pa veckoschema:
+
+```text
+0 12 * * 1
+```
+
+Det betyder varje mandag klockan 12:00 UTC.
+
+## Railway Volume
+
+Om du vill att state ska overleva omstarter och redeploys ska du montera en Volume.
+
+Rekommenderad mount path:
 
 ```text
 /app/data
 ```
 
-På så sätt läser och skriver båda tjänsterna samma `bot_state.json`.
+Alla services ska anvanda samma mount path sa att de delar samma `bot_state.json`.
 
-### Vad OFAuth-synken gör
+## Vad OFAuth-synken gor
 
-När `sync_onlyfans.py` körs:
+Nar `sync_onlyfans.py` kors:
 
-- hämtar den aktiva subscribers från OFAuth
-- matchar dem mot sparade OF-usernames i botens state
-- förlänger access 30 dagar för de som fortfarande matchar
-- markerar access som `expired` för de som inte längre matchar
+- hamtar den aktiva subscribers fran OFAuth
+- matchar dem mot sparade OF-usernames
+- forlangar access 30 dagar for de som fortfarande matchar
+- markerar access som `expired` for de som inte langre matchar
 - skickar en sammanfattning till ditt admin-konto i Telegram
+- skickar en extra varning med anvandare som du bor ta bort eller be att resubscriba
 
-### Viktig begränsning
+## Begransning
 
-Den här automatiseringen matchar mot det OF-username som användaren själv har skrivit till boten.
+Automatiseringen matchar mot det OF-username som anvandaren sjalv har skrivit till boten.
 
-Det betyder att det fortfarande finns en identitetsrisk om någon uppger någon annans OF-username. Därför är den säkraste modellen fortfarande att första godkännandet är manuellt.
+Det betyder att det fortfarande finns en identitetsrisk om nagon uppger nagon annans OF-username. Den sakraste modellen ar fortfarande att forsta godkannandet ar manuellt.
