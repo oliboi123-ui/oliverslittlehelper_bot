@@ -59,6 +59,9 @@ Exempel:
 BOT_TOKEN=din_nya_token
 ADMIN_USERNAME=ditttelegramusername
 PRIVATE_TELEGRAM_USERNAME=@ditt_privata_username
+ACCESS_DURATION_DAYS=30
+OFAUTH_API_KEY=valfritt_for_ofauth
+OFAUTH_CONNECTION_ID=valfritt_for_ofauth
 ```
 
 ## Starta boten
@@ -100,6 +103,10 @@ Den här mallen övervakar genom att:
 - `/pending`
 - `/approve <user_id>`
 - `/reject <user_id>`
+- `/renew <user_id>`
+- `/status <user_id>`
+- `/expiring`
+- `/syncsubs`
 
 ## Begränsningar
 
@@ -168,3 +175,69 @@ Rekommenderad mount path på Railway:
 När en Volume är monterad där använder boten den automatiskt för `bot_state.json`.
 
 Om du inte använder en Volume kan botens sparade status försvinna vid omstart eller redeploy.
+
+### Två Railway-tjänster
+
+För automatiska subscriber-kontroller är det bäst att köra två tjänster i samma Railway-projekt:
+
+1. En vanlig långkörande service för Telegram-boten
+2. En Cron Job som kör `sync_onlyfans.py` och sedan avslutas
+
+### Telegram-boten
+
+Den vanliga bot-servicen kör som tidigare från `Dockerfile`.
+
+### OFAuth-sync som Cron Job
+
+Skapa en till service i samma Railway-projekt från samma repo och använd den som Cron Job.
+
+Startkommando:
+
+```text
+python sync_onlyfans.py
+```
+
+Exempel på schema för två körningar per månad:
+
+```text
+0 4 1,15 * *
+```
+
+Det betyder den 1:a och 15:e varje månad klockan 04:00 UTC.
+
+### Samma miljövariabler i båda tjänsterna
+
+Både bot-servicen och cron-servicen behöver samma värden för:
+
+```env
+BOT_TOKEN=...
+ADMIN_USERNAME=...
+PRIVATE_TELEGRAM_USERNAME=...
+ACCESS_DURATION_DAYS=30
+OFAUTH_API_KEY=...
+OFAUTH_CONNECTION_ID=...
+```
+
+Om du använder en Railway Volume ska båda tjänsterna ha samma mount path:
+
+```text
+/app/data
+```
+
+På så sätt läser och skriver båda tjänsterna samma `bot_state.json`.
+
+### Vad OFAuth-synken gör
+
+När `sync_onlyfans.py` körs:
+
+- hämtar den aktiva subscribers från OFAuth
+- matchar dem mot sparade OF-usernames i botens state
+- förlänger access 30 dagar för de som fortfarande matchar
+- markerar access som `expired` för de som inte längre matchar
+- skickar en sammanfattning till ditt admin-konto i Telegram
+
+### Viktig begränsning
+
+Den här automatiseringen matchar mot det OF-username som användaren själv har skrivit till boten.
+
+Det betyder att det fortfarande finns en identitetsrisk om någon uppger någon annans OF-username. Därför är den säkraste modellen fortfarande att första godkännandet är manuellt.
