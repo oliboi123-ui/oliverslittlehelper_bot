@@ -408,6 +408,106 @@ def ofauth_request_json(
         raise RuntimeError("OFAuth returned invalid JSON.") from exc
 
 
+def get_subscriber_page(
+    *,
+    subscriber_type: str = "active",
+    limit: int | None = None,
+    offset: int = 0,
+) -> dict[str, Any]:
+    page_size = limit or get_ofauth_page_size()
+    return ofauth_request_json(
+        "/v2/access/subscribers",
+        {"type": subscriber_type, "limit": page_size, "offset": offset},
+        timeout_seconds=get_ofauth_timeout_seconds(),
+    )
+
+
+def fingerprint_subscriber_batch(batch: list[dict[str, Any]]) -> str:
+    return json.dumps(
+        [
+            {
+                "id": item.get("id"),
+                "username": item.get("username"),
+                "expiredAt": item.get("expiredAt"),
+            }
+            for item in batch
+        ],
+        ensure_ascii=True,
+        sort_keys=True,
+    )
+
+
+def run_ofauth_diagnostics() -> dict[str, Any]:
+    page_size = get_ofauth_page_size()
+    diagnostics: dict[str, Any] = {
+        "page_size": page_size,
+        "self_username": None,
+        "self_subscribers_count": None,
+        "active_page_1_count": 0,
+        "active_page_2_count": 0,
+        "active_page_2_repeats_page_1": False,
+        "all_page_1_count": 0,
+        "all_page_2_count": 0,
+        "all_page_2_repeats_page_1": False,
+        "conclusion": "",
+    }
+
+    try:
+        self_payload = ofauth_request_json("/v2/access/self", timeout_seconds=get_ofauth_timeout_seconds())
+    except Exception as exc:
+        diagnostics["self_error"] = str(exc)
+    else:
+        diagnostics["self_username"] = self_payload.get("username")
+        diagnostics["self_subscribers_count"] = self_payload.get("subscribersCount")
+
+    for subscriber_type in ("active", "all"):
+        page_one = get_subscriber_page(subscriber_type=subscriber_type, limit=page_size, offset=0)
+        batch_one = page_one.get("list") or []
+        if not isinstance(batch_one, list):
+            raise RuntimeError(f"OFAuth returned an unexpected {subscriber_type} subscriber payload.")
+        page_two = get_subscriber_page(subscriber_type=subscriber_type, limit=page_size, offset=page_size)
+        batch_two = page_two.get("list") or []
+        if not isinstance(batch_two, list):
+            raise RuntimeError(f"OFAuth returned an unexpected {subscriber_type} subscriber payload.")
+
+        diagnostics[f"{subscriber_type}_page_1_count"] = len(batch_one)
+        diagnostics[f"{subscriber_type}_page_2_count"] = len(batch_two)
+        diagnostics[f"{subscriber_type}_page_2_repeats_page_1"] = (
+            fingerprint_subscriber_batch(batch_one) == fingerprint_subscriber_batch(batch_two)
+        )
+
+    self_count = diagnostics.get("self_subscribers_count")
+    active_repeat = diagnostics.get("active_page_2_repeats_page_1")
+    all_repeat = diagnostics.get("all_page_2_repeats_page_1")
+    active_page_1_count = diagnostics.get("active_page_1_count")
+
+    if isinstance(self_count, int) and self_count > page_size and active_repeat:
+        diagnostics["conclusion"] = (
+            "OFAuth knows the account has more subscribers than fit on one page, "
+            "but the subscriber list endpoint repeats page 1 on page 2. "
+            "That points to broken pagination or an ignored offset."
+        )
+    elif active_repeat and all_repeat:
+        diagnostics["conclusion"] = (
+            "Both active and all subscriber listings repeat page 1 on page 2. "
+            "That points to a general pagination issue for this connection."
+        )
+    elif active_repeat:
+        diagnostics["conclusion"] = (
+            "The active subscriber listing repeats page 1 on page 2, while the all listing behaves differently. "
+            "That points to an OFAuth issue with the active filter."
+        )
+    elif isinstance(self_count, int) and active_page_1_count == self_count:
+        diagnostics["conclusion"] = (
+            "OFAuth appears to think the full active subscriber count fits on the first page. "
+            "If that count is lower than expected, the connection may be seeing incomplete account data."
+        )
+    else:
+        diagnostics["conclusion"] = "No obvious OFAuth pagination issue was detected."
+
+    return diagnostics
+
+
 def fetch_active_subscribers(limit: int | None = None) -> tuple[list[dict[str, Any]], list[str]]:
     subscribers: list[dict[str, Any]] = []
     warnings: list[str] = []
@@ -431,26 +531,11 @@ def fetch_active_subscribers(limit: int | None = None) -> tuple[list[dict[str, A
             page_size,
             timeout,
         )
-        payload = ofauth_request_json(
-            "/v2/access/subscribers",
-            {"type": "active", "limit": page_size, "offset": offset},
-            timeout_seconds=timeout,
-        )
+        payload = get_subscriber_page(subscriber_type="active", limit=page_size, offset=offset)
         batch = payload.get("list") or []
         if not isinstance(batch, list):
             raise RuntimeError("OFAuth returned an unexpected subscriber payload.")
-        page_fingerprint = json.dumps(
-            [
-                {
-                    "id": item.get("id"),
-                    "username": item.get("username"),
-                    "expiredAt": item.get("expiredAt"),
-                }
-                for item in batch
-            ],
-            ensure_ascii=True,
-            sort_keys=True,
-        )
+        page_fingerprint = fingerprint_subscriber_batch(batch)
         if previous_page_fingerprint is not None and page_fingerprint == previous_page_fingerprint:
             warning = (
                 "OFAuth repeated the same subscriber page twice. "
@@ -1029,6 +1114,57 @@ async def sync_subs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(expired_alert)
 
 
+async def ofdiag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.effective_chat or not update.message:
+        return
+    if update.effective_chat.type != "private":
+        return
+
+    state = load_state()
+    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
+    if admin_chat_id != update.effective_chat.id:
+        return
+
+    if not ofauth_is_configured():
+        await update.message.reply_text(
+            "OFAuth is not configured. Set OFAUTH_API_KEY and OFAUTH_CONNECTION_ID first."
+        )
+        return
+
+    await update.message.reply_text("Running OFAuth diagnostics...")
+    try:
+        diagnostics = await asyncio.to_thread(run_ofauth_diagnostics)
+    except Exception as exc:
+        LOGGER.exception("OFAuth diagnostics failed.")
+        await update.message.reply_text(f"OFAuth diagnostics failed: {exc}")
+        return
+
+    lines = [
+        "OFAuth diagnostics",
+        "",
+        f"Self username: {diagnostics.get('self_username') or 'Unavailable'}",
+        f"Self subscribersCount: {diagnostics.get('self_subscribers_count')}",
+        f"Configured page size: {diagnostics.get('page_size')}",
+        "",
+        (
+            "Active list: "
+            f"page1={diagnostics.get('active_page_1_count')}, "
+            f"page2={diagnostics.get('active_page_2_count')}, "
+            f"repeats={diagnostics.get('active_page_2_repeats_page_1')}"
+        ),
+        (
+            "All list: "
+            f"page1={diagnostics.get('all_page_1_count')}, "
+            f"page2={diagnostics.get('all_page_2_count')}, "
+            f"repeats={diagnostics.get('all_page_2_repeats_page_1')}"
+        ),
+    ]
+    if diagnostics.get("self_error"):
+        lines.extend(["", f"Self endpoint error: {diagnostics['self_error']}"])
+    lines.extend(["", f"Conclusion: {diagnostics.get('conclusion') or 'No conclusion.'}"])
+    await update.message.reply_text("\n".join(lines))
+
+
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.effective_chat or not update.message:
         return
@@ -1210,6 +1346,7 @@ def main() -> None:
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("expiring", expiring))
     app.add_handler(CommandHandler("syncsubs", sync_subs))
+    app.add_handler(CommandHandler("ofdiag", ofdiag))
     app.add_handler(CallbackQueryHandler(button_click))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
     app.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, non_text_message))
