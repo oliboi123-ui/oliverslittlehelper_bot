@@ -426,6 +426,100 @@ def get_subscriber_page(
     )
 
 
+def get_user_profile(user_id_or_username: str) -> dict[str, Any]:
+    normalized = str(user_id_or_username).strip()
+    if not normalized:
+        raise RuntimeError("Missing OnlyFans user identifier.")
+    return ofauth_request_json(
+        f"/v2/access/users/{urllib_parse.quote(normalized, safe='')}",
+        timeout_seconds=get_ofauth_timeout_seconds(),
+    )
+
+
+def get_users_by_ids(user_ids: list[str | int]) -> list[dict[str, Any]]:
+    normalized_ids = [str(item).strip() for item in user_ids if str(item).strip()]
+    if not normalized_ids:
+        return []
+    payload = ofauth_request_json(
+        "/v2/access/users/list",
+        {"userIds": ",".join(normalized_ids)},
+        timeout_seconds=get_ofauth_timeout_seconds(),
+    )
+    users = payload.get("users") or []
+    if not isinstance(users, list):
+        raise RuntimeError("OFAuth returned an unexpected users/list payload.")
+    return users
+
+
+def verify_onlyfans_username(claimed_username: str) -> dict[str, Any]:
+    normalized = normalize_of_username(claimed_username)
+    if not normalized:
+        raise RuntimeError("Missing OnlyFans username.")
+
+    try:
+        profile = get_user_profile(normalized)
+    except RuntimeError as exc:
+        message = str(exc)
+        if "with 404" in message:
+            return {
+                "verified": False,
+                "username": normalized,
+                "id": None,
+                "expired_at": None,
+                "source": "users/{username}",
+                "reason": "username not found",
+            }
+        raise
+    onlyfans_user_id = profile.get("id")
+    if onlyfans_user_id is None:
+        raise RuntimeError("OFAuth did not return a user id for that username.")
+
+    detailed_users = get_users_by_ids([onlyfans_user_id])
+    detailed = detailed_users[0] if detailed_users else profile
+    subscribed_by = detailed.get("subscribedBy")
+    subscribed_data = detailed.get("subscribedByData") or {}
+    has_active_paid = bool(subscribed_data.get("hasActivePaidSubscriptions"))
+    status_text = str(subscribed_data.get("status") or "").strip().lower()
+    expired_at = (
+        subscribed_data.get("expiredAt")
+        or detailed.get("subscribedByExpireDate")
+        or detailed.get("expiredAt")
+    )
+    is_expired_now = bool(detailed.get("subscribedIsExpiredNow"))
+
+    verified = False
+    if has_active_paid:
+        verified = True
+    elif status_text in {"active", "current"} and not is_expired_now:
+        verified = True
+    elif subscribed_by is True and not is_expired_now:
+        verified = True
+
+    if verified:
+        return {
+            "verified": True,
+            "username": detailed.get("username") or normalized,
+            "id": onlyfans_user_id,
+            "expired_at": expired_at,
+            "source": "users/list",
+            "reason": None,
+        }
+
+    return {
+        "verified": False,
+        "username": detailed.get("username") or normalized,
+        "id": onlyfans_user_id,
+        "expired_at": expired_at,
+        "source": "users/list",
+        "reason": (
+            f"subscribedBy={subscribed_by}, "
+            f"hasActivePaidSubscriptions={has_active_paid}, "
+            f"status={status_text or 'unknown'}, "
+            f"subscribedIsExpiredNow={is_expired_now}"
+        ),
+    }
+
+
 def fingerprint_subscriber_batch(batch: list[dict[str, Any]]) -> str:
     return json.dumps(
         [
@@ -818,30 +912,27 @@ async def complete_application(
     exact_match_note = ""
     if ofauth_is_configured():
         try:
-            subscriber, verification_warnings = await asyncio.to_thread(
-                lookup_active_subscriber_by_username,
+            verification_result = await asyncio.to_thread(
+                verify_onlyfans_username,
                 str(record.get("of_username") or ""),
             )
         except Exception as exc:
             exact_match_note = f"OFAuth check: error ({exc})"
         else:
-            if subscriber:
+            if verification_result.get("verified"):
                 record["subscription_status"] = "active"
-                record["onlyfans_user_id"] = subscriber.get("id")
-                record["subscription_expires_at"] = subscriber.get("expiredAt")
+                record["onlyfans_user_id"] = verification_result.get("id")
+                record["subscription_expires_at"] = verification_result.get("expired_at")
                 exact_match_note = (
                     "✅ Exact active username match found "
-                    f"(expires {subscriber.get('expiredAt') or 'unknown'})"
+                    f"(expires {verification_result.get('expired_at') or 'unknown'})"
                 )
             else:
-                record["subscription_status"] = "unknown" if verification_warnings else "inactive"
+                record["subscription_status"] = "inactive"
                 record["subscription_expires_at"] = None
-                if verification_warnings:
-                    exact_match_note = (
-                        "Verification could not be completed because OFAuth only returned a partial subscriber list."
-                    )
-                else:
-                    exact_match_note = "❌ No exact active username match found"
+                exact_match_note = "❌ No exact active username match found"
+                if verification_result.get("reason"):
+                    exact_match_note += f" ({verification_result['reason']})"
 
     record["queued_at"] = to_iso(utc_now())
     if classify_low_priority(record):
@@ -1171,39 +1262,32 @@ async def verifyof(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.message.reply_text(f"Checking OF username {claimed_username}...")
     try:
-        subscriber, warnings = await asyncio.to_thread(lookup_active_subscriber_by_username, claimed_username)
+        verification_result = await asyncio.to_thread(verify_onlyfans_username, claimed_username)
     except Exception as exc:
         LOGGER.exception("OFAuth verify command failed.")
         await update.message.reply_text(f"OFAuth verification failed: {exc}")
         return
 
-    if subscriber:
+    if verification_result.get("verified"):
         lines = [
             "✅ Verified",
             "",
-            f"OF username: {subscriber.get('username') or claimed_username}",
-            f"OnlyFans user id: {subscriber.get('id')}",
-            f"Subscription expires: {subscriber.get('expiredAt') or 'Unknown'}",
+            f"OF username: {verification_result.get('username') or claimed_username}",
+            f"OnlyFans user id: {verification_result.get('id')}",
+            f"Subscription expires: {verification_result.get('expired_at') or 'Unknown'}",
+            f"Source: {verification_result.get('source')}",
         ]
-        if warnings:
-            lines.extend(["", "Warnings:", *[f"- {item}" for item in warnings[:5]]])
         await update.message.reply_text("\n".join(lines))
         return
 
     lines = [
         "❌ Unverified",
         "",
-        f"OF username: {claimed_username}",
+        f"OF username: {verification_result.get('username') or claimed_username}",
+        f"Source: {verification_result.get('source')}",
     ]
-    if warnings:
-        lines.extend(
-            [
-                "Result note: OFAuth is only returning a partial subscriber list, so this negative result is not conclusive.",
-                "",
-                "Warnings:",
-                *[f"- {item}" for item in warnings[:5]],
-            ]
-        )
+    if verification_result.get("reason"):
+        lines.append(f"Reason: {verification_result['reason']}")
     else:
         lines.append("No exact active subscriber match was found.")
     await update.message.reply_text("\n".join(lines))
