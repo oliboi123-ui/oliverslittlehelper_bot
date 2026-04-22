@@ -67,6 +67,13 @@ def get_ofauth_base_url() -> str:
     return os.getenv("OFAUTH_BASE_URL", "https://api.ofauth.com").rstrip("/")
 
 
+def get_ofauth_user_agent() -> str:
+    return os.getenv(
+        "OFAUTH_USER_AGENT",
+        "oliverslittlehelper-bot/1.0 (+https://github.com/oliboi123-ui/oliverslittlehelper_bot)",
+    ).strip()
+
+
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -222,6 +229,7 @@ def ofauth_request_json(path: str, query: dict[str, Any] | None = None) -> dict[
             "apikey": api_key,
             "x-connection-id": connection_id,
             "Accept": "application/json",
+            "User-Agent": get_ofauth_user_agent(),
         },
         method="GET",
     )
