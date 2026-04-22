@@ -247,9 +247,13 @@ def budget_line(record: dict[str, Any]) -> str:
 def subscription_status_line(record: dict[str, Any]) -> str:
     status = record.get("subscription_status") or "unknown"
     expires_at = record.get("subscription_expires_at")
-    if expires_at:
-        return f"{status} until {expires_at}"
-    return status
+    if status == "active":
+        if expires_at:
+            return f"✅ Verified until {expires_at}"
+        return "✅ Verified"
+    if status == "inactive":
+        return "❌ Unverified"
+    return "Verification not conclusive"
 
 
 def priority_label(record: dict[str, Any]) -> str:
@@ -297,7 +301,7 @@ def format_review_card(user_id: int, record: dict[str, Any], heading: str) -> st
         f"Planned first spend: {budget_line(record)}",
         f"Queue: {priority_label(record)}",
         f"Looking to buy: {record.get('purchase_intent') or 'Not provided'}",
-        f"OFAuth: {subscription_status_line(record)}",
+        f"Verification: {subscription_status_line(record)}",
     ]
     return "\n".join(lines)
 
@@ -306,7 +310,7 @@ def format_pending_line(user_id: int, record: dict[str, Any]) -> str:
     return (
         f"{user_label(user_id, record)} | spend={budget_line(record)} | "
         f"queue={priority_label(record)} | OF={record.get('of_username')} | "
-        f"OFAuth={record.get('subscription_status')}"
+        f"verification={subscription_status_line(record)}"
     )
 
 
@@ -512,6 +516,17 @@ def sync_warnings_indicate_partial_data(warnings: list[str]) -> bool:
     return bool(warnings)
 
 
+def lookup_active_subscriber_by_username(claimed_username: str) -> tuple[dict[str, Any] | None, list[str]]:
+    normalized = normalize_of_username(claimed_username)
+    if not normalized:
+        return None, []
+    subscribers, warnings = fetch_active_subscribers()
+    for subscriber in subscribers:
+        if normalize_of_username(str(subscriber.get("username") or "")) == normalized:
+            return subscriber, warnings
+    return None, warnings
+
+
 def fetch_active_subscribers(limit: int | None = None) -> tuple[list[dict[str, Any]], list[str]]:
     subscribers: list[dict[str, Any]] = []
     warnings: list[str] = []
@@ -580,14 +595,8 @@ def fetch_active_subscribers(limit: int | None = None) -> tuple[list[dict[str, A
 
 
 def find_active_subscriber_by_username(claimed_username: str) -> dict[str, Any] | None:
-    normalized = normalize_of_username(claimed_username)
-    if not normalized:
-        return None
-    subscribers, _warnings = fetch_active_subscribers()
-    for subscriber in subscribers:
-        if normalize_of_username(str(subscriber.get("username") or "")) == normalized:
-            return subscriber
-    return None
+    subscriber, _warnings = lookup_active_subscriber_by_username(claimed_username)
+    return subscriber
 
 
 def sync_subscribers(state: dict[str, Any]) -> dict[str, Any]:
@@ -809,7 +818,10 @@ async def complete_application(
     exact_match_note = ""
     if ofauth_is_configured():
         try:
-            subscriber = await asyncio.to_thread(find_active_subscriber_by_username, str(record.get("of_username") or ""))
+            subscriber, verification_warnings = await asyncio.to_thread(
+                lookup_active_subscriber_by_username,
+                str(record.get("of_username") or ""),
+            )
         except Exception as exc:
             exact_match_note = f"OFAuth check: error ({exc})"
         else:
@@ -818,13 +830,18 @@ async def complete_application(
                 record["onlyfans_user_id"] = subscriber.get("id")
                 record["subscription_expires_at"] = subscriber.get("expiredAt")
                 exact_match_note = (
-                    "OFAuth check: exact active username match found "
+                    "✅ Exact active username match found "
                     f"(expires {subscriber.get('expiredAt') or 'unknown'})"
                 )
             else:
-                record["subscription_status"] = "inactive"
+                record["subscription_status"] = "unknown" if verification_warnings else "inactive"
                 record["subscription_expires_at"] = None
-                exact_match_note = "OFAuth check: no exact active username match found"
+                if verification_warnings:
+                    exact_match_note = (
+                        "Verification could not be completed because OFAuth only returned a partial subscriber list."
+                    )
+                else:
+                    exact_match_note = "❌ No exact active username match found"
 
     record["queued_at"] = to_iso(utc_now())
     if classify_low_priority(record):
@@ -874,7 +891,7 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(
             "Use /pending [all|low|normal|priority|expired], /approve <user_id>, /reject <user_id>, "
             "/priority <user_id>, /lowpriority <user_id>, /renew <user_id>, /status <user_id>, "
-            "/expiring or /syncsubs here."
+            "/expiring, /syncsubs, /verifyof <onlyfans_username> or /ofdiag here."
         )
         state["admin_chat_id"] = admin_chat_id
         save_state(state)
@@ -1126,6 +1143,72 @@ async def sync_subs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(expired_alert)
 
 
+async def verifyof(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.effective_chat or not update.message:
+        return
+    if update.effective_chat.type != "private":
+        return
+
+    state = load_state()
+    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
+    if admin_chat_id != update.effective_chat.id:
+        return
+
+    if not ofauth_is_configured():
+        await update.message.reply_text(
+            "OFAuth is not configured. Set OFAUTH_API_KEY and OFAUTH_CONNECTION_ID first."
+        )
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /verifyof <onlyfans_username>")
+        return
+
+    claimed_username = normalize_of_username(context.args[0])
+    if not claimed_username:
+        await update.message.reply_text("Usage: /verifyof <onlyfans_username>")
+        return
+
+    await update.message.reply_text(f"Checking OF username {claimed_username}...")
+    try:
+        subscriber, warnings = await asyncio.to_thread(lookup_active_subscriber_by_username, claimed_username)
+    except Exception as exc:
+        LOGGER.exception("OFAuth verify command failed.")
+        await update.message.reply_text(f"OFAuth verification failed: {exc}")
+        return
+
+    if subscriber:
+        lines = [
+            "✅ Verified",
+            "",
+            f"OF username: {subscriber.get('username') or claimed_username}",
+            f"OnlyFans user id: {subscriber.get('id')}",
+            f"Subscription expires: {subscriber.get('expiredAt') or 'Unknown'}",
+        ]
+        if warnings:
+            lines.extend(["", "Warnings:", *[f"- {item}" for item in warnings[:5]]])
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    lines = [
+        "❌ Unverified",
+        "",
+        f"OF username: {claimed_username}",
+    ]
+    if warnings:
+        lines.extend(
+            [
+                "Result note: OFAuth is only returning a partial subscriber list, so this negative result is not conclusive.",
+                "",
+                "Warnings:",
+                *[f"- {item}" for item in warnings[:5]],
+            ]
+        )
+    else:
+        lines.append("No exact active subscriber match was found.")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def ofdiag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.effective_chat or not update.message:
         return
@@ -1203,7 +1286,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"Looking to buy: {record.get('purchase_intent')}\n"
         f"Access until: {record.get('expires_at')}\n"
         f"Last checked: {record.get('last_checked_at')}\n"
-        f"Subscription: {subscription_status_line(record)}\n"
+        f"Verification: {subscription_status_line(record)}\n"
         f"OnlyFans user id: {record.get('onlyfans_user_id')}"
     )
 
@@ -1358,6 +1441,7 @@ def main() -> None:
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("expiring", expiring))
     app.add_handler(CommandHandler("syncsubs", sync_subs))
+    app.add_handler(CommandHandler("verifyof", verifyof))
     app.add_handler(CommandHandler("ofdiag", ofdiag))
     app.add_handler(CallbackQueryHandler(button_click))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
