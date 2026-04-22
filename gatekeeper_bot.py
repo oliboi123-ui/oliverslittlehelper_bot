@@ -508,6 +508,10 @@ def run_ofauth_diagnostics() -> dict[str, Any]:
     return diagnostics
 
 
+def sync_warnings_indicate_partial_data(warnings: list[str]) -> bool:
+    return bool(warnings)
+
+
 def fetch_active_subscribers(limit: int | None = None) -> tuple[list[dict[str, Any]], list[str]]:
     subscribers: list[dict[str, Any]] = []
     warnings: list[str] = []
@@ -590,6 +594,7 @@ def sync_subscribers(state: dict[str, Any]) -> dict[str, Any]:
     now = utc_now()
     started_at = time.monotonic()
     subscribers, sync_warnings = fetch_active_subscribers()
+    partial_sync = sync_warnings_indicate_partial_data(sync_warnings)
     by_username = {
         normalize_of_username(str(item.get("username") or "")): item
         for item in subscribers
@@ -607,6 +612,8 @@ def sync_subscribers(state: dict[str, Any]) -> dict[str, Any]:
         "duration_seconds": 0.0,
         "expired_users": [],
         "warnings": sync_warnings,
+        "partial_sync": partial_sync,
+        "skipped_inactive_due_to_partial_sync": 0,
     }
 
     for user_id_text, record in state.get("users", {}).items():
@@ -635,6 +642,10 @@ def sync_subscribers(state: dict[str, Any]) -> dict[str, Any]:
                 grant_access(record, now=now)
                 if previous_expiry is None or previous_expiry <= now + timedelta(days=1):
                     summary["renewed"] += 1
+            continue
+
+        if partial_sync:
+            summary["skipped_inactive_due_to_partial_sync"] += 1
             continue
 
         was_approved = record.get("status") == "approved"
@@ -667,6 +678,7 @@ def format_sync_summary(summary: dict[str, Any]) -> str:
         f"Renewed access: {summary['renewed']}\n"
         f"Expired access: {summary['expired']}\n"
         f"Inactive claims: {summary['inactive']}\n"
+        f"Skipped inactive checks: {summary['skipped_inactive_due_to_partial_sync']}\n"
         f"Duration: {summary['duration_seconds']}s"
     )
     warnings = summary.get("warnings") or []
