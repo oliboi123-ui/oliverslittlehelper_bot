@@ -404,8 +404,10 @@ def ofauth_request_json(
         raise RuntimeError("OFAuth returned invalid JSON.") from exc
 
 
-def fetch_active_subscribers(limit: int = 100) -> list[dict[str, Any]]:
+def fetch_active_subscribers(limit: int = 100) -> tuple[list[dict[str, Any]], list[str]]:
     subscribers: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    seen_keys: set[str] = set()
     offset = 0
     page_number = 0
     max_pages = get_ofauth_max_pages()
@@ -445,10 +447,13 @@ def fetch_active_subscribers(limit: int = 100) -> list[dict[str, Any]]:
             sort_keys=True,
         )
         if previous_page_fingerprint is not None and page_fingerprint == previous_page_fingerprint:
-            raise RuntimeError(
-                "OFAuth returned the same subscriber page twice in a row. "
-                "Pagination appears stuck or the offset may be ignored."
+            warning = (
+                "OFAuth repeated the same subscriber page twice. "
+                "The sync stopped early and used the unique subscribers already collected."
             )
+            warnings.append(warning)
+            LOGGER.warning(warning)
+            break
         previous_page_fingerprint = page_fingerprint
         LOGGER.info(
             "OFAuth sync received page %s with %s subscribers (hasMore=%s).",
@@ -456,18 +461,45 @@ def fetch_active_subscribers(limit: int = 100) -> list[dict[str, Any]]:
             len(batch),
             bool(payload.get("hasMore")),
         )
-        subscribers.extend(batch)
-        if not payload.get("hasMore") or not batch:
+        added_this_page = 0
+        for item in batch:
+            unique_key = str(item.get("id") or normalize_of_username(str(item.get("username") or "")))
+            if not unique_key or unique_key in seen_keys:
+                continue
+            seen_keys.add(unique_key)
+            subscribers.append(item)
+            added_this_page += 1
+        if not batch:
+            break
+        if len(batch) < limit:
+            if payload.get("hasMore"):
+                warning = (
+                    "OFAuth reported more subscriber pages even though the current page was not full. "
+                    "The sync treated this as the end of the list."
+                )
+                warnings.append(warning)
+                LOGGER.warning(warning)
+            break
+        if added_this_page == 0:
+            warning = (
+                "OFAuth returned a subscriber page with no new unique entries. "
+                "The sync stopped early to avoid looping forever."
+            )
+            warnings.append(warning)
+            LOGGER.warning(warning)
+            break
+        if not payload.get("hasMore"):
             break
         offset += len(batch)
-    return subscribers
+    return subscribers, warnings
 
 
 def find_active_subscriber_by_username(claimed_username: str) -> dict[str, Any] | None:
     normalized = normalize_of_username(claimed_username)
     if not normalized:
         return None
-    for subscriber in fetch_active_subscribers():
+    subscribers, _warnings = fetch_active_subscribers()
+    for subscriber in subscribers:
         if normalize_of_username(str(subscriber.get("username") or "")) == normalized:
             return subscriber
     return None
@@ -476,7 +508,7 @@ def find_active_subscriber_by_username(claimed_username: str) -> dict[str, Any] 
 def sync_subscribers(state: dict[str, Any]) -> dict[str, Any]:
     now = utc_now()
     started_at = time.monotonic()
-    subscribers = fetch_active_subscribers()
+    subscribers, sync_warnings = fetch_active_subscribers()
     by_username = {
         normalize_of_username(str(item.get("username") or "")): item
         for item in subscribers
@@ -493,6 +525,7 @@ def sync_subscribers(state: dict[str, Any]) -> dict[str, Any]:
         "matched": 0,
         "duration_seconds": 0.0,
         "expired_users": [],
+        "warnings": sync_warnings,
     }
 
     for user_id_text, record in state.get("users", {}).items():
@@ -545,7 +578,7 @@ def sync_subscribers(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def format_sync_summary(summary: dict[str, Any]) -> str:
-    return (
+    message = (
         "OnlyFans sync complete.\n\n"
         f"Checked at: {summary['checked_at']}\n"
         f"Active subscribers seen: {summary['active_subscribers_seen']}\n"
@@ -555,6 +588,10 @@ def format_sync_summary(summary: dict[str, Any]) -> str:
         f"Inactive claims: {summary['inactive']}\n"
         f"Duration: {summary['duration_seconds']}s"
     )
+    warnings = summary.get("warnings") or []
+    if warnings:
+        message += "\n\nWarnings:\n- " + "\n- ".join(str(item) for item in warnings[:5])
+    return message
 
 
 def format_expired_access_alert(summary: dict[str, Any]) -> str | None:
