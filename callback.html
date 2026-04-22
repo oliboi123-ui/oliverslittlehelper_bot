@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OFAuth Callback</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: #111827;
+      color: #f9fafb;
+      display: grid;
+      min-height: 100vh;
+      place-items: center;
+      padding: 24px;
+    }
+    main {
+      max-width: 640px;
+      width: 100%;
+      background: #1f2937;
+      border: 1px solid #374151;
+      border-radius: 16px;
+      padding: 24px;
+      box-sizing: border-box;
+    }
+    h1 {
+      margin-top: 0;
+      font-size: 28px;
+    }
+    code {
+      word-break: break-all;
+      white-space: pre-wrap;
+      display: block;
+      background: #0f172a;
+      padding: 12px;
+      border-radius: 10px;
+      margin-top: 12px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Connection received</h1>
+    <p>If OFAuth redirected here successfully, your connection details are in the URL.</p>
+    <p>Copy the <code>connection_id</code> from the address bar if you need it manually.</p>
+    <code id="params">Loading...</code>
+  </main>
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    document.getElementById("params").textContent = params.toString() || "No query parameters found.";
+  </script>
+</body>
+</html>
