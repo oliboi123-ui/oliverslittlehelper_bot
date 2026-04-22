@@ -1,0 +1,6 @@
+.env
+.venv/
+.venv.broken-20260422/
+__pycache__/
+*.log
+bot_state.json
