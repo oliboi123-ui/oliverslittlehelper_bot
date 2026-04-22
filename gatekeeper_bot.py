@@ -93,6 +93,10 @@ def get_ofauth_max_pages() -> int:
     return int(os.getenv("OFAUTH_MAX_PAGES", "5"))
 
 
+def get_ofauth_page_size() -> int:
+    return int(os.getenv("OFAUTH_PAGE_SIZE", "10"))
+
+
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -404,10 +408,11 @@ def ofauth_request_json(
         raise RuntimeError("OFAuth returned invalid JSON.") from exc
 
 
-def fetch_active_subscribers(limit: int = 100) -> tuple[list[dict[str, Any]], list[str]]:
+def fetch_active_subscribers(limit: int | None = None) -> tuple[list[dict[str, Any]], list[str]]:
     subscribers: list[dict[str, Any]] = []
     warnings: list[str] = []
     seen_keys: set[str] = set()
+    page_size = limit or get_ofauth_page_size()
     offset = 0
     page_number = 0
     max_pages = get_ofauth_max_pages()
@@ -423,12 +428,12 @@ def fetch_active_subscribers(limit: int = 100) -> tuple[list[dict[str, Any]], li
             "OFAuth sync fetching subscribers page %s (offset=%s, limit=%s, timeout=%ss).",
             page_number,
             offset,
-            limit,
+            page_size,
             timeout,
         )
         payload = ofauth_request_json(
             "/v2/access/subscribers",
-            {"type": "active", "limit": limit, "offset": offset},
+            {"type": "active", "limit": page_size, "offset": offset},
             timeout_seconds=timeout,
         )
         batch = payload.get("list") or []
@@ -470,15 +475,6 @@ def fetch_active_subscribers(limit: int = 100) -> tuple[list[dict[str, Any]], li
             subscribers.append(item)
             added_this_page += 1
         if not batch:
-            break
-        if len(batch) < limit:
-            if payload.get("hasMore"):
-                warning = (
-                    "OFAuth reported more subscriber pages even though the current page was not full. "
-                    "The sync treated this as the end of the list."
-                )
-                warnings.append(warning)
-                LOGGER.warning(warning)
             break
         if added_this_page == 0:
             warning = (
