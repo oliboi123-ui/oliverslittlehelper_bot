@@ -277,6 +277,7 @@ def fetch_active_subscribers(limit: int = 100) -> list[dict[str, Any]]:
     page_number = 0
     max_pages = get_ofauth_max_pages()
     timeout = get_ofauth_timeout_seconds()
+    previous_page_fingerprint: str | None = None
     while True:
         page_number += 1
         if page_number > max_pages:
@@ -298,6 +299,24 @@ def fetch_active_subscribers(limit: int = 100) -> list[dict[str, Any]]:
         batch = payload.get("list") or []
         if not isinstance(batch, list):
             raise RuntimeError("OFAuth returned an unexpected subscriber payload.")
+        page_fingerprint = json.dumps(
+            [
+                {
+                    "id": item.get("id"),
+                    "username": item.get("username"),
+                    "expiredAt": item.get("expiredAt"),
+                }
+                for item in batch
+            ],
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+        if previous_page_fingerprint is not None and page_fingerprint == previous_page_fingerprint:
+            raise RuntimeError(
+                "OFAuth returned the same subscriber page twice in a row. "
+                "Pagination appears stuck or the offset may be ignored."
+            )
+        previous_page_fingerprint = page_fingerprint
         LOGGER.info(
             "OFAuth sync received page %s with %s subscribers (hasMore=%s).",
             page_number,
