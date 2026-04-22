@@ -2,6 +2,8 @@ import asyncio
 import json
 import logging
 import os
+import socket
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -72,6 +74,14 @@ def get_ofauth_user_agent() -> str:
         "OFAUTH_USER_AGENT",
         "oliverslittlehelper-bot/1.0 (+https://github.com/oliboi123-ui/oliverslittlehelper_bot)",
     ).strip()
+
+
+def get_ofauth_timeout_seconds() -> float:
+    return float(os.getenv("OFAUTH_TIMEOUT_SECONDS", "10"))
+
+
+def get_ofauth_max_pages() -> int:
+    return int(os.getenv("OFAUTH_MAX_PAGES", "5"))
 
 
 def utc_now() -> datetime:
@@ -216,13 +226,19 @@ def ofauth_is_configured() -> bool:
     return bool(get_optional_env("OFAUTH_API_KEY") and get_optional_env("OFAUTH_CONNECTION_ID"))
 
 
-def ofauth_request_json(path: str, query: dict[str, Any] | None = None) -> dict[str, Any]:
+def ofauth_request_json(
+    path: str,
+    query: dict[str, Any] | None = None,
+    *,
+    timeout_seconds: float | None = None,
+) -> dict[str, Any]:
     api_key = get_required_env("OFAUTH_API_KEY")
     connection_id = get_required_env("OFAUTH_CONNECTION_ID")
     query_string = ""
     if query:
         query_string = "?" + urllib_parse.urlencode(query)
     url = f"{get_ofauth_base_url()}{path}{query_string}"
+    timeout = timeout_seconds if timeout_seconds is not None else get_ofauth_timeout_seconds()
     request = urllib_request.Request(
         url,
         headers={
@@ -234,12 +250,20 @@ def ofauth_request_json(path: str, query: dict[str, Any] | None = None) -> dict[
         method="GET",
     )
     try:
-        with urllib_request.urlopen(request, timeout=30) as response:
+        with urllib_request.urlopen(request, timeout=timeout) as response:
             payload = response.read().decode("utf-8")
+    except TimeoutError as exc:
+        raise RuntimeError(f"OFAuth request timed out after {timeout:g}s.") from exc
+    except socket.timeout as exc:
+        raise RuntimeError(f"OFAuth request timed out after {timeout:g}s.") from exc
     except urllib_error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"OFAuth request failed with {exc.code}: {body}") from exc
     except urllib_error.URLError as exc:
+        if isinstance(exc.reason, TimeoutError):
+            raise RuntimeError(f"OFAuth request timed out after {timeout:g}s.") from exc
+        if isinstance(exc.reason, socket.timeout):
+            raise RuntimeError(f"OFAuth request timed out after {timeout:g}s.") from exc
         raise RuntimeError(f"OFAuth request failed: {exc.reason}") from exc
     try:
         return json.loads(payload)
@@ -250,14 +274,36 @@ def ofauth_request_json(path: str, query: dict[str, Any] | None = None) -> dict[
 def fetch_active_subscribers(limit: int = 100) -> list[dict[str, Any]]:
     subscribers: list[dict[str, Any]] = []
     offset = 0
+    page_number = 0
+    max_pages = get_ofauth_max_pages()
+    timeout = get_ofauth_timeout_seconds()
     while True:
+        page_number += 1
+        if page_number > max_pages:
+            raise RuntimeError(
+                f"OFAuth sync stopped after {max_pages} pages. Increase OFAUTH_MAX_PAGES if this is expected."
+            )
+        LOGGER.info(
+            "OFAuth sync fetching subscribers page %s (offset=%s, limit=%s, timeout=%ss).",
+            page_number,
+            offset,
+            limit,
+            timeout,
+        )
         payload = ofauth_request_json(
             "/v2/access/subscribers",
             {"type": "active", "limit": limit, "offset": offset},
+            timeout_seconds=timeout,
         )
         batch = payload.get("list") or []
         if not isinstance(batch, list):
             raise RuntimeError("OFAuth returned an unexpected subscriber payload.")
+        LOGGER.info(
+            "OFAuth sync received page %s with %s subscribers (hasMore=%s).",
+            page_number,
+            len(batch),
+            bool(payload.get("hasMore")),
+        )
         subscribers.extend(batch)
         if not payload.get("hasMore") or not batch:
             break
@@ -277,6 +323,7 @@ def find_active_subscriber_by_username(claimed_username: str) -> dict[str, Any] 
 
 def sync_subscribers(state: dict[str, Any]) -> dict[str, Any]:
     now = utc_now()
+    started_at = time.monotonic()
     subscribers = fetch_active_subscribers()
     by_username = {
         normalize_of_username(str(item.get("username") or "")): item
@@ -292,6 +339,7 @@ def sync_subscribers(state: dict[str, Any]) -> dict[str, Any]:
         "expired": 0,
         "inactive": 0,
         "matched": 0,
+        "duration_seconds": 0.0,
     }
 
     for user_id_text, record in state.get("users", {}).items():
@@ -329,6 +377,7 @@ def sync_subscribers(state: dict[str, Any]) -> dict[str, Any]:
         summary["inactive"] += 1
         LOGGER.info("Marked user %s inactive after OFAuth sync.", user_id_text)
 
+    summary["duration_seconds"] = round(time.monotonic() - started_at, 2)
     return summary
 
 
@@ -340,7 +389,8 @@ def format_sync_summary(summary: dict[str, Any]) -> str:
         f"Matched users: {summary['matched']}\n"
         f"Renewed access: {summary['renewed']}\n"
         f"Expired access: {summary['expired']}\n"
-        f"Inactive claims: {summary['inactive']}"
+        f"Inactive claims: {summary['inactive']}\n"
+        f"Duration: {summary['duration_seconds']}s"
     )
 
 
