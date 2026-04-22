@@ -476,23 +476,24 @@ def verify_onlyfans_username(claimed_username: str) -> dict[str, Any]:
 
     detailed_users = get_users_by_ids([onlyfans_user_id])
     detailed = detailed_users[0] if detailed_users else profile
-    subscribed_by = detailed.get("subscribedBy")
-    subscribed_data = detailed.get("subscribedByData") or {}
+    subscribed_on = detailed.get("subscribedOn")
+    subscribed_data = detailed.get("subscribedOnData") or {}
     has_active_paid = bool(subscribed_data.get("hasActivePaidSubscriptions"))
     status_text = str(subscribed_data.get("status") or "").strip().lower()
     expired_at = (
         subscribed_data.get("expiredAt")
+        or detailed.get("subscribedOnExpireDate")
         or detailed.get("subscribedByExpireDate")
         or detailed.get("expiredAt")
     )
-    is_expired_now = bool(detailed.get("subscribedIsExpiredNow"))
+    is_expired_now = bool(detailed.get("subscribedOnExpiredNow") or detailed.get("subscribedIsExpiredNow"))
 
     verified = False
     if has_active_paid:
         verified = True
     elif status_text in {"active", "current"} and not is_expired_now:
         verified = True
-    elif subscribed_by is True and not is_expired_now:
+    elif subscribed_on is True and not is_expired_now:
         verified = True
 
     if verified:
@@ -512,10 +513,10 @@ def verify_onlyfans_username(claimed_username: str) -> dict[str, Any]:
         "expired_at": expired_at,
         "source": "users/list",
         "reason": (
-            f"subscribedBy={subscribed_by}, "
+            f"subscribedOn={subscribed_on}, "
             f"hasActivePaidSubscriptions={has_active_paid}, "
             f"status={status_text or 'unknown'}, "
-            f"subscribedIsExpiredNow={is_expired_now}"
+            f"subscribedOnExpiredNow={is_expired_now}"
         ),
     }
 
