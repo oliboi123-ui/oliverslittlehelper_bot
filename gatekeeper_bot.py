@@ -573,11 +573,14 @@ def begin_test_mode_session(state: dict[str, Any], user: Any) -> dict[str, Any]:
     session["active"] = True
     session["started_at"] = to_iso(utc_now())
     session["buyer_user_id"] = get_test_session_user_id(user.id)
+    session["buyer_chat_id"] = user.id
 
     record = get_user_record(state, session["buyer_user_id"])
     record.clear()
     record.update(default_user_record())
     record["test_mode"] = True
+    record["test_mode_buyer_user_id"] = session["buyer_user_id"]
+    record["test_mode_chat_id"] = session["buyer_chat_id"]
     record["status"] = "new"
     record["telegram_username"] = "test_mode"
     record["first_name"] = "Test"
@@ -627,10 +630,12 @@ def end_test_mode_session(state: dict[str, Any], user: Any) -> None:
         session["ended_at"] = to_iso(utc_now())
 
 
-def get_test_mode_real_user_id(state: dict[str, Any], sandbox_user_id: int) -> int | None:
+def get_test_mode_chat_id(state: dict[str, Any], sandbox_user_id: int) -> int | None:
     for admin_user_id, session in get_test_sessions(state).items():
         if int(session.get("buyer_user_id") or 0) == sandbox_user_id and session.get("active"):
-            return int(admin_user_id)
+            chat_id = session.get("buyer_chat_id")
+            if chat_id is not None:
+                return int(chat_id)
     return None
 
 
@@ -2152,12 +2157,14 @@ async def send_relay_contact(
     record: dict[str, Any],
     *,
     now: datetime | None = None,
+    target_chat_id: int | None = None,
 ) -> tuple[int, str]:
     current_time = now or utc_now()
     topic_id, topic_name = await ensure_relay_topic(bot, state, user_id, record)
     set_contact_mode(record, "relay", now=current_time)
-    await bot.send_message(chat_id=user_id, text=relay_access_message(record), protect_content=True)
-    await send_and_pin_payment_message(bot, user_id, record)
+    chat_id = target_chat_id if target_chat_id is not None else user_id
+    await bot.send_message(chat_id=chat_id, text=relay_access_message(record), protect_content=True)
+    await send_and_pin_payment_message(bot, chat_id, record, callback_user_id=user_id)
     relay_group_id = get_relay_group_id()
     if relay_group_id is not None:
         await bot.send_message(
@@ -2197,7 +2204,8 @@ async def relay_buyer_message(
     if relay_group_id is None or not isinstance(relay_topic_id, int):
         await update.message.reply_text("Your relay chat is not ready yet. Please wait a moment.")
         return
-    get_relay_topics(state)[str(relay_topic_id)] = update.effective_user.id
+    logical_user_id = int(record.get("test_mode_buyer_user_id") or update.effective_user.id)
+    get_relay_topics(state)[str(relay_topic_id)] = logical_user_id
     save_state(state)
 
     try:
@@ -2257,9 +2265,11 @@ async def relay_admin_group_message(update: Update, context: ContextTypes.DEFAUL
         )
         return
 
+    target_chat_id = int(record.get("test_mode_chat_id") or 0) or get_test_mode_chat_id(state, user_id) or user_id
+
     try:
         await context.bot.copy_message(
-            chat_id=user_id,
+            chat_id=target_chat_id,
             from_chat_id=update.effective_chat.id,
             message_id=update.message.message_id,
             protect_content=True,
@@ -2287,10 +2297,9 @@ async def ask_budget_question(message_target: Any) -> None:
 
 
 def test_mode_access_message(record: dict[str, Any]) -> str:
-    private_username = get_required_env("PRIVATE_TELEGRAM_USERNAME")
     return (
-        "Test mode is active.\n\n"
-        f"{direct_access_message(private_username, record)}\n\n"
+        "Relay sandbox is active.\n\n"
+        f"{relay_access_message(record)}\n\n"
         "Use the sandbox buttons below to simulate payment and unlock content."
     )
 
@@ -2308,8 +2317,8 @@ def test_mode_prompt_message(record: dict[str, Any]) -> str:
     if is_access_active(record):
         return test_mode_access_message(record)
     return (
-        "Test mode is active.\n\n"
-        "Send a fake OnlyFans username to walk the buyer flow. "
+        "Relay sandbox is active.\n\n"
+        "Send a message to walk the buyer flow. "
         "Run /testmode again to exit the sandbox."
     )
 
@@ -2456,12 +2465,13 @@ async def complete_application(
         record["status"] = "approved"
         save_state(state)
         await update.message.reply_text(application_confirmation_message(record))
-        await update.message.reply_text(test_mode_access_message(record))
-        await send_and_pin_payment_message(
+        await send_relay_contact(
             context.bot,
-            user.id,
+            state,
+            int(record.get("test_mode_buyer_user_id") or get_test_session_user_id(user.id)),
             record,
-            callback_user_id=get_test_session_user_id(user.id),
+            now=current_time,
+            target_chat_id=user.id,
         )
         return
 
@@ -2559,13 +2569,11 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         record["telegram_username"] = "test_mode"
         record["first_name"] = "Test"
         record["last_name"] = "Buyer"
-        await handle_test_mode_private_message(update, context, state, record)
-        return
-
-    record = get_user_record(state, user.id)
-    record["telegram_username"] = user.username
-    record["first_name"] = user.first_name
-    record["last_name"] = user.last_name
+    else:
+        record = get_user_record(state, user.id)
+        record["telegram_username"] = user.username
+        record["first_name"] = user.first_name
+        record["last_name"] = user.last_name
     mark_expired_if_needed(record)
 
     admin_chat_id = resolve_admin_chat_id(state, user)
@@ -2918,12 +2926,17 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if item is None:
             await query.answer("That vault item is no longer registered.", show_alert=True)
             return
+        target_chat_id = (
+            int(unlock_record.get("test_mode_chat_id"))
+            if unlock_record.get("test_mode") and unlock_record.get("test_mode_chat_id") is not None
+            else None
+        )
         await deliver_vault_item(
             context.bot,
             state,
             unlock_user_id,
             item_key,
-            target_chat_id=query.message.chat.id if unlock_record.get("test_mode") else None,
+            target_chat_id=target_chat_id,
         )
         unlock_record.setdefault("content_unlocks", []).append(
             {
@@ -3288,9 +3301,43 @@ async def testmode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     record = begin_test_mode_session(state, update.effective_user)
+    current_time = utc_now()
+    grant_access(record, now=current_time)
+    record["status"] = "approved"
+    record["subscription_status"] = "active"
+    record["subscription_expires_at"] = to_iso(current_time + timedelta(days=get_access_duration_days()))
+    record["onlyfans_user_id"] = f"test-{update.effective_user.id}"
+    record["payment_status"] = "pending"
+    record["payment_requested_at"] = None
+    record["payment_confirmed_at"] = None
+    record["test_mode"] = True
     save_state(state)
-    log_event("test_mode_started", buyer_id=update.effective_user.id)
-    await update.message.reply_text(test_mode_prompt_message(record))
+    relay_group_id = get_relay_group_id()
+    if relay_group_id is None:
+        await update.message.reply_text("Relay is not configured yet. Set RELAY_ADMIN_GROUP_ID first.")
+        return
+
+    try:
+        topic_id, topic_name = await send_relay_contact(
+            context.bot,
+            state,
+            record["test_mode_buyer_user_id"],
+            record,
+            now=current_time,
+            target_chat_id=update.effective_user.id,
+        )
+    except Exception as exc:
+        LOGGER.exception("Could not start relay test mode.")
+        await update.message.reply_text(f"Test mode could not start: {exc}")
+        return
+
+    save_state(state)
+    log_event("test_mode_started", buyer_id=update.effective_user.id, relay_topic_id=topic_id, relay_topic_name=topic_name)
+    await update.message.reply_text(
+        "Relay test mode is active.\n\n"
+        f"Topic: {topic_name}\n"
+        "Use this chat like a buyer. Run /testmode again to exit."
+    )
 
 
 async def verifyof(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3781,10 +3828,8 @@ async def non_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         record["telegram_username"] = "test_mode"
         record["first_name"] = "Test"
         record["last_name"] = "Buyer"
-        await handle_test_mode_private_message(update, context, state, record)
-        return
-
-    record = get_user_record(state, update.effective_user.id)
+    else:
+        record = get_user_record(state, update.effective_user.id)
     mark_expired_if_needed(record)
     if is_closed_record(record):
         save_state(state)
