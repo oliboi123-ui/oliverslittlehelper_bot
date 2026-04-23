@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import json
 import logging
 import os
@@ -240,18 +240,18 @@ def access_status_line(record: dict[str, Any]) -> str:
 def verification_badge(record: dict[str, Any]) -> str:
     status = record.get("subscription_status") or "unknown"
     if status == "active":
-        return "âœ…"
+        return "OK"
     if status == "inactive":
-        return "âŒ"
+        return "NO"
     return "?"
 
 
 def verification_summary(record: dict[str, Any]) -> str:
     status = record.get("subscription_status") or "unknown"
     if status == "active":
-        return "âœ… Verified"
+        return "Verified"
     if status == "inactive":
-        return "âŒ Unverified"
+        return "Unverified"
     return "Verification pending"
 
 
@@ -397,7 +397,7 @@ def truncate_text(value: str, limit: int) -> str:
     text = value.strip()
     if len(text) <= limit:
         return text
-    return text[: max(limit - 1, 1)].rstrip() + "â€¦"
+    return text[: max(limit - 3, 1)].rstrip() + "..."
 
 
 def build_relay_topic_name(record: dict[str, Any]) -> str:
@@ -1320,7 +1320,7 @@ async def relay_buyer_message(
     except Exception as exc:
         LOGGER.exception("Could not relay buyer message for user %s.", update.effective_user.id)
         save_state(state)
-        await update.message.reply_text("I couldnâ€™t send that through just now. Please try again in a moment.")
+        await update.message.reply_text("I couldn't send that through just now. Please try again in a moment.")
         admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
         if admin_chat_id:
             try:
@@ -1913,7 +1913,7 @@ async def verifyof(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if verification_result.get("verified"):
         lines = [
-            "âœ… Verified",
+            "Verified",
             "",
             f"OF username: {verification_result.get('username') or claimed_username}",
             f"Subscription: active until {format_datetime_for_user(verification_result.get('expired_at'), empty='an unknown date')}",
@@ -1930,7 +1930,7 @@ async def verifyof(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     lines = [
-        "âŒ Unverified",
+        "Unverified",
         "",
         f"OF username: {verification_result.get('username') or claimed_username}",
         "No active subscription found.",
