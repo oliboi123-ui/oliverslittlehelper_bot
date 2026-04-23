@@ -2896,7 +2896,10 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         record["clarification_requested_at"] = to_iso(utc_now())
         save_state(state)
         log_event("clarification_requested", buyer_id=user_id)
-        await context.bot.send_message(chat_id=user_id, text=template("clarification_request"))
+        await context.bot.send_message(
+            chat_id=get_buyer_chat_id(record, user_id),
+            text=template("clarification_request"),
+        )
         await query.edit_message_text(format_review_card(user_id, record, "Clarification requested"))
         await query.answer("Clarification requested.")
         return
@@ -2909,7 +2912,10 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         record["onlyfans_user_id"] = None
         save_state(state)
         log_event("onlyfans_username_retry_requested", buyer_id=user_id)
-        await context.bot.send_message(chat_id=user_id, text=of_username_not_verified_message(None))
+        await context.bot.send_message(
+            chat_id=get_buyer_chat_id(record, user_id),
+            text=of_username_not_verified_message(None),
+        )
         await query.edit_message_text(format_review_card(user_id, record, "Asked buyer to retry OnlyFans username"))
         await query.answer("Username retry requested.")
         return
@@ -2933,7 +2939,10 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         save_state(state)
         log_event("banned", buyer_id=user_id, trigger="button")
         try:
-            await context.bot.send_message(chat_id=user_id, text=template("banned"))
+            await context.bot.send_message(
+                chat_id=get_buyer_chat_id(record, user_id),
+                text=template("banned"),
+            )
         except Exception:
             LOGGER.exception("Could not notify banned user %s.", user_id)
         await query.edit_message_text(format_review_card(user_id, record, "Banned"))
@@ -2946,7 +2955,10 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         save_state(state)
         log_event("not_fit", buyer_id=user_id, trigger="button")
         try:
-            await context.bot.send_message(chat_id=user_id, text=template("not_fit"))
+            await context.bot.send_message(
+                chat_id=get_buyer_chat_id(record, user_id),
+                text=template("not_fit"),
+            )
         except Exception:
             LOGGER.exception("Could not notify not-fit user %s.", user_id)
         await query.edit_message_text(format_review_card(user_id, record, "Closed as not a fit"))
@@ -2961,7 +2973,10 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         record["payment_confirmed_at"] = to_iso(utc_now())
         save_state(state)
         log_event("payment_confirmed", buyer_id=user_id, trigger="button")
-        await context.bot.send_message(chat_id=user_id, text=template("payment_confirmed"))
+        await context.bot.send_message(
+            chat_id=get_buyer_chat_id(record, user_id),
+            text=template("payment_confirmed"),
+        )
         await query.edit_message_text(
             format_review_card(user_id, record, "Payment confirmed"),
             reply_markup=build_post_approval_keyboard(user_id, record),
@@ -2977,7 +2992,10 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         record["payment_reminded_at"] = to_iso(utc_now())
         save_state(state)
         log_event("payment_reminder_sent", buyer_id=user_id, trigger="button")
-        await context.bot.send_message(chat_id=user_id, text=template("payment_reminder"))
+        await context.bot.send_message(
+            chat_id=get_buyer_chat_id(record, user_id),
+            text=template("payment_reminder"),
+        )
         await query.edit_message_text(
             format_review_card(user_id, record, "Payment reminder sent"),
             reply_markup=build_post_approval_keyboard(user_id, record),
@@ -3053,7 +3071,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         save_state(state)
         log_event("rejected", buyer_id=user_id, trigger="button")
         await context.bot.send_message(
-            chat_id=user_id,
+            chat_id=get_buyer_chat_id(record, user_id),
             text=template("rejected"),
         )
         await query.edit_message_text(format_review_card(user_id, record, "Rejected"))
