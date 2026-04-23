@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import socket
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -23,13 +24,71 @@ from telegram.ext import (
 )
 
 
-logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    level=logging.INFO,
-)
 LOGGER = logging.getLogger("gatekeeper_bot")
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+LOG_RECORD_RESERVED_KEYS = set(
+    logging.LogRecord("", 0, "", 0, "", (), None).__dict__.keys()
+)
+
+
+class MaxLevelFilter(logging.Filter):
+    def __init__(self, max_level: int) -> None:
+        super().__init__()
+        self.max_level = max_level
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno < self.max_level
+
+
+class JsonLogFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload: dict[str, Any] = {
+            "timestamp": datetime.fromtimestamp(record.created, timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
+            "level": record.levelname.lower(),
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        for key, value in sorted(record.__dict__.items()):
+            if key.startswith("_") or key in LOG_RECORD_RESERVED_KEYS:
+                continue
+            payload[key] = value
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=True, default=str)
+
+
+def configure_logging() -> None:
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+    root_logger.setLevel(logging.INFO)
+
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setLevel(logging.INFO)
+    stdout_handler.addFilter(MaxLevelFilter(logging.WARNING))
+    stdout_handler.setFormatter(JsonLogFormatter())
+
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setLevel(logging.WARNING)
+    stderr_handler.setFormatter(JsonLogFormatter())
+
+    root_logger.addHandler(stdout_handler)
+    root_logger.addHandler(stderr_handler)
+
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+def log_event(event: str, level: int = logging.INFO, **attributes: Any) -> None:
+    safe_attributes = {
+        key: value
+        for key, value in attributes.items()
+        if value is not None
+    }
+    LOGGER.log(level, event.replace("_", " "), extra={"event": event, **safe_attributes})
 
 ENV_PATH = Path(__file__).with_name(".env")
 try:
@@ -1520,6 +1579,8 @@ async def send_and_pin_payment_message(bot: Any, user_id: int, record: dict[str,
         )
     except Exception:
         LOGGER.exception("Could not pin payment message for user %s.", user_id)
+        log_event("payment_pin_failed", logging.WARNING, buyer_id=user_id)
+    log_event("payment_requested", buyer_id=user_id)
 
 
 async def send_direct_contact(
@@ -1592,6 +1653,12 @@ async def relay_buyer_message(
         )
     except Exception as exc:
         LOGGER.exception("Could not relay buyer message for user %s.", update.effective_user.id)
+        log_event(
+            "relay_delivery_failed",
+            logging.ERROR,
+            direction="buyer_to_admin",
+            buyer_id=update.effective_user.id,
+        )
         save_state(state)
         await update.message.reply_text("I couldn't send that through just now. Please try again in a moment.")
         admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
@@ -1643,6 +1710,12 @@ async def relay_admin_group_message(update: Update, context: ContextTypes.DEFAUL
         )
     except Exception as exc:
         LOGGER.exception("Could not relay admin message to user %s.", user_id)
+        log_event(
+            "relay_delivery_failed",
+            logging.ERROR,
+            direction="admin_to_buyer",
+            buyer_id=user_id,
+        )
         await context.bot.send_message(
             chat_id=relay_group_id,
             message_thread_id=record.get("relay_topic_id"),
@@ -1676,6 +1749,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         first_admin_setup = state.get("admin_chat_id") != admin_chat_id
         state["admin_chat_id"] = admin_chat_id
         save_state(state)
+        log_event("admin_dashboard_opened", first_setup=first_admin_setup)
         heading = (
             "Setup complete. This chat is now your private admin inbox."
             if first_admin_setup
@@ -1712,6 +1786,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     begin_application(record)
     save_state(state)
+    log_event("application_started", buyer_id=user.id)
     await update.message.reply_text(of_username_help_message())
 
 
@@ -1738,12 +1813,14 @@ async def complete_application(
             exact_match_note = f"OFAuth check: error ({exc})"
             verified_subscription = True
             record["subscription_status"] = "unknown"
+            log_event("ofauth_error", logging.WARNING, buyer_id=user.id, stage="intake")
         else:
             if verification_result.get("verified"):
                 record["subscription_status"] = "active"
                 record["onlyfans_user_id"] = verification_result.get("id")
                 record["subscription_expires_at"] = verification_result.get("expired_at")
                 verified_subscription = True
+                log_event("ofauth_verified", buyer_id=user.id, stage="intake")
             else:
                 record["subscription_status"] = "inactive"
                 record["subscription_expires_at"] = None
@@ -1760,6 +1837,7 @@ async def complete_application(
         record["review_priority"] = "normal"
         record["queued_at"] = None
         save_state(state)
+        log_event("ofauth_unverified", buyer_id=user.id, stage="intake")
         await update.message.reply_text(of_username_not_verified_message(submitted_username))
         return
 
@@ -1768,15 +1846,29 @@ async def complete_application(
         record["status"] = "low_priority"
         record["review_priority"] = "low"
         save_state(state)
+        log_event(
+            "low_priority_queued",
+            buyer_id=user.id,
+            budget_key=record.get("budget_range_key"),
+            verified=record.get("subscription_status") == "active",
+        )
         await update.message.reply_text(low_priority_message())
         return
 
     record["status"] = "pending"
     save_state(state)
+    log_event(
+        "application_submitted",
+        buyer_id=user.id,
+        priority=record.get("review_priority"),
+        budget_key=record.get("budget_range_key"),
+        verified=record.get("subscription_status") == "active",
+    )
     await update.message.reply_text(application_confirmation_message(record))
 
     if not admin_chat_id:
         LOGGER.warning("No admin chat configured yet. Request stored but not delivered.")
+        log_event("admin_not_configured", logging.WARNING, buyer_id=user.id)
         return
 
     admin_text = format_review_card(user.id, record, "New gatekeeper request")
@@ -1830,6 +1922,7 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if status in {"new", "rejected", "expired"}:
         begin_application(record)
         save_state(state)
+        log_event("application_started", buyer_id=user.id, previous_status=status)
         await update.message.reply_text(of_username_help_message())
         return
 
@@ -1837,6 +1930,7 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         record["of_username"] = update.message.text.strip()
         record["status"] = "awaiting_budget_range"
         save_state(state)
+        log_event("onlyfans_username_received", buyer_id=user.id)
         await ask_budget_question(update.message)
         return
 
@@ -1854,6 +1948,7 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         record["status"] = "pending"
         record["queued_at"] = to_iso(utc_now())
         save_state(state)
+        log_event("clarification_received", buyer_id=user.id)
         await update.message.reply_text(
             "Thanks. I added that to your request and will review it personally."
         )
@@ -1902,6 +1997,12 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         record["review_priority"] = option["priority"]
         record["status"] = "awaiting_purchase_intent"
         save_state(state)
+        log_event(
+            "budget_selected",
+            buyer_id=query.from_user.id,
+            budget_key=option["key"],
+            priority=option["priority"],
+        )
         await query.answer("Budget range saved.")
         if query.message is not None:
             await query.edit_message_text(
@@ -1974,10 +2075,12 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 await query.answer("OFAuth is not configured.", show_alert=True)
                 return
             await query.answer("Syncing OnlyFans...")
+            log_event("ofauth_sync_started", trigger="dashboard")
             try:
                 summary = await asyncio.to_thread(sync_subscribers, state)
             except Exception as exc:
                 LOGGER.exception("OFAuth sync failed from admin dashboard.")
+                log_event("ofauth_sync_failed", logging.ERROR, trigger="dashboard")
                 await context.bot.send_message(
                     chat_id=query.message.chat.id,
                     text=f"OnlyFans sync failed: {exc}",
@@ -1985,6 +2088,16 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 )
                 return
             save_state(state)
+            log_event(
+                "ofauth_sync_completed",
+                trigger="dashboard",
+                active_seen=summary.get("active_subscribers_seen"),
+                matched=summary.get("matched"),
+                renewed=summary.get("renewed"),
+                expired=summary.get("expired"),
+                inactive=summary.get("inactive"),
+                partial=bool(summary.get("warnings")),
+            )
             await context.bot.send_message(
                 chat_id=query.message.chat.id,
                 text=format_sync_summary(summary),
@@ -2002,6 +2115,13 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if admin_action == "notify_unverified":
             summary = await notify_unverified_low_priority_users(context.bot, state)
             save_state(state)
+            log_event(
+                "unverified_users_notified",
+                trigger="dashboard",
+                notified=summary["notified"],
+                failed=summary["failed"],
+                skipped=summary["skipped"],
+            )
             await context.bot.send_message(
                 chat_id=query.message.chat.id,
                 text=(
@@ -2046,6 +2166,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         record["status"] = "awaiting_clarification"
         record["clarification_requested_at"] = to_iso(utc_now())
         save_state(state)
+        log_event("clarification_requested", buyer_id=user_id)
         await context.bot.send_message(chat_id=user_id, text=template("clarification_request"))
         await query.edit_message_text(format_review_card(user_id, record, "Clarification requested"))
         await query.answer("Clarification requested.")
@@ -2058,6 +2179,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         record["subscription_expires_at"] = None
         record["onlyfans_user_id"] = None
         save_state(state)
+        log_event("onlyfans_username_retry_requested", buyer_id=user_id)
         await context.bot.send_message(chat_id=user_id, text=of_username_not_verified_message(None))
         await query.edit_message_text(format_review_card(user_id, record, "Asked buyer to retry OnlyFans username"))
         await query.answer("Username retry requested.")
@@ -2066,6 +2188,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if action in {"label_promising", "label_skip"}:
         record["internal_label"] = "promising" if action == "label_promising" else "not_worth_time"
         save_state(state)
+        log_event("internal_label_set", buyer_id=user_id, label=record["internal_label"])
         await query.edit_message_text(
             format_review_card(user_id, record, "Internal label updated"),
             reply_markup=build_admin_review_keyboard(user_id),
@@ -2079,6 +2202,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         record["banned_at"] = to_iso(current_time)
         record["ban_reason"] = "Admin button"
         save_state(state)
+        log_event("banned", buyer_id=user_id, trigger="button")
         try:
             await context.bot.send_message(chat_id=user_id, text=template("banned"))
         except Exception:
@@ -2091,6 +2215,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         record["status"] = "not_fit"
         record["not_fit_at"] = to_iso(utc_now())
         save_state(state)
+        log_event("not_fit", buyer_id=user_id, trigger="button")
         try:
             await context.bot.send_message(chat_id=user_id, text=template("not_fit"))
         except Exception:
@@ -2106,6 +2231,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         record["payment_status"] = "paid"
         record["payment_confirmed_at"] = to_iso(utc_now())
         save_state(state)
+        log_event("payment_confirmed", buyer_id=user_id, trigger="button")
         await context.bot.send_message(chat_id=user_id, text=template("payment_confirmed"))
         await query.edit_message_text(
             format_review_card(user_id, record, "Payment confirmed"),
@@ -2121,6 +2247,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         record["payment_status"] = "pending"
         record["payment_reminded_at"] = to_iso(utc_now())
         save_state(state)
+        log_event("payment_reminder_sent", buyer_id=user_id, trigger="button")
         await context.bot.send_message(chat_id=user_id, text=template("payment_reminder"))
         await query.edit_message_text(
             format_review_card(user_id, record, "Payment reminder sent"),
@@ -2146,6 +2273,12 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     now=current_time,
                 )
                 save_state(state)
+                log_event(
+                    "approved_relay",
+                    buyer_id=user_id,
+                    trigger="button",
+                    budget_key=record.get("budget_range_key"),
+                )
                 await query.edit_message_text(
                     format_review_card(user_id, record, f"Approved in relay mode\nTopic: {topic_name}"),
                     reply_markup=build_post_approval_keyboard(user_id),
@@ -2154,6 +2287,12 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             else:
                 await send_direct_contact(context.bot, user_id, record, now=current_time)
                 save_state(state)
+                log_event(
+                    "approved_direct",
+                    buyer_id=user_id,
+                    trigger="button",
+                    budget_key=record.get("budget_range_key"),
+                )
                 await query.edit_message_text(
                     format_review_card(user_id, record, "Approved direct"),
                     reply_markup=build_post_approval_keyboard(user_id),
@@ -2161,6 +2300,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 await query.answer("Approved direct.")
         except Exception as exc:
             LOGGER.exception("Approval flow failed for user %s.", user_id)
+            log_event("approval_failed", logging.ERROR, buyer_id=user_id, trigger="button")
             record["status"] = "pending"
             save_state(state)
             await query.answer("Approval failed.", show_alert=True)
@@ -2173,6 +2313,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if action == "r":
         record["status"] = "rejected"
         save_state(state)
+        log_event("rejected", buyer_id=user_id, trigger="button")
         await context.bot.send_message(
             chat_id=user_id,
             text=template("rejected"),
@@ -2186,6 +2327,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if record.get("status") == "low_priority":
             record["status"] = "pending"
         save_state(state)
+        log_event("queue_changed", buyer_id=user_id, queue="priority", trigger="button")
         await query.edit_message_text(
             format_review_card(user_id, record, "Marked priority"),
             reply_markup=build_admin_review_keyboard(user_id),
@@ -2197,6 +2339,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         record["review_priority"] = "low"
         record["status"] = "low_priority"
         save_state(state)
+        log_event("queue_changed", buyer_id=user_id, queue="low", trigger="button")
         await query.edit_message_text(format_review_card(user_id, record, "Moved to low-priority queue"))
         await query.answer("Moved to low-priority queue.")
         return
@@ -2252,6 +2395,13 @@ async def notify_unverified_manual(update: Update, context: ContextTypes.DEFAULT
 
     summary = await notify_unverified_low_priority_users(context.bot, state)
     save_state(state)
+    log_event(
+        "unverified_users_notified",
+        trigger="command",
+        notified=summary["notified"],
+        failed=summary["failed"],
+        skipped=summary["skipped"],
+    )
     await update.message.reply_text(
         "Unverified low-priority users notified.\n\n"
         f"Sent: {summary['notified']}\n"
@@ -2278,14 +2428,26 @@ async def sync_subs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     await update.message.reply_text("Syncing OnlyFans...")
+    log_event("ofauth_sync_started", trigger="command")
     try:
         summary = await asyncio.to_thread(sync_subscribers, state)
     except Exception as exc:
         LOGGER.exception("OFAuth sync failed.")
+        log_event("ofauth_sync_failed", logging.ERROR, trigger="command")
         await update.message.reply_text(f"OnlyFans sync failed: {exc}")
         return
 
     save_state(state)
+    log_event(
+        "ofauth_sync_completed",
+        trigger="command",
+        active_seen=summary.get("active_subscribers_seen"),
+        matched=summary.get("matched"),
+        renewed=summary.get("renewed"),
+        expired=summary.get("expired"),
+        inactive=summary.get("inactive"),
+        partial=bool(summary.get("warnings")),
+    )
     await update.message.reply_text(format_sync_summary(summary))
     expired_alert = format_expired_access_alert(summary)
     if expired_alert:
@@ -2324,10 +2486,12 @@ async def verifyof(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         verification_result = await asyncio.to_thread(verify_onlyfans_username, claimed_username)
     except Exception as exc:
         LOGGER.exception("OFAuth verify command failed.")
+        log_event("ofauth_verify_failed", logging.ERROR, trigger="command")
         await update.message.reply_text(f"OFAuth verification failed: {exc}")
         return
 
     if verification_result.get("verified"):
+        log_event("ofauth_verified", trigger="command")
         lines = [
             "Verified",
             "",
@@ -2345,6 +2509,7 @@ async def verifyof(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("\n".join(lines))
         return
 
+    log_event("ofauth_unverified", trigger="command")
     lines = [
         "Unverified",
         "",
@@ -2380,6 +2545,7 @@ async def ofdiag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         diagnostics = await asyncio.to_thread(run_ofauth_diagnostics)
     except Exception as exc:
         LOGGER.exception("OFAuth diagnostics failed.")
+        log_event("ofauth_diagnostics_failed", logging.ERROR, trigger="command")
         await update.message.reply_text(f"OFAuth diagnostics failed: {exc}")
         return
 
@@ -2509,6 +2675,7 @@ async def reprioritize(update: Update, context: ContextTypes.DEFAULT_TYPE, new_p
     else:
         record["status"] = "low_priority"
     save_state(state)
+    log_event("queue_changed", buyer_id=user_id, queue=new_priority, trigger="command")
     await update.message.reply_text(f"Updated queue to {new_priority}.")
 
 
@@ -2531,6 +2698,7 @@ async def renew_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     record = get_user_record(state, user_id)
     grant_access(record)
     save_state(state)
+    log_event("access_renewed", buyer_id=user_id, trigger="command")
     await update.message.reply_text(
         f"Renewed. Access now ends {format_date_for_user(record.get('expires_at'))}."
     )
@@ -2559,6 +2727,7 @@ async def senddirect_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     await send_direct_contact(context.bot, user_id, record, now=utc_now())
     save_state(state)
+    log_event("direct_handle_sent", buyer_id=user_id, trigger="command")
     await update.message.reply_text("Direct handle sent.")
 
 
@@ -2599,13 +2768,16 @@ async def manual_decision(
             if approval_mode == "relay":
                 await send_relay_contact(context.bot, state, user_id, record, now=current_time)
                 save_state(state)
+                log_event("approved_relay", buyer_id=user_id, trigger="command")
                 await update.message.reply_text("Approved in relay mode.")
             else:
                 await send_direct_contact(context.bot, user_id, record, now=current_time)
                 save_state(state)
+                log_event("approved_direct", buyer_id=user_id, trigger="command")
                 await update.message.reply_text("Approved and sent.")
         except Exception as exc:
             LOGGER.exception("Manual approval failed for user %s.", user_id)
+            log_event("approval_failed", logging.ERROR, buyer_id=user_id, trigger="command")
             record["status"] = "pending"
             save_state(state)
             await update.message.reply_text(f"Approval failed: {exc}")
@@ -2613,6 +2785,7 @@ async def manual_decision(
 
     record["status"] = "rejected"
     save_state(state)
+    log_event("rejected", buyer_id=user_id, trigger="command")
     await context.bot.send_message(
         chat_id=user_id,
         text=template("rejected"),
@@ -2646,6 +2819,7 @@ async def non_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 def main() -> None:
+    configure_logging()
     load_dotenv_file()
     token = get_required_env("BOT_TOKEN")
     loop = asyncio.new_event_loop()
@@ -2676,7 +2850,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
     app.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, non_text_message))
 
-    LOGGER.info("Bot is running.")
+    log_event("bot_started")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
