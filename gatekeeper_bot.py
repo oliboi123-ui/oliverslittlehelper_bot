@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import json
 import logging
 import os
@@ -45,6 +45,28 @@ BUDGET_OPTIONS = [
     {"key": "250_499", "label": "$250-$499", "floor": 250, "ceiling": 499, "priority": "priority"},
     {"key": "500_plus", "label": "$500+", "floor": 500, "ceiling": None, "priority": "priority"},
 ]
+
+
+TEMPLATES = {
+    "already_pending": "Your request is already pending review. Please wait for a decision.",
+    "low_priority": (
+        "Your request is in a lower-priority review queue. I check that queue weekly."
+    ),
+    "not_fit": (
+        "Thanks for reaching out. I do not think this is the right fit, "
+        "so I will not be moving forward."
+    ),
+    "banned": "This request is closed. Do not contact this bot again.",
+    "rejected": "Sorry, this request was not approved.",
+    "payment_reminder": (
+        "Quick reminder: please use the pinned payment link when you are ready. "
+        "Payment keeps your purchase information easy to find."
+    ),
+    "payment_confirmed": "Payment marked as received. Thank you.",
+}
+
+def template(name: str) -> str:
+    return TEMPLATES[name]
 
 
 def load_dotenv_file() -> None:
@@ -218,18 +240,18 @@ def access_status_line(record: dict[str, Any]) -> str:
 def verification_badge(record: dict[str, Any]) -> str:
     status = record.get("subscription_status") or "unknown"
     if status == "active":
-        return "✅"
+        return "âœ…"
     if status == "inactive":
-        return "❌"
+        return "âŒ"
     return "?"
 
 
 def verification_summary(record: dict[str, Any]) -> str:
     status = record.get("subscription_status") or "unknown"
     if status == "active":
-        return "✅ Verified"
+        return "âœ… Verified"
     if status == "inactive":
-        return "❌ Unverified"
+        return "âŒ Unverified"
     return "Verification pending"
 
 
@@ -319,6 +341,13 @@ def default_user_record() -> dict[str, Any]:
         "identity_proof_requested_at": None,
         "identity_proof_sent_at": None,
         "payment_message_id": None,
+        "payment_status": "not_requested",
+        "payment_requested_at": None,
+        "payment_confirmed_at": None,
+        "payment_reminded_at": None,
+        "not_fit_at": None,
+        "banned_at": None,
+        "ban_reason": None,
     }
 
 
@@ -368,7 +397,7 @@ def truncate_text(value: str, limit: int) -> str:
     text = value.strip()
     if len(text) <= limit:
         return text
-    return text[: max(limit - 1, 1)].rstrip() + "…"
+    return text[: max(limit - 1, 1)].rstrip() + "â€¦"
 
 
 def build_relay_topic_name(record: dict[str, Any]) -> str:
@@ -461,6 +490,27 @@ def subscription_status_line(record: dict[str, Any]) -> str:
     return verification_summary(record)
 
 
+def payment_status_line(record: dict[str, Any]) -> str:
+    status = str(record.get("payment_status") or "not_requested").strip().lower()
+    labels = {
+        "not_requested": "Not requested",
+        "requested": "Requested",
+        "pending": "Awaiting payment",
+        "paid": "Paid",
+        "waived": "Waived",
+    }
+    label = labels.get(status, status.replace("_", " ").title())
+    if status in {"requested", "pending"} and record.get("payment_requested_at"):
+        return f"{label} since {format_datetime_for_user(record.get('payment_requested_at'))}"
+    if status == "paid" and record.get("payment_confirmed_at"):
+        return f"Paid on {format_datetime_for_user(record.get('payment_confirmed_at'))}"
+    return label
+
+
+def is_closed_record(record: dict[str, Any]) -> bool:
+    return record.get("status") in {"not_fit", "banned"}
+
+
 def priority_label(record: dict[str, Any]) -> str:
     priority = record.get("review_priority") or "normal"
     return priority.replace("_", " ").title()
@@ -490,30 +540,61 @@ def build_admin_review_keyboard(user_id: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("Approve Direct", callback_data=f"ad:{user_id}"),
             ],
             [
+                InlineKeyboardButton("Not a Fit", callback_data=f"nf:{user_id}"),
                 InlineKeyboardButton("Reject", callback_data=f"r:{user_id}"),
-                InlineKeyboardButton("Priority", callback_data=f"p:{user_id}"),
             ],
             [
+                InlineKeyboardButton("Priority", callback_data=f"p:{user_id}"),
                 InlineKeyboardButton("Low Priority", callback_data=f"l:{user_id}"),
+            ],
+            [
+                InlineKeyboardButton("Ban", callback_data=f"ban:{user_id}"),
+                InlineKeyboardButton("Status", callback_data=f"st:{user_id}"),
+            ],
+        ]
+    )
+
+
+def build_post_approval_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Paid", callback_data=f"paid:{user_id}"),
+                InlineKeyboardButton("Remind Pay", callback_data=f"rp:{user_id}"),
+            ],
+            [
+                InlineKeyboardButton("Status", callback_data=f"st:{user_id}"),
+                InlineKeyboardButton("Ban", callback_data=f"ban:{user_id}"),
             ],
         ]
     )
 
 
 def format_review_card(user_id: int, record: dict[str, Any], heading: str) -> str:
+    status = str(record.get("status") or "unknown").replace("_", " ").title()
     lines = [
         heading,
-        format_person_label(record),
-        f"ID: {user_id}",
+        "",
+        f"Buyer: {format_person_label(record)}",
+        f"Telegram ID: {user_id}",
+        f"Telegram: {telegram_handle(record) or 'No username'}",
+        f"Status: {status}",
         f"OF: {clean_text(record.get('of_username'))}",
-        verification_summary(record),
+        f"OFAuth: {verification_summary(record)}",
         f"Budget: {budget_line(record)}",
         f"Wants: {clean_text(record.get('purchase_intent'))}",
+        f"Queue: {priority_label(record)}",
+        f"Contact: {contact_mode_label(record)}",
+        f"Payment: {payment_status_line(record)}",
     ]
-    if record.get("contact_mode"):
-        lines.append(f"Contact: {contact_mode_label(record)}")
-    if record.get("review_priority") != "normal":
-        lines.append(f"Queue: {priority_label(record)}")
+    if record.get("status") in {"approved", "expired"}:
+        lines.append(f"Access: {access_status_line(record)}")
+    if record.get("relay_topic_name"):
+        lines.append(f"Relay topic: {record.get('relay_topic_name')}")
+    if record.get("not_fit_at"):
+        lines.append(f"Not fit at: {format_datetime_for_user(record.get('not_fit_at'))}")
+    if record.get("banned_at"):
+        lines.append(f"Banned at: {format_datetime_for_user(record.get('banned_at'))}")
     return "\n".join(lines)
 
 
@@ -555,6 +636,61 @@ def format_low_priority_digest(state: dict[str, Any]) -> str:
         "Use /approve <user_id>, /approverelay <user_id>, /reject <user_id>, /priority <user_id>, or /status <user_id>."
     )
     return "\n".join(lines)
+
+
+def format_admin_digest(state: dict[str, Any]) -> str:
+    now = utc_now()
+    soon = now + timedelta(days=7)
+    sections: list[str] = ["Weekly admin digest"]
+    users = [(int(user_id), record) for user_id, record in state.get("users", {}).items()]
+
+    def add_section(title: str, rows: list[str], *, empty: str = "Nothing waiting.") -> None:
+        sections.extend(["", title])
+        sections.extend(rows[:20] or [empty])
+
+    priority_rows = [
+        format_pending_line(user_id, record)
+        for user_id, record in users
+        if record.get("status") == "pending" and record.get("review_priority") == "priority"
+    ]
+    normal_rows = [
+        format_pending_line(user_id, record)
+        for user_id, record in users
+        if record.get("status") == "pending" and record.get("review_priority") != "priority"
+    ]
+    low_rows = [
+        format_pending_line(user_id, record)
+        for user_id, record in users
+        if record.get("status") == "low_priority"
+    ]
+    payment_rows = [
+        f"{user_id} | {display_name(record)} | {budget_line(record)} | {payment_status_line(record)}"
+        for user_id, record in users
+        if record.get("status") == "approved" and record.get("payment_status") in {"requested", "pending"}
+    ]
+    expiring_rows = []
+    expired_rows = []
+    for user_id, record in users:
+        expires_at = parse_iso(record.get("expires_at"))
+        if record.get("status") == "approved" and expires_at and expires_at <= soon:
+            expiring_rows.append(
+                f"{user_id} | {display_name(record)} | expires {format_date_for_user(record.get('expires_at'))}"
+            )
+        elif record.get("status") == "expired":
+            expired_rows.append(f"{user_id} | {display_name(record)} | expired")
+
+    add_section("Priority leads", priority_rows)
+    add_section("Normal pending leads", normal_rows)
+    add_section("Low-priority queue", low_rows)
+    add_section("Awaiting payment", payment_rows)
+    add_section("Expiring soon", expiring_rows)
+    add_section("Expired", expired_rows)
+
+    banned_count = sum(1 for _, record in users if record.get("status") == "banned")
+    not_fit_count = sum(1 for _, record in users if record.get("status") == "not_fit")
+    sections.extend(["", f"Closed: {not_fit_count} not fit, {banned_count} banned."])
+    sections.append("Use /pending, /status <user_id>, or the admin buttons for action.")
+    return "\n".join(sections)
 
 
 def send_telegram_text(chat_id: int, text: str) -> None:
@@ -1033,20 +1169,7 @@ def format_expired_access_alert(summary: dict[str, Any]) -> str | None:
 
 
 def format_status_message(user_id: int, record: dict[str, Any]) -> str:
-    lines = [
-        format_person_label(record),
-        f"Status: {str(record.get('status') or 'unknown').replace('_', ' ').title()}",
-        f"Contact: {contact_mode_label(record)}",
-        f"OF: {clean_text(record.get('of_username'))}",
-        verification_summary(record),
-        f"Budget: {budget_line(record)}",
-        f"Wants: {clean_text(record.get('purchase_intent'))}",
-    ]
-    if record.get("review_priority") != "normal":
-        lines.append(f"Queue: {priority_label(record)}")
-    if record.get("status") in {"approved", "expired"}:
-        lines.append(f"Access: {access_status_line(record)}")
-    return "\n".join(lines)
+    return format_review_card(user_id, record, "Buyer status")
 
 
 def resolve_admin_chat_id(state: dict[str, Any], user: Any) -> int | None:
@@ -1107,6 +1230,9 @@ async def ensure_relay_topic(
 
 
 async def send_and_pin_payment_message(bot: Any, user_id: int, record: dict[str, Any]) -> None:
+    current_time = utc_now()
+    record["payment_status"] = "pending"
+    record["payment_requested_at"] = to_iso(current_time)
     message = await bot.send_message(
         chat_id=user_id,
         text=payment_message(),
@@ -1194,7 +1320,7 @@ async def relay_buyer_message(
     except Exception as exc:
         LOGGER.exception("Could not relay buyer message for user %s.", update.effective_user.id)
         save_state(state)
-        await update.message.reply_text("I couldn’t send that through just now. Please try again in a moment.")
+        await update.message.reply_text("I couldnâ€™t send that through just now. Please try again in a moment.")
         admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
         if admin_chat_id:
             try:
@@ -1296,6 +1422,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
+    if is_closed_record(record):
+        save_state(state)
+        return
+
     if is_access_active(record):
         save_state(state)
         if record.get("contact_mode") == "relay":
@@ -1306,12 +1436,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if record.get("status") == "pending":
-        await update.message.reply_text("Your request is already pending review. Please wait for a decision.")
+        await update.message.reply_text(template("already_pending"))
         return
 
     if record.get("status") == "low_priority":
         await update.message.reply_text(
-            "Your request is in a lower-priority review queue. I check that queue weekly."
+            template("low_priority")
         )
         return
 
@@ -1403,6 +1533,10 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         save_state(state)
         return
 
+    if is_closed_record(record):
+        save_state(state)
+        return
+
     if is_access_active(record):
         if record.get("contact_mode") == "relay":
             await relay_buyer_message(update, context, state, record)
@@ -1436,12 +1570,12 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     if status == "pending":
-        await update.message.reply_text("Your request is already pending review. Please wait for a decision.")
+        await update.message.reply_text(template("already_pending"))
         return
 
     if status == "low_priority":
         await update.message.reply_text(
-            "Your request is in a lower-priority review queue. I check that queue weekly."
+            template("low_priority")
         )
         return
 
@@ -1498,6 +1632,77 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     user_id = int(user_id_text)
     record = get_user_record(state, user_id)
+
+    if action == "st":
+        markup = None
+        if record.get("status") in {"pending", "low_priority"}:
+            markup = build_admin_review_keyboard(user_id)
+        elif record.get("status") == "approved":
+            markup = build_post_approval_keyboard(user_id)
+        await context.bot.send_message(
+            chat_id=query.message.chat.id,
+            text=format_status_message(user_id, record),
+            reply_markup=markup,
+        )
+        await query.answer("Status sent.")
+        return
+
+    if action == "ban":
+        current_time = utc_now()
+        record["status"] = "banned"
+        record["banned_at"] = to_iso(current_time)
+        record["ban_reason"] = "Admin button"
+        save_state(state)
+        try:
+            await context.bot.send_message(chat_id=user_id, text=template("banned"))
+        except Exception:
+            LOGGER.exception("Could not notify banned user %s.", user_id)
+        await query.edit_message_text(format_review_card(user_id, record, "Banned"))
+        await query.answer("Banned.")
+        return
+
+    if action == "nf":
+        record["status"] = "not_fit"
+        record["not_fit_at"] = to_iso(utc_now())
+        save_state(state)
+        try:
+            await context.bot.send_message(chat_id=user_id, text=template("not_fit"))
+        except Exception:
+            LOGGER.exception("Could not notify not-fit user %s.", user_id)
+        await query.edit_message_text(format_review_card(user_id, record, "Closed as not a fit"))
+        await query.answer("Closed as not a fit.")
+        return
+
+    if action == "paid":
+        if record.get("status") != "approved":
+            await query.answer("Only approved buyers can be marked paid.", show_alert=True)
+            return
+        record["payment_status"] = "paid"
+        record["payment_confirmed_at"] = to_iso(utc_now())
+        save_state(state)
+        await context.bot.send_message(chat_id=user_id, text=template("payment_confirmed"))
+        await query.edit_message_text(
+            format_review_card(user_id, record, "Payment confirmed"),
+            reply_markup=build_post_approval_keyboard(user_id),
+        )
+        await query.answer("Marked paid.")
+        return
+
+    if action == "rp":
+        if record.get("status") != "approved":
+            await query.answer("Only approved buyers can receive payment reminders.", show_alert=True)
+            return
+        record["payment_status"] = "pending"
+        record["payment_reminded_at"] = to_iso(utc_now())
+        save_state(state)
+        await context.bot.send_message(chat_id=user_id, text=template("payment_reminder"))
+        await query.edit_message_text(
+            format_review_card(user_id, record, "Payment reminder sent"),
+            reply_markup=build_post_approval_keyboard(user_id),
+        )
+        await query.answer("Reminder sent.")
+        return
+
     if record.get("status") not in {"pending", "low_priority"}:
         await query.answer("This request is no longer reviewable.", show_alert=True)
         return
@@ -1516,13 +1721,17 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 )
                 save_state(state)
                 await query.edit_message_text(
-                    format_review_card(user_id, record, f"Approved in relay mode\nTopic: {topic_name}")
+                    format_review_card(user_id, record, f"Approved in relay mode\nTopic: {topic_name}"),
+                    reply_markup=build_post_approval_keyboard(user_id),
                 )
                 await query.answer(f"Relay approved in topic {topic_id}.")
             else:
                 await send_direct_contact(context.bot, user_id, record, now=current_time)
                 save_state(state)
-                await query.edit_message_text(format_review_card(user_id, record, "Approved direct"))
+                await query.edit_message_text(
+                    format_review_card(user_id, record, "Approved direct"),
+                    reply_markup=build_post_approval_keyboard(user_id),
+                )
                 await query.answer("Approved direct.")
         except Exception as exc:
             LOGGER.exception("Approval flow failed for user %s.", user_id)
@@ -1540,7 +1749,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         save_state(state)
         await context.bot.send_message(
             chat_id=user_id,
-            text="Sorry, this request was not approved.",
+            text=template("rejected"),
         )
         await query.edit_message_text(format_review_card(user_id, record, "Rejected"))
         await query.answer("Rejected.")
@@ -1704,7 +1913,7 @@ async def verifyof(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if verification_result.get("verified"):
         lines = [
-            "✅ Verified",
+            "âœ… Verified",
             "",
             f"OF username: {verification_result.get('username') or claimed_username}",
             f"Subscription: active until {format_datetime_for_user(verification_result.get('expired_at'), empty='an unknown date')}",
@@ -1721,7 +1930,7 @@ async def verifyof(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     lines = [
-        "❌ Unverified",
+        "âŒ Unverified",
         "",
         f"OF username: {verification_result.get('username') or claimed_username}",
         "No active subscription found.",
@@ -1970,7 +2179,7 @@ async def manual_decision(
     save_state(state)
     await context.bot.send_message(
         chat_id=user_id,
-        text="Sorry, this request was not approved.",
+        text=template("rejected"),
     )
     await update.message.reply_text("Rejected.")
 
@@ -1984,6 +2193,9 @@ async def non_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     state = load_state()
     record = get_user_record(state, update.effective_user.id)
     mark_expired_if_needed(record)
+    if is_closed_record(record):
+        save_state(state)
+        return
     if relay_mode_enabled(record):
         await relay_buyer_message(update, context, state, record)
         return

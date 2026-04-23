@@ -1,5 +1,5 @@
-from gatekeeper_bot import (
-    format_low_priority_digest,
+﻿from gatekeeper_bot import (
+    format_admin_digest,
     load_dotenv_file,
     load_state,
     send_telegram_text,
@@ -12,7 +12,7 @@ def main() -> None:
     admin_chat_id = state.get("admin_chat_id")
     if not admin_chat_id:
         return
-    send_telegram_text(int(admin_chat_id), format_low_priority_digest(state))
+    send_telegram_text(int(admin_chat_id), format_admin_digest(state))
 
 
 if __name__ == "__main__":
