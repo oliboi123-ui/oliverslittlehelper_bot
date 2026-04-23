@@ -109,6 +109,10 @@ def get_relay_group_id() -> int | None:
     return int(value)
 
 
+def get_payment_url() -> str:
+    return os.getenv("PAYMENT_URL", "https://paypal.me/mirage22m").strip()
+
+
 def relay_is_configured() -> bool:
     return get_relay_group_id() is not None
 
@@ -314,6 +318,7 @@ def default_user_record() -> dict[str, Any]:
         "direct_shared_at": None,
         "identity_proof_requested_at": None,
         "identity_proof_sent_at": None,
+        "payment_message_id": None,
     }
 
 
@@ -392,18 +397,30 @@ def relay_intro_text(user_id: int, record: dict[str, Any]) -> str:
 
 
 def relay_access_message(record: dict[str, Any]) -> str:
+    access_date = format_date_for_user(record.get("expires_at"))
     return (
-        "You’re approved.\n\n"
+        "You're approved.\n\n"
         "I reply personally here through this bot to keep access private and organized.\n"
-        "If you want identity confirmation first, just ask and I’ll send a short hello video saying your name.\n\n"
-        f"Access ends {format_date_for_user(record.get('expires_at'))}."
+        "If you want identity confirmation first, just ask and I'll send a short hello video saying your name.\n\n"
+        f"Access is tied to your active OnlyFans subscription and is valid until {access_date}.\n"
+        "If your subscription ends, this bot access is revoked."
     )
 
 
 def direct_access_message(private_username: str, record: dict[str, Any]) -> str:
+    access_date = format_date_for_user(record.get("expires_at"))
     return (
         f"Approved. You can message me at {private_username}.\n\n"
-        f"Access ends {format_date_for_user(record.get('expires_at'))}."
+        f"Access is tied to your active OnlyFans subscription and is valid until {access_date}.\n"
+        "If your subscription ends, access is removed."
+    )
+
+
+def payment_message() -> str:
+    return (
+        "Payment link\n"
+        f"{get_payment_url()}\n\n"
+        "Use this for purchases so payment info stays easy to find."
     )
 
 
@@ -1089,6 +1106,23 @@ async def ensure_relay_topic(
     return topic_id, topic_name
 
 
+async def send_and_pin_payment_message(bot: Any, user_id: int, record: dict[str, Any]) -> None:
+    message = await bot.send_message(
+        chat_id=user_id,
+        text=payment_message(),
+        protect_content=True,
+    )
+    record["payment_message_id"] = message.message_id
+    try:
+        await bot.pin_chat_message(
+            chat_id=user_id,
+            message_id=message.message_id,
+            disable_notification=True,
+        )
+    except Exception:
+        LOGGER.exception("Could not pin payment message for user %s.", user_id)
+
+
 async def send_direct_contact(
     bot: Any,
     user_id: int,
@@ -1100,6 +1134,7 @@ async def send_direct_contact(
     private_username = get_required_env("PRIVATE_TELEGRAM_USERNAME")
     set_contact_mode(record, "direct", now=current_time)
     await bot.send_message(chat_id=user_id, text=direct_access_message(private_username, record))
+    await send_and_pin_payment_message(bot, user_id, record)
 
 
 async def send_relay_contact(
@@ -1114,6 +1149,7 @@ async def send_relay_contact(
     topic_id, topic_name = await ensure_relay_topic(bot, state, user_id, record)
     set_contact_mode(record, "relay", now=current_time)
     await bot.send_message(chat_id=user_id, text=relay_access_message(record), protect_content=True)
+    await send_and_pin_payment_message(bot, user_id, record)
     return topic_id, topic_name
 
 
