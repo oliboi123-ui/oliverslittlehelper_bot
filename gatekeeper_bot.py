@@ -564,6 +564,12 @@ def get_active_private_record(state: dict[str, Any], user: Any) -> dict[str, Any
     return get_user_record(state, user.id)
 
 
+def is_private_buyer_test_context(state: dict[str, Any], update: Any) -> bool:
+    chat = getattr(update, "effective_chat", None)
+    user = getattr(update, "effective_user", None)
+    return bool(chat and user and chat.type == "private" and is_test_mode_active(state, user))
+
+
 def is_sandbox_record(record: dict[str, Any]) -> bool:
     return bool(record.get("test_mode"))
 
@@ -1911,6 +1917,8 @@ def resolve_admin_chat_id(state: dict[str, Any], user: Any) -> int | None:
 def callback_is_from_admin_surface(state: dict[str, Any], query: Any) -> bool:
     if query.message is None:
         return False
+    if query.message.chat.type == "private" and is_test_mode_active(state, query.from_user):
+        return False
     relay_group_id = get_relay_group_id()
     admin_chat_id = resolve_admin_chat_id(state, query.from_user)
     if relay_group_id is not None and query.message.chat.id == relay_group_id:
@@ -3084,6 +3092,8 @@ async def pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     state = load_state()
+    if is_private_buyer_test_context(state, update):
+        return
     admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
     if admin_chat_id != update.effective_chat.id:
         return
@@ -3099,6 +3109,8 @@ async def expiring(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     state = load_state()
+    if is_private_buyer_test_context(state, update):
+        return
     admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
     if admin_chat_id != update.effective_chat.id:
         return
@@ -3113,6 +3125,8 @@ async def notify_unverified_manual(update: Update, context: ContextTypes.DEFAULT
         return
 
     state = load_state()
+    if is_private_buyer_test_context(state, update):
+        return
     admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
     if admin_chat_id != update.effective_chat.id:
         return
@@ -3141,6 +3155,8 @@ async def sync_subs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     state = load_state()
+    if is_private_buyer_test_context(state, update):
+        return
     admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
     if admin_chat_id != update.effective_chat.id:
         return
@@ -3208,6 +3224,8 @@ async def verifyof(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     state = load_state()
+    if is_private_buyer_test_context(state, update):
+        return
     admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
     if admin_chat_id != update.effective_chat.id:
         return
@@ -3277,6 +3295,8 @@ async def ofdiag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     state = load_state()
+    if is_private_buyer_test_context(state, update):
+        return
     admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
     if admin_chat_id != update.effective_chat.id:
         return
@@ -3341,6 +3361,8 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     state = load_state()
+    if is_private_buyer_test_context(state, update):
+        return
     admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
     if admin_chat_id != update.effective_chat.id:
         return
@@ -3364,6 +3386,8 @@ async def details_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     state = load_state()
+    if is_private_buyer_test_context(state, update):
+        return
     admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
     if admin_chat_id != update.effective_chat.id:
         return
@@ -3407,6 +3431,8 @@ async def reprioritize(update: Update, context: ContextTypes.DEFAULT_TYPE, new_p
         return
 
     state = load_state()
+    if is_private_buyer_test_context(state, update):
+        return
     admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
     if admin_chat_id != update.effective_chat.id:
         return
@@ -3439,6 +3465,8 @@ async def renew_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     state = load_state()
+    if is_private_buyer_test_context(state, update):
+        return
     admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
     if admin_chat_id != update.effective_chat.id:
         return
@@ -3464,6 +3492,8 @@ async def senddirect_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     state = load_state()
+    if is_private_buyer_test_context(state, update):
+        return
     admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
     if admin_chat_id != update.effective_chat.id:
         return
@@ -3550,6 +3580,8 @@ async def vaultlist_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     state = load_state()
+    if is_private_buyer_test_context(state, update):
+        return
     admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
     if admin_chat_id is None and update.effective_chat.id != state.get("content_vault_chat_id"):
         await update.message.reply_text("Not allowed.")
@@ -3565,6 +3597,8 @@ async def revoke_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     state = load_state()
+    if is_private_buyer_test_context(state, update):
+        return
     admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
     if admin_chat_id != update.effective_chat.id:
         return
@@ -3594,6 +3628,8 @@ async def removeuser_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     state = load_state()
+    if is_private_buyer_test_context(state, update):
+        return
     admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
     if admin_chat_id != update.effective_chat.id:
         return
@@ -3626,6 +3662,8 @@ async def manual_decision(
         return
 
     state = load_state()
+    if is_private_buyer_test_context(state, update):
+        return
     admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
     if admin_chat_id != update.effective_chat.id:
         return
