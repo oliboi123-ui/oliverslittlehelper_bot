@@ -50,7 +50,7 @@ BUDGET_OPTIONS = [
 TEMPLATES = {
     "already_pending": "Your request is already pending review. Please wait for a decision.",
     "low_priority": (
-        "Your request is in a lower-priority review queue. I check that queue weekly."
+        "Your request is saved in my slower review queue. You do not need to resend anything."
     ),
     "not_fit": (
         "Thanks for reaching out. I do not think this is the right fit, "
@@ -63,6 +63,10 @@ TEMPLATES = {
         "Payment keeps your purchase information easy to find."
     ),
     "payment_confirmed": "Payment marked as received. Thank you.",
+    "clarification_request": (
+        "Thanks. Could you briefly clarify what you are looking for? "
+        "A short answer is enough."
+    ),
 }
 
 def template(name: str) -> str:
@@ -71,9 +75,11 @@ def template(name: str) -> str:
 
 def of_username_help_message() -> str:
     return (
-        "Please send your OnlyFans username to continue.\n\n"
-        "This means the username on your OnlyFans profile, not your Telegram username, "
-        "display name, email, or a link.\n\n"
+        "Welcome.\n\n"
+        "This private access bot is reserved for active OnlyFans subscribers. "
+        "It helps keep requests organized while access stays personal and private.\n\n"
+        "To continue, please send your OnlyFans username.\n\n"
+        "This means the username on your OnlyFans profile, not your Telegram username, display name, email, or a link.\n\n"
         "Examples:\n"
         "- If your profile is onlyfans.com/example, send: example\n"
         "- If you never chose a custom username, it may look like @u123456789. "
@@ -92,6 +98,24 @@ def of_username_not_verified_message(of_username: str | None = None) -> str:
         "- If your profile is onlyfans.com/example, send: example\n"
         "- If you never chose a custom username, it may look like @u123456789. "
         "In that case, send the full @u number username."
+    )
+
+
+def application_confirmation_message(record: dict[str, Any]) -> str:
+    return (
+        "Thanks. I have your request.\n\n"
+        f"OnlyFans username: {clean_text(record.get('of_username'))}\n"
+        f"Looking for: {clean_text(record.get('purchase_intent'))}\n\n"
+        "I review requests based on availability, fit, and the kind of request. "
+        "If it looks like a fit, I will follow up here."
+    )
+
+
+def low_priority_message() -> str:
+    return (
+        "Thanks. I have your request saved in my slower review queue.\n\n"
+        "I review requests based on availability, fit, and the kind of request. "
+        "You do not need to resend anything. If it looks like a fit, I will follow up here."
     )
 
 
@@ -374,6 +398,9 @@ def default_user_record() -> dict[str, Any]:
         "not_fit_at": None,
         "banned_at": None,
         "ban_reason": None,
+        "clarification_requested_at": None,
+        "clarification_response": None,
+        "internal_label": None,
     }
 
 
@@ -440,7 +467,7 @@ def relay_intro_text(user_id: int, record: dict[str, Any]) -> str:
         "Relay opened",
         format_person_label(record),
         f"ID: {user_id}",
-        f"OF: {clean_text(record.get('of_username'))}",
+        f"OnlyFans: {clean_text(record.get('of_username'))}",
         verification_summary(record),
         f"Budget: {budget_line(record)}",
         f"Wants: {clean_text(record.get('purchase_intent'))}",
@@ -562,20 +589,28 @@ def build_admin_review_keyboard(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("Approve Relay", callback_data=f"ar:{user_id}"),
-                InlineKeyboardButton("Approve Direct", callback_data=f"ad:{user_id}"),
+                InlineKeyboardButton("Approve", callback_data=f"ar:{user_id}"),
+                InlineKeyboardButton("Direct Handle", callback_data=f"ad:{user_id}"),
             ],
             [
                 InlineKeyboardButton("Not a Fit", callback_data=f"nf:{user_id}"),
                 InlineKeyboardButton("Reject", callback_data=f"r:{user_id}"),
             ],
             [
-                InlineKeyboardButton("Priority", callback_data=f"p:{user_id}"),
-                InlineKeyboardButton("Low Priority", callback_data=f"l:{user_id}"),
+                InlineKeyboardButton("Ask Clarify", callback_data=f"clar:{user_id}"),
+                InlineKeyboardButton("Retry Username", callback_data=f"retryof:{user_id}"),
+            ],
+            [
+                InlineKeyboardButton("Promising", callback_data=f"label_promising:{user_id}"),
+                InlineKeyboardButton("Not Worth Time", callback_data=f"label_skip:{user_id}"),
+            ],
+            [
+                InlineKeyboardButton("Move Up", callback_data=f"p:{user_id}"),
+                InlineKeyboardButton("Slow Queue", callback_data=f"l:{user_id}"),
             ],
             [
                 InlineKeyboardButton("Ban", callback_data=f"ban:{user_id}"),
-                InlineKeyboardButton("Status", callback_data=f"st:{user_id}"),
+                InlineKeyboardButton("Details", callback_data=f"st:{user_id}"),
             ],
         ]
     )
@@ -623,30 +658,51 @@ def build_admin_home_keyboard() -> InlineKeyboardMarkup:
 
 
 def format_review_card(user_id: int, record: dict[str, Any], heading: str) -> str:
-    status = str(record.get("status") or "unknown").replace("_", " ").title()
     lines = [
         heading,
+        "",
+        f"Buyer: {format_person_label(record)}",
+        f"OnlyFans: {clean_text(record.get('of_username'))} ({verification_summary(record)})",
+        f"Budget: {budget_line(record)}",
+        f"Looking for: {clean_text(record.get('purchase_intent'))}",
+    ]
+    if record.get("clarification_response"):
+        lines.append(f"Clarified: {clean_text(record.get('clarification_response'))}")
+    if record.get("internal_label"):
+        lines.append(f"Internal label: {clean_text(record.get('internal_label')).replace('_', ' ').title()}")
+    lines.append("")
+    lines.append("Use Details for full technical history.")
+    return "\n".join(lines)
+
+
+def format_detailed_status_message(user_id: int, record: dict[str, Any]) -> str:
+    status = str(record.get("status") or "unknown").replace("_", " ").title()
+    lines = [
+        "Buyer details",
         "",
         f"Buyer: {format_person_label(record)}",
         f"Telegram ID: {user_id}",
         f"Telegram: {telegram_handle(record) or 'No username'}",
         f"Status: {status}",
-        f"OF: {clean_text(record.get('of_username'))}",
+        f"OnlyFans: {clean_text(record.get('of_username'))}",
         f"OFAuth: {verification_summary(record)}",
+        f"OnlyFans user id: {clean_text(record.get('onlyfans_user_id'))}",
+        f"Subscription expires: {format_datetime_for_user(record.get('subscription_expires_at'))}",
         f"Budget: {budget_line(record)}",
-        f"Wants: {clean_text(record.get('purchase_intent'))}",
+        f"Budget floor: {clean_text(record.get('budget_floor'))}",
+        f"Looking for: {clean_text(record.get('purchase_intent'))}",
+        f"Clarification: {clean_text(record.get('clarification_response'))}",
         f"Queue: {priority_label(record)}",
+        f"Internal label: {clean_text(record.get('internal_label'))}",
         f"Contact: {contact_mode_label(record)}",
         f"Payment: {payment_status_line(record)}",
+        f"Access: {access_status_line(record)}",
+        f"Queued at: {format_datetime_for_user(record.get('queued_at'))}",
+        f"Approved at: {format_datetime_for_user(record.get('approved_at'))}",
+        f"Relay topic: {clean_text(record.get('relay_topic_name'))}",
+        f"Not fit at: {format_datetime_for_user(record.get('not_fit_at'))}",
+        f"Banned at: {format_datetime_for_user(record.get('banned_at'))}",
     ]
-    if record.get("status") in {"approved", "expired"}:
-        lines.append(f"Access: {access_status_line(record)}")
-    if record.get("relay_topic_name"):
-        lines.append(f"Relay topic: {record.get('relay_topic_name')}")
-    if record.get("not_fit_at"):
-        lines.append(f"Not fit at: {format_datetime_for_user(record.get('not_fit_at'))}")
-    if record.get("banned_at"):
-        lines.append(f"Banned at: {format_datetime_for_user(record.get('banned_at'))}")
     return "\n".join(lines)
 
 
@@ -718,6 +774,7 @@ def format_admin_help() -> str:
         "Use the dashboard buttons for the common workflow.\n\n"
         "Useful commands:\n"
         "/pending [all|low|normal|priority|expired]\n"
+        "/details <user_id>\n"
         "/approve <user_id>\n"
         "/approverelay <user_id>\n"
         "/reject <user_id>\n"
@@ -738,7 +795,7 @@ def format_pending_line(user_id: int, record: dict[str, Any]) -> str:
     parts = [
         str(user_id),
         display_name(record),
-        clean_text(record.get("of_username")),
+        f"OnlyFans: {clean_text(record.get('of_username'))}",
         budget_line(record),
         verification_badge(record),
     ]
@@ -1409,6 +1466,8 @@ def begin_application(record: dict[str, Any]) -> None:
     record["budget_range_label"] = None
     record["budget_floor"] = None
     record["purchase_intent"] = None
+    record["clarification_requested_at"] = None
+    record["clarification_response"] = None
     record["review_priority"] = "normal"
     record["queued_at"] = None
 
@@ -1593,8 +1652,7 @@ async def relay_admin_group_message(update: Update, context: ContextTypes.DEFAUL
 
 async def ask_budget_question(message_target: Any) -> None:
     await message_target.reply_text(
-        "My time is limited and I prioritize serious buyers. "
-        "What range are you planning to spend in our first interaction?",
+        "Thanks. To route the request properly, what range are you planning for the first request?",
         reply_markup=build_budget_keyboard(),
     )
 
@@ -1678,6 +1736,8 @@ async def complete_application(
             )
         except Exception as exc:
             exact_match_note = f"OFAuth check: error ({exc})"
+            verified_subscription = True
+            record["subscription_status"] = "unknown"
         else:
             if verification_result.get("verified"):
                 record["subscription_status"] = "active"
@@ -1708,15 +1768,12 @@ async def complete_application(
         record["status"] = "low_priority"
         record["review_priority"] = "low"
         save_state(state)
-        await update.message.reply_text(
-            "Thanks. Based on your stated budget, your request has been placed in a slower review queue. "
-            "I check that queue weekly."
-        )
+        await update.message.reply_text(low_priority_message())
         return
 
     record["status"] = "pending"
     save_state(state)
-    await update.message.reply_text("Thanks. Your request is pending manual review.")
+    await update.message.reply_text(application_confirmation_message(record))
 
     if not admin_chat_id:
         LOGGER.warning("No admin chat configured yet. Request stored but not delivered.")
@@ -1792,6 +1849,22 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await complete_application(update, context, state, record)
         return
 
+    if status == "awaiting_clarification":
+        record["clarification_response"] = update.message.text.strip()
+        record["status"] = "pending"
+        record["queued_at"] = to_iso(utc_now())
+        save_state(state)
+        await update.message.reply_text(
+            "Thanks. I added that to your request and will review it personally."
+        )
+        if admin_chat_id:
+            await context.bot.send_message(
+                chat_id=admin_chat_id,
+                text=format_review_card(user.id, record, "Buyer clarified request"),
+                reply_markup=build_admin_review_keyboard(user.id),
+            )
+        return
+
     if status == "pending":
         await update.message.reply_text(template("already_pending"))
         return
@@ -1833,8 +1906,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if query.message is not None:
             await query.edit_message_text(
                 text=(
-                    "My time is limited and I prioritize serious buyers. "
-                    f"You selected: {option['label']}"
+                    f"Budget range saved: {option['label']}"
                 )
             )
             await context.bot.send_message(
@@ -1961,10 +2033,44 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             markup = build_post_approval_keyboard(user_id)
         await context.bot.send_message(
             chat_id=query.message.chat.id,
-            text=format_status_message(user_id, record),
+            text=format_detailed_status_message(user_id, record),
             reply_markup=markup,
         )
-        await query.answer("Status sent.")
+        await query.answer("Details sent.")
+        return
+
+    if action == "clar":
+        if record.get("status") not in {"pending", "low_priority"}:
+            await query.answer("This request is not waiting for review.", show_alert=True)
+            return
+        record["status"] = "awaiting_clarification"
+        record["clarification_requested_at"] = to_iso(utc_now())
+        save_state(state)
+        await context.bot.send_message(chat_id=user_id, text=template("clarification_request"))
+        await query.edit_message_text(format_review_card(user_id, record, "Clarification requested"))
+        await query.answer("Clarification requested.")
+        return
+
+    if action == "retryof":
+        record["status"] = "awaiting_of_username"
+        record["of_username"] = None
+        record["subscription_status"] = "unknown"
+        record["subscription_expires_at"] = None
+        record["onlyfans_user_id"] = None
+        save_state(state)
+        await context.bot.send_message(chat_id=user_id, text=of_username_not_verified_message(None))
+        await query.edit_message_text(format_review_card(user_id, record, "Asked buyer to retry OnlyFans username"))
+        await query.answer("Username retry requested.")
+        return
+
+    if action in {"label_promising", "label_skip"}:
+        record["internal_label"] = "promising" if action == "label_promising" else "not_worth_time"
+        save_state(state)
+        await query.edit_message_text(
+            format_review_card(user_id, record, "Internal label updated"),
+            reply_markup=build_admin_review_keyboard(user_id),
+        )
+        await query.answer("Internal label saved.")
         return
 
     if action == "ban":
@@ -2335,6 +2441,26 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text(format_status_message(user_id, record))
 
 
+async def details_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.effective_chat or not update.message:
+        return
+    if update.effective_chat.type != "private":
+        return
+
+    state = load_state()
+    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
+    if admin_chat_id != update.effective_chat.id:
+        return
+
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: /details <user_id>")
+        return
+
+    user_id = int(context.args[0])
+    record = get_user_record(state, user_id)
+    await update.message.reply_text(format_detailed_status_message(user_id, record))
+
+
 async def approve_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await manual_decision(update, context, approved=True, approval_mode="direct")
 
@@ -2515,6 +2641,8 @@ async def non_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text("Please choose a budget range using the buttons above.")
     elif record.get("status") == "awaiting_purchase_intent":
         await update.message.reply_text("Please tell me what you are looking to purchase in text.")
+    elif record.get("status") == "awaiting_clarification":
+        await update.message.reply_text(template("clarification_request"))
 
 
 def main() -> None:
@@ -2534,6 +2662,7 @@ def main() -> None:
     app.add_handler(CommandHandler("renew", renew_manual))
     app.add_handler(CommandHandler("senddirect", senddirect_manual))
     app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("details", details_command))
     app.add_handler(CommandHandler("expiring", expiring))
     app.add_handler(CommandHandler("notifyunverified", notify_unverified_manual))
     app.add_handler(CommandHandler("syncsubs", sync_subs))
