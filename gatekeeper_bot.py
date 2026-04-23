@@ -240,10 +240,10 @@ def access_status_line(record: dict[str, Any]) -> str:
 def verification_badge(record: dict[str, Any]) -> str:
     status = record.get("subscription_status") or "unknown"
     if status == "active":
-        return "OK"
+        return "Verified"
     if status == "inactive":
-        return "NO"
-    return "?"
+        return "Not verified"
+    return "Not checked"
 
 
 def verification_summary(record: dict[str, Any]) -> str:
@@ -650,31 +650,36 @@ def format_admin_home(state: dict[str, Any]) -> str:
 
     active_review_count = counts["priority"] + counts["normal"]
     followup_count = counts["awaiting_payment"] + counts["expiring"] + counts["expired"]
-    if active_review_count:
-        main_status = f"{active_review_count} lead{'s' if active_review_count != 1 else ''} waiting for review"
-    elif followup_count:
-        main_status = f"{followup_count} follow-up item{'s' if followup_count != 1 else ''} need attention"
-    else:
-        main_status = "All clear. Nothing urgent right now."
+    lines = ["Oliver's Little Helper", "Control room", ""]
 
-    lines = [
-        "Oliver's Little Helper",
-        "Admin dashboard",
-        "",
-        main_status,
-        "",
-        "Review pipeline",
-        f"Hot leads: {counts['priority']}",
-        f"Standard leads: {counts['normal']}",
-        f"Slow queue: {counts['low']}",
-        "",
-        "Follow-up",
-        f"Awaiting payment: {counts['awaiting_payment']}",
-        f"Access ending soon: {counts['expiring']}",
-        f"Expired access: {counts['expired']}",
-        "",
-        "Choose a button below. New buyer requests will still arrive here automatically.",
-    ]
+    if active_review_count == 0 and followup_count == 0 and counts["low"] == 0:
+        lines.extend(
+            [
+                "You're clear right now.",
+                "No urgent leads, payment follow-ups, or access issues need attention.",
+            ]
+        )
+    else:
+        lines.append("Needs attention")
+        if counts["priority"]:
+            lines.append(f"Hot leads waiting: {counts['priority']}")
+        if counts["normal"]:
+            lines.append(f"Standard leads waiting: {counts['normal']}")
+        if counts["awaiting_payment"]:
+            lines.append(f"Payments to follow up: {counts['awaiting_payment']}")
+        if counts["expiring"]:
+            lines.append(f"Access ending soon: {counts['expiring']}")
+        if counts["expired"]:
+            lines.append(f"Expired access: {counts['expired']}")
+        if counts["low"]:
+            lines.extend(["", f"Slow queue: {counts['low']} lead{'s' if counts['low'] != 1 else ''}"])
+
+    lines.extend(
+        [
+            "",
+            "Use the buttons below when you want to review, sync, or get a full briefing.",
+        ]
+    )
     return "\n".join(lines)
 
 
