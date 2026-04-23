@@ -574,20 +574,20 @@ def build_admin_home_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("Pending", callback_data="adm:pending:all"),
-                InlineKeyboardButton("Priority", callback_data="adm:pending:priority"),
+                InlineKeyboardButton("Review Inbox", callback_data="adm:pending:all"),
+                InlineKeyboardButton("Hot Leads", callback_data="adm:pending:priority"),
             ],
             [
-                InlineKeyboardButton("Low Queue", callback_data="adm:pending:low"),
-                InlineKeyboardButton("Expiring", callback_data="adm:expiring"),
+                InlineKeyboardButton("Slow Queue", callback_data="adm:pending:low"),
+                InlineKeyboardButton("Access Watch", callback_data="adm:expiring"),
             ],
             [
-                InlineKeyboardButton("Weekly Digest", callback_data="adm:digest"),
+                InlineKeyboardButton("Full Briefing", callback_data="adm:digest"),
                 InlineKeyboardButton("Sync OFAuth", callback_data="adm:sync"),
             ],
             [
                 InlineKeyboardButton("Refresh", callback_data="adm:home"),
-                InlineKeyboardButton("Help", callback_data="adm:help"),
+                InlineKeyboardButton("Command Menu", callback_data="adm:help"),
             ],
         ]
     )
@@ -648,17 +648,32 @@ def format_admin_home(state: dict[str, Any]) -> str:
         elif status == "expired":
             counts["expired"] += 1
 
+    active_review_count = counts["priority"] + counts["normal"]
+    followup_count = counts["awaiting_payment"] + counts["expiring"] + counts["expired"]
+    if active_review_count:
+        main_status = f"{active_review_count} lead{'s' if active_review_count != 1 else ''} waiting for review"
+    elif followup_count:
+        main_status = f"{followup_count} follow-up item{'s' if followup_count != 1 else ''} need attention"
+    else:
+        main_status = "All clear. Nothing urgent right now."
+
     lines = [
+        "Oliver's Little Helper",
         "Admin dashboard",
         "",
-        f"Priority leads: {counts['priority']}",
-        f"Normal pending: {counts['normal']}",
-        f"Low queue: {counts['low']}",
-        f"Awaiting payment: {counts['awaiting_payment']}",
-        f"Expiring soon: {counts['expiring']}",
-        f"Expired: {counts['expired']}",
+        main_status,
         "",
-        "Use the buttons below. New buyer requests will still arrive here automatically.",
+        "Review pipeline",
+        f"Hot leads: {counts['priority']}",
+        f"Standard leads: {counts['normal']}",
+        f"Slow queue: {counts['low']}",
+        "",
+        "Follow-up",
+        f"Awaiting payment: {counts['awaiting_payment']}",
+        f"Access ending soon: {counts['expiring']}",
+        f"Expired access: {counts['expired']}",
+        "",
+        "Choose a button below. New buyer requests will still arrive here automatically.",
     ]
     return "\n".join(lines)
 
@@ -1540,9 +1555,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         state["admin_chat_id"] = admin_chat_id
         save_state(state)
         heading = (
-            "Setup complete. This chat is now the admin inbox."
+            "Setup complete. This chat is now your private admin inbox."
             if first_admin_setup
-            else "Welcome back."
+            else "Welcome back. Here's your control room."
         )
         await update.message.reply_text(
             f"{heading}\n\n{format_admin_home(state)}",
