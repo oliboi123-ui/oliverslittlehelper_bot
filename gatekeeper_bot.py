@@ -2224,7 +2224,7 @@ async def relay_buyer_message(
         )
         save_state(state)
         await update.message.reply_text("I couldn't send that through just now. Please try again in a moment.")
-        admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
+        admin_chat_id = get_relay_group_id() if is_test_mode_active(state, update.effective_user) else resolve_admin_chat_id(state, update.effective_user)
         if admin_chat_id:
             try:
                 await context.bot.send_message(
@@ -2521,9 +2521,10 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(
             "Thanks. I added that to your request and will review it personally."
         )
-        if admin_chat_id:
+        notification_chat_id = get_relay_group_id() if test_mode_active else admin_chat_id
+        if notification_chat_id:
             await context.bot.send_message(
-                chat_id=admin_chat_id,
+                chat_id=notification_chat_id,
                 text=format_review_card(user.id, record, "Buyer clarified request"),
                 reply_markup=build_admin_review_keyboard(user.id),
             )
