@@ -105,6 +105,24 @@ BUDGET_OPTIONS = [
     {"key": "500_plus", "label": "$500+", "floor": 500, "ceiling": None, "priority": "priority"},
 ]
 
+QUICK_PHRASES = [
+    {
+        "key": "bought_before",
+        "label": "❓ Bought before?",
+        "text": "Have you purchased content from me before?",
+    },
+    {
+        "key": "what_content",
+        "label": "🧾 What do you want?",
+        "text": "What kind of content are you looking for today?",
+    },
+    {
+        "key": "budget",
+        "label": "💬 Ask budget",
+        "text": "What budget range are you thinking for this?",
+    },
+]
+
 
 TEMPLATES = {
     "already_pending": "Your request is already pending review. Please wait for a decision.",
@@ -533,6 +551,7 @@ def relay_intro_text(user_id: int, record: dict[str, Any]) -> str:
         "",
         "Reply in this topic to message this buyer.",
         "Messages starting with // stay in this topic only.",
+        "Quick buttons below keep replies and access actions fast.",
     ]
     return "\n".join(lines)
 
@@ -561,8 +580,34 @@ def payment_message() -> str:
     return (
         "Payment link\n"
         f"{get_payment_url()}\n\n"
-        "Use this for purchases so payment info stays easy to find."
+        "Use the PayPal button below for purchases so payment info stays easy to find."
     )
+
+
+def build_payment_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("💸 PayPal", url=get_payment_url())]]
+    )
+
+
+def build_relay_topic_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(item["label"], callback_data=f"q:{item['key']}:{user_id}")]
+        for item in QUICK_PHRASES
+    ]
+    rows.extend(
+        [
+            [
+                InlineKeyboardButton("💸 PayPal", callback_data=f"pay:{user_id}"),
+                InlineKeyboardButton("Status", callback_data=f"st:{user_id}"),
+            ],
+            [
+                InlineKeyboardButton("Revoke", callback_data=f"rv:{user_id}"),
+                InlineKeyboardButton("Remove", callback_data=f"rm:{user_id}"),
+            ],
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
 
 
 def user_label(user_id: int, user_data: dict[str, Any]) -> str:
@@ -633,6 +678,13 @@ def classify_low_priority(record: dict[str, Any]) -> bool:
     return budget_floor < 100
 
 
+def get_quick_phrase(key: str) -> dict[str, str] | None:
+    for item in QUICK_PHRASES:
+        if item["key"] == key:
+            return item
+    return None
+
+
 def build_budget_keyboard() -> InlineKeyboardMarkup:
     rows = []
     for start in range(0, len(BUDGET_OPTIONS), 2):
@@ -648,28 +700,28 @@ def build_admin_review_keyboard(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("Approve", callback_data=f"ar:{user_id}"),
-                InlineKeyboardButton("Direct Handle", callback_data=f"ad:{user_id}"),
+                InlineKeyboardButton("✅ Approve", callback_data=f"ar:{user_id}"),
+                InlineKeyboardButton("📩 Direct", callback_data=f"ad:{user_id}"),
             ],
             [
-                InlineKeyboardButton("Not a Fit", callback_data=f"nf:{user_id}"),
-                InlineKeyboardButton("Reject", callback_data=f"r:{user_id}"),
+                InlineKeyboardButton("🪫 Not a Fit", callback_data=f"nf:{user_id}"),
+                InlineKeyboardButton("❌ Reject", callback_data=f"r:{user_id}"),
             ],
             [
-                InlineKeyboardButton("Ask Clarify", callback_data=f"clar:{user_id}"),
-                InlineKeyboardButton("Retry Username", callback_data=f"retryof:{user_id}"),
+                InlineKeyboardButton("💬 Clarify", callback_data=f"clar:{user_id}"),
+                InlineKeyboardButton("↩ Retry Username", callback_data=f"retryof:{user_id}"),
             ],
             [
-                InlineKeyboardButton("Promising", callback_data=f"label_promising:{user_id}"),
-                InlineKeyboardButton("Not Worth Time", callback_data=f"label_skip:{user_id}"),
+                InlineKeyboardButton("⭐ Promising", callback_data=f"label_promising:{user_id}"),
+                InlineKeyboardButton("🧊 Skip", callback_data=f"label_skip:{user_id}"),
             ],
             [
-                InlineKeyboardButton("Move Up", callback_data=f"p:{user_id}"),
-                InlineKeyboardButton("Slow Queue", callback_data=f"l:{user_id}"),
+                InlineKeyboardButton("⬆ Move Up", callback_data=f"p:{user_id}"),
+                InlineKeyboardButton("⏳ Slow Queue", callback_data=f"l:{user_id}"),
             ],
             [
-                InlineKeyboardButton("Ban", callback_data=f"ban:{user_id}"),
-                InlineKeyboardButton("Details", callback_data=f"st:{user_id}"),
+                InlineKeyboardButton("🚫 Ban", callback_data=f"ban:{user_id}"),
+                InlineKeyboardButton("👤 Details", callback_data=f"st:{user_id}"),
             ],
         ]
     )
@@ -679,38 +731,62 @@ def build_post_approval_keyboard(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("Paid", callback_data=f"paid:{user_id}"),
-                InlineKeyboardButton("Remind Pay", callback_data=f"rp:{user_id}"),
+                InlineKeyboardButton("✅ Paid", callback_data=f"paid:{user_id}"),
+                InlineKeyboardButton("🔔 Remind Pay", callback_data=f"rp:{user_id}"),
             ],
             [
-                InlineKeyboardButton("Status", callback_data=f"st:{user_id}"),
-                InlineKeyboardButton("Ban", callback_data=f"ban:{user_id}"),
+                InlineKeyboardButton("👤 Status", callback_data=f"st:{user_id}"),
+                InlineKeyboardButton("🚫 Revoke", callback_data=f"rv:{user_id}"),
+            ],
+            [
+                InlineKeyboardButton("🗑 Remove", callback_data=f"rm:{user_id}"),
+                InlineKeyboardButton("🚫 Ban", callback_data=f"ban:{user_id}"),
             ],
         ]
     )
+
+
+def build_closed_record_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("👤 Status", callback_data=f"st:{user_id}"),
+                InlineKeyboardButton("🗑 Remove", callback_data=f"rm:{user_id}"),
+            ],
+        ]
+    )
+
+
+def build_user_action_keyboard(user_id: int, record: dict[str, Any]) -> InlineKeyboardMarkup:
+    status = record.get("status")
+    if status in {"pending", "low_priority"}:
+        return build_admin_review_keyboard(user_id)
+    if status == "approved":
+        return build_post_approval_keyboard(user_id)
+    return build_closed_record_keyboard(user_id)
 
 
 def build_admin_home_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("Review Inbox", callback_data="adm:pending:all"),
-                InlineKeyboardButton("Hot Leads", callback_data="adm:pending:priority"),
+                InlineKeyboardButton("📥 Review Inbox", callback_data="adm:pending:all"),
+                InlineKeyboardButton("🔥 Hot Leads", callback_data="adm:pending:priority"),
             ],
             [
-                InlineKeyboardButton("Slow Queue", callback_data="adm:pending:low"),
-                InlineKeyboardButton("Access Watch", callback_data="adm:expiring"),
+                InlineKeyboardButton("⏳ Slow Queue", callback_data="adm:pending:low"),
+                InlineKeyboardButton("👀 Access Watch", callback_data="adm:expiring"),
             ],
             [
-                InlineKeyboardButton("Full Briefing", callback_data="adm:digest"),
-                InlineKeyboardButton("Sync OFAuth", callback_data="adm:sync"),
+                InlineKeyboardButton("📋 Full Briefing", callback_data="adm:digest"),
+                InlineKeyboardButton("🔄 Sync OFAuth", callback_data="adm:sync"),
             ],
             [
-                InlineKeyboardButton("Help Unverified", callback_data="adm:notify_unverified"),
+                InlineKeyboardButton("❔ Help Unverified", callback_data="adm:notify_unverified"),
             ],
             [
-                InlineKeyboardButton("Refresh", callback_data="adm:home"),
-                InlineKeyboardButton("Command Menu", callback_data="adm:help"),
+                InlineKeyboardButton("🔁 Refresh", callback_data="adm:home"),
+                InlineKeyboardButton("📜 Command Menu", callback_data="adm:help"),
             ],
         ]
     )
@@ -841,6 +917,8 @@ def format_admin_help() -> str:
         "/lowpriority <user_id>\n"
         "/renew <user_id>\n"
         "/senddirect <user_id>\n"
+        "/revoke <user_id>\n"
+        "/removeuser <user_id>\n"
         "/status <user_id>\n"
         "/expiring\n"
         "/notifyunverified\n"
@@ -861,6 +939,36 @@ def format_pending_line(user_id: int, record: dict[str, Any]) -> str:
     if record.get("review_priority") != "normal":
         parts.append(priority_label(record))
     return " | ".join(parts)
+
+
+def get_queue_records(state: dict[str, Any], mode: str) -> list[tuple[int, dict[str, Any]]]:
+    records: list[tuple[int, dict[str, Any]]] = []
+    for user_id_text, record in state.get("users", {}).items():
+        status = record.get("status")
+        priority = record.get("review_priority")
+        if mode == "all" and status in {"pending", "low_priority"}:
+            records.append((int(user_id_text), record))
+        elif mode == "low" and status == "low_priority":
+            records.append((int(user_id_text), record))
+        elif mode == "normal" and status == "pending" and priority == "normal":
+            records.append((int(user_id_text), record))
+        elif mode == "priority" and status == "pending" and priority == "priority":
+            records.append((int(user_id_text), record))
+        elif mode == "expired" and status == "expired":
+            records.append((int(user_id_text), record))
+    records.sort(key=lambda item: item[1].get("queued_at") or item[1].get("approved_at") or "")
+    return records
+
+
+def queue_mode_title(mode: str) -> str:
+    titles = {
+        "all": "Review inbox",
+        "low": "Slow queue",
+        "normal": "Standard queue",
+        "priority": "Priority queue",
+        "expired": "Expired access",
+    }
+    return titles.get(mode, f"{mode.title()} queue")
 
 
 def get_pending_items(state: dict[str, Any], mode: str) -> list[str]:
@@ -960,9 +1068,67 @@ def format_low_priority_digest(state: dict[str, Any]) -> str:
             f"{user_id} | {display_name(record)} | {clean_text(record.get('of_username'))} | {budget_line(record)}"
         )
     lines.append(
-        "Use /approve <user_id>, /approverelay <user_id>, /reject <user_id>, /priority <user_id>, or /status <user_id>."
+        "Open /pending low in the admin chat for approval buttons."
     )
     return "\n".join(lines)
+
+
+async def send_queue_cards(bot: Any, chat_id: int, state: dict[str, Any], mode: str) -> None:
+    records = get_queue_records(state, mode)
+    title = queue_mode_title(mode)
+    if not records:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"{title}\n\nNothing waiting.",
+            reply_markup=build_admin_home_keyboard(),
+        )
+        return
+
+    await bot.send_message(
+        chat_id=chat_id,
+        text=f"{title}\n\n{count_line(len(records), 'request')} found. Tap a card to act on a user.",
+        reply_markup=build_admin_home_keyboard(),
+    )
+    for user_id, record in records[:20]:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=format_review_card(user_id, record, title),
+            reply_markup=build_user_action_keyboard(user_id, record),
+        )
+
+
+async def send_expiring_cards(bot: Any, chat_id: int, state: dict[str, Any]) -> None:
+    now = utc_now()
+    soon = now + timedelta(days=7)
+    records: list[tuple[int, dict[str, Any]]] = []
+    for user_id_text, record in state.get("users", {}).items():
+        user_id = int(user_id_text)
+        expires_at = parse_iso(record.get("expires_at"))
+        if record.get("status") == "approved" and expires_at and expires_at <= soon:
+            records.append((user_id, record))
+        elif record.get("status") == "expired":
+            records.append((user_id, record))
+
+    if not records:
+        await bot.send_message(
+            chat_id=chat_id,
+            text="No users expiring soon.",
+            reply_markup=build_admin_home_keyboard(),
+        )
+        return
+
+    await bot.send_message(
+        chat_id=chat_id,
+        text=f"Access watch\n\n{count_line(len(records), 'user')} found.",
+        reply_markup=build_admin_home_keyboard(),
+    )
+    for user_id, record in records[:20]:
+        heading = "Expires soon" if record.get("status") == "approved" else "Expired"
+        await bot.send_message(
+            chat_id=chat_id,
+            text=format_review_card(user_id, record, heading),
+            reply_markup=build_user_action_keyboard(user_id, record),
+        )
 
 
 def format_admin_digest(state: dict[str, Any]) -> str:
@@ -1496,7 +1662,7 @@ def format_expired_access_alert(summary: dict[str, Any]) -> str | None:
 
 
 def format_status_message(user_id: int, record: dict[str, Any]) -> str:
-    return format_review_card(user_id, record, "Buyer status")
+    return format_detailed_status_message(user_id, record)
 
 
 def resolve_admin_chat_id(state: dict[str, Any], user: Any) -> int | None:
@@ -1513,6 +1679,71 @@ def resolve_admin_chat_id(state: dict[str, Any], user: Any) -> int | None:
     if configured_username and configured_username == current_username:
         return user.id
     return None
+
+
+def callback_is_from_admin_surface(state: dict[str, Any], query: Any) -> bool:
+    if query.message is None:
+        return False
+    relay_group_id = get_relay_group_id()
+    admin_chat_id = resolve_admin_chat_id(state, query.from_user)
+    if relay_group_id is not None and query.message.chat.id == relay_group_id:
+        return admin_chat_id is not None
+    return bool(admin_chat_id and query.message.chat.id == admin_chat_id)
+
+
+def clear_relay_topic(state: dict[str, Any], record: dict[str, Any]) -> int | None:
+    topic_id = record.get("relay_topic_id")
+    if isinstance(topic_id, int):
+        get_relay_topics(state).pop(str(topic_id), None)
+        record["relay_topic_id"] = None
+    record["relay_topic_name"] = None
+    return topic_id if isinstance(topic_id, int) else None
+
+
+async def close_relay_topic_if_possible(bot: Any, topic_id: int | None) -> None:
+    relay_group_id = get_relay_group_id()
+    if relay_group_id is None or topic_id is None:
+        return
+    try:
+        await bot.close_forum_topic(chat_id=relay_group_id, message_thread_id=topic_id)
+    except Exception:
+        LOGGER.exception("Could not close relay topic %s.", topic_id)
+
+
+async def revoke_user_access(
+    bot: Any,
+    state: dict[str, Any],
+    user_id: int,
+    record: dict[str, Any],
+    *,
+    notify_user: bool = True,
+) -> None:
+    topic_id = clear_relay_topic(state, record)
+    record["status"] = "expired"
+    record["expires_at"] = to_iso(utc_now())
+    record["contact_mode"] = None
+    record["subscription_status"] = "inactive"
+    record["subscription_expires_at"] = None
+    record["payment_status"] = "not_requested"
+    await close_relay_topic_if_possible(bot, topic_id)
+    if notify_user:
+        try:
+            await bot.send_message(
+                chat_id=user_id,
+                text="Your access has ended. If you want back in later, send /start again.",
+            )
+        except Exception:
+            LOGGER.exception("Could not notify revoked user %s.", user_id)
+
+
+async def remove_user_from_system(
+    bot: Any,
+    state: dict[str, Any],
+    user_id: int,
+    record: dict[str, Any],
+) -> None:
+    await revoke_user_access(bot, state, user_id, record, notify_user=False)
+    state.setdefault("users", {}).pop(str(user_id), None)
 
 
 def begin_application(record: dict[str, Any]) -> None:
@@ -1557,6 +1788,7 @@ async def ensure_relay_topic(
         chat_id=relay_group_id,
         message_thread_id=topic_id,
         text=relay_intro_text(user_id, record),
+        reply_markup=build_relay_topic_keyboard(user_id),
     )
     return topic_id, topic_name
 
@@ -1568,6 +1800,7 @@ async def send_and_pin_payment_message(bot: Any, user_id: int, record: dict[str,
     message = await bot.send_message(
         chat_id=user_id,
         text=payment_message(),
+        reply_markup=build_payment_keyboard(),
         protect_content=True,
     )
     record["payment_message_id"] = message.message_id
@@ -1610,6 +1843,14 @@ async def send_relay_contact(
     set_contact_mode(record, "relay", now=current_time)
     await bot.send_message(chat_id=user_id, text=relay_access_message(record), protect_content=True)
     await send_and_pin_payment_message(bot, user_id, record)
+    relay_group_id = get_relay_group_id()
+    if relay_group_id is not None:
+        await bot.send_message(
+            chat_id=relay_group_id,
+            message_thread_id=topic_id,
+            text="Relay controls",
+            reply_markup=build_relay_topic_keyboard(user_id),
+        )
     return topic_id, topic_name
 
 
@@ -2016,8 +2257,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
         return
 
-    admin_chat_id = resolve_admin_chat_id(state, query.from_user)
-    if not admin_chat_id or query.message is None or query.message.chat.id != admin_chat_id:
+    if not callback_is_from_admin_surface(state, query):
         await query.answer("Not allowed.", show_alert=True)
         return
 
@@ -2035,20 +2275,12 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         if admin_action == "pending":
             mode = parts[2] if len(parts) > 2 else "all"
-            await context.bot.send_message(
-                chat_id=query.message.chat.id,
-                text=format_pending_message(state, mode),
-                reply_markup=build_admin_home_keyboard(),
-            )
+            await send_queue_cards(context.bot, query.message.chat.id, state, mode)
             await query.answer("List sent.")
             return
 
         if admin_action == "expiring":
-            await context.bot.send_message(
-                chat_id=query.message.chat.id,
-                text=format_expiring_message(state),
-                reply_markup=build_admin_home_keyboard(),
-            )
+            await send_expiring_cards(context.bot, query.message.chat.id, state)
             await query.answer("Expiring list sent.")
             return
 
@@ -2146,17 +2378,51 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     record = get_user_record(state, user_id)
 
     if action == "st":
-        markup = None
-        if record.get("status") in {"pending", "low_priority"}:
-            markup = build_admin_review_keyboard(user_id)
-        elif record.get("status") == "approved":
-            markup = build_post_approval_keyboard(user_id)
+        markup = build_user_action_keyboard(user_id, record)
         await context.bot.send_message(
             chat_id=query.message.chat.id,
             text=format_detailed_status_message(user_id, record),
             reply_markup=markup,
         )
         await query.answer("Details sent.")
+        return
+
+    if action == "pay":
+        if record.get("status") != "approved":
+            await query.answer("Only approved buyers can receive the payment link.", show_alert=True)
+            return
+        await send_and_pin_payment_message(context.bot, user_id, record)
+        save_state(state)
+        await query.answer("Payment link sent.")
+        if query.message.chat.type == "supergroup":
+            await context.bot.send_message(
+                chat_id=query.message.chat.id,
+                message_thread_id=query.message.message_thread_id,
+                text="Payment link sent.",
+            )
+        return
+
+    if action == "rv":
+        if record.get("status") not in {"approved", "expired"}:
+            await query.answer("That user does not currently have active access.", show_alert=True)
+            return
+        await revoke_user_access(context.bot, state, user_id, record, notify_user=True)
+        save_state(state)
+        await query.edit_message_text(
+            format_detailed_status_message(user_id, record),
+            reply_markup=build_user_action_keyboard(user_id, record),
+        )
+        await query.answer("Access revoked.")
+        return
+
+    if action == "rm":
+        if str(user_id) not in state.get("users", {}):
+            await query.answer("User is already removed.", show_alert=True)
+            return
+        await remove_user_from_system(context.bot, state, user_id, record)
+        save_state(state)
+        await query.edit_message_text(f"Removed user {user_id} from the system.")
+        await query.answer("User removed.")
         return
 
     if action == "clar":
@@ -2359,10 +2625,7 @@ async def pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     mode = normalize_username(context.args[0]) if context.args else "all"
-    await update.message.reply_text(
-        format_pending_message(state, mode),
-        reply_markup=build_admin_home_keyboard(),
-    )
+    await send_queue_cards(context.bot, update.effective_chat.id, state, mode)
 
 
 async def expiring(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2376,10 +2639,7 @@ async def expiring(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if admin_chat_id != update.effective_chat.id:
         return
 
-    await update.message.reply_text(
-        format_expiring_message(state),
-        reply_markup=build_admin_home_keyboard(),
-    )
+    await send_expiring_cards(context.bot, update.effective_chat.id, state)
 
 
 async def notify_unverified_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2604,7 +2864,10 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     user_id = int(context.args[0])
     record = get_user_record(state, user_id)
-    await update.message.reply_text(format_status_message(user_id, record))
+    await update.message.reply_text(
+        format_status_message(user_id, record),
+        reply_markup=build_user_action_keyboard(user_id, record),
+    )
 
 
 async def details_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2624,7 +2887,10 @@ async def details_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     user_id = int(context.args[0])
     record = get_user_record(state, user_id)
-    await update.message.reply_text(format_detailed_status_message(user_id, record))
+    await update.message.reply_text(
+        format_detailed_status_message(user_id, record),
+        reply_markup=build_user_action_keyboard(user_id, record),
+    )
 
 
 async def approve_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2731,6 +2997,62 @@ async def senddirect_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.message.reply_text("Direct handle sent.")
 
 
+async def revoke_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.effective_chat or not update.message:
+        return
+    if update.effective_chat.type != "private":
+        return
+
+    state = load_state()
+    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
+    if admin_chat_id != update.effective_chat.id:
+        return
+
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: /revoke <user_id>")
+        return
+
+    user_id = int(context.args[0])
+    record = get_user_record(state, user_id)
+    if record.get("status") not in {"approved", "expired"}:
+        await update.message.reply_text("That user does not currently have active access.")
+        return
+    await revoke_user_access(context.bot, state, user_id, record)
+    save_state(state)
+    log_event("access_revoked", buyer_id=user_id, trigger="command")
+    await update.message.reply_text(
+        format_detailed_status_message(user_id, record),
+        reply_markup=build_user_action_keyboard(user_id, record),
+    )
+
+
+async def removeuser_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.effective_chat or not update.message:
+        return
+    if update.effective_chat.type != "private":
+        return
+
+    state = load_state()
+    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
+    if admin_chat_id != update.effective_chat.id:
+        return
+
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: /removeuser <user_id>")
+        return
+
+    user_id = int(context.args[0])
+    if str(user_id) not in state.get("users", {}):
+        await update.message.reply_text("That user is already removed.")
+        return
+
+    record = get_user_record(state, user_id)
+    await remove_user_from_system(context.bot, state, user_id, record)
+    save_state(state)
+    log_event("user_removed", buyer_id=user_id, trigger="command")
+    await update.message.reply_text(f"Removed user {user_id} from the system.")
+
+
 async def manual_decision(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -2835,6 +3157,8 @@ def main() -> None:
     app.add_handler(CommandHandler("lowpriority", lowpriority_manual))
     app.add_handler(CommandHandler("renew", renew_manual))
     app.add_handler(CommandHandler("senddirect", senddirect_manual))
+    app.add_handler(CommandHandler("revoke", revoke_manual))
+    app.add_handler(CommandHandler("removeuser", removeuser_manual))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("details", details_command))
     app.add_handler(CommandHandler("expiring", expiring))
