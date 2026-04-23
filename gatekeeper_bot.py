@@ -72,9 +72,12 @@ def template(name: str) -> str:
 def of_username_help_message() -> str:
     return (
         "Please send your OnlyFans username to continue.\n\n"
-        "This means the @name on your OnlyFans profile, not your Telegram username, "
+        "This means the username on your OnlyFans profile, not your Telegram username, "
         "display name, email, or a link.\n\n"
-        "Example: if your profile is onlyfans.com/example, send: example"
+        "Examples:\n"
+        "- If your profile is onlyfans.com/example, send: example\n"
+        "- If you never chose a custom username, it may look like @u123456789. "
+        "In that case, send the full @u number username."
     )
 
 
@@ -83,9 +86,12 @@ def of_username_not_verified_message(of_username: str | None = None) -> str:
     return (
         f"I couldn't verify an active OnlyFans subscription for {submitted}.\n\n"
         "Most of the time this is just the wrong name being entered. Please send the "
-        "username from your OnlyFans profile URL, not your display name, Telegram name, "
+        "OnlyFans username from your profile, not your display name, Telegram name, "
         "email, or a full link.\n\n"
-        "Example: if your profile is onlyfans.com/example, send: example"
+        "Examples:\n"
+        "- If your profile is onlyfans.com/example, send: example\n"
+        "- If you never chose a custom username, it may look like @u123456789. "
+        "In that case, send the full @u number username."
     )
 
 
@@ -2219,7 +2225,7 @@ async def verifyof(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         lines = [
             "Verified",
             "",
-            f"OF username: {verification_result.get('username') or claimed_username}",
+            f"OnlyFans username: {verification_result.get('username') or claimed_username}",
             f"Subscription: active until {format_datetime_for_user(verification_result.get('expired_at'), empty='an unknown date')}",
         ]
         if show_debug:
@@ -2236,7 +2242,7 @@ async def verifyof(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = [
         "Unverified",
         "",
-        f"OF username: {verification_result.get('username') or claimed_username}",
+        f"OnlyFans username: {verification_result.get('username') or claimed_username}",
         "No active subscription found.",
     ]
     if show_debug:
