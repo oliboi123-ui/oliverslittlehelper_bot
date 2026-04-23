@@ -69,6 +69,26 @@ def template(name: str) -> str:
     return TEMPLATES[name]
 
 
+def of_username_help_message() -> str:
+    return (
+        "Please send your OnlyFans username to continue.\n\n"
+        "This means the @name on your OnlyFans profile, not your Telegram username, "
+        "display name, email, or a link.\n\n"
+        "Example: if your profile is onlyfans.com/example, send: example"
+    )
+
+
+def of_username_not_verified_message(of_username: str | None = None) -> str:
+    submitted = clean_text(of_username, empty="that username")
+    return (
+        f"I couldn't verify an active OnlyFans subscription for {submitted}.\n\n"
+        "Most of the time this is just the wrong name being entered. Please send the "
+        "username from your OnlyFans profile URL, not your display name, Telegram name, "
+        "email, or a full link.\n\n"
+        "Example: if your profile is onlyfans.com/example, send: example"
+    )
+
+
 def load_dotenv_file() -> None:
     if not ENV_PATH.exists():
         return
@@ -586,6 +606,9 @@ def build_admin_home_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("Sync OFAuth", callback_data="adm:sync"),
             ],
             [
+                InlineKeyboardButton("Help Unverified", callback_data="adm:notify_unverified"),
+            ],
+            [
                 InlineKeyboardButton("Refresh", callback_data="adm:home"),
                 InlineKeyboardButton("Command Menu", callback_data="adm:help"),
             ],
@@ -698,6 +721,7 @@ def format_admin_help() -> str:
         "/senddirect <user_id>\n"
         "/status <user_id>\n"
         "/expiring\n"
+        "/notifyunverified\n"
         "/syncsubs\n"
         "/verifyof <onlyfans_username>\n"
         "/ofdiag"
@@ -764,6 +788,32 @@ def format_expiring_message(state: dict[str, Any]) -> str:
     if not items:
         return "No users expiring soon."
     return "\n".join(items[:50])
+
+
+async def notify_unverified_low_priority_users(bot: Any, state: dict[str, Any]) -> dict[str, int]:
+    notified = 0
+    failed = 0
+    skipped = 0
+    for user_id_text, record in state.get("users", {}).items():
+        if record.get("status") != "low_priority" or record.get("subscription_status") != "inactive":
+            continue
+
+        user_id = int(user_id_text)
+        submitted_username = str(record.get("of_username") or "").strip()
+        try:
+            await bot.send_message(
+                chat_id=user_id,
+                text=of_username_not_verified_message(submitted_username),
+            )
+        except Exception:
+            LOGGER.exception("Could not notify unverified low-priority user %s.", user_id)
+            failed += 1
+            continue
+
+        begin_application(record)
+        notified += 1
+
+    return {"notified": notified, "failed": failed, "skipped": skipped}
 
 
 def get_low_priority_records(state: dict[str, Any]) -> list[tuple[int, dict[str, Any]]]:
@@ -1346,6 +1396,9 @@ def resolve_admin_chat_id(state: dict[str, Any], user: Any) -> int | None:
 def begin_application(record: dict[str, Any]) -> None:
     record["status"] = "awaiting_of_username"
     record["of_username"] = None
+    record["subscription_status"] = "unknown"
+    record["subscription_expires_at"] = None
+    record["onlyfans_user_id"] = None
     record["budget_range_key"] = None
     record["budget_range_label"] = None
     record["budget_floor"] = None
@@ -1595,7 +1648,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     begin_application(record)
     save_state(state)
-    await update.message.reply_text("Please state your OF-username to continue.")
+    await update.message.reply_text(of_username_help_message())
 
 
 async def complete_application(
@@ -1610,6 +1663,7 @@ async def complete_application(
 
     admin_chat_id = resolve_admin_chat_id(state, user)
     exact_match_note = ""
+    verified_subscription = not ofauth_is_configured()
     if ofauth_is_configured():
         try:
             verification_result = await asyncio.to_thread(
@@ -1623,9 +1677,25 @@ async def complete_application(
                 record["subscription_status"] = "active"
                 record["onlyfans_user_id"] = verification_result.get("id")
                 record["subscription_expires_at"] = verification_result.get("expired_at")
+                verified_subscription = True
             else:
                 record["subscription_status"] = "inactive"
                 record["subscription_expires_at"] = None
+                verified_subscription = False
+
+    if not verified_subscription:
+        submitted_username = str(record.get("of_username") or "").strip()
+        record["status"] = "awaiting_of_username"
+        record["of_username"] = None
+        record["budget_range_key"] = None
+        record["budget_range_label"] = None
+        record["budget_floor"] = None
+        record["purchase_intent"] = None
+        record["review_priority"] = "normal"
+        record["queued_at"] = None
+        save_state(state)
+        await update.message.reply_text(of_username_not_verified_message(submitted_username))
+        return
 
     record["queued_at"] = to_iso(utc_now())
     if classify_low_priority(record):
@@ -1673,9 +1743,8 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     admin_chat_id = resolve_admin_chat_id(state, user)
     if admin_chat_id == update.effective_chat.id:
         await update.message.reply_text(
-            "Use /pending [all|low|normal|priority|expired], /approve <user_id>, /approverelay <user_id>, /reject <user_id>, "
-            "/priority <user_id>, /lowpriority <user_id>, /renew <user_id>, /senddirect <user_id>, /status <user_id>, "
-            "/expiring, /syncsubs, /verifyof <onlyfans_username> or /ofdiag here."
+            format_admin_home(state),
+            reply_markup=build_admin_home_keyboard(),
         )
         state["admin_chat_id"] = admin_chat_id
         save_state(state)
@@ -1698,7 +1767,7 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if status in {"new", "rejected", "expired"}:
         begin_application(record)
         save_state(state)
-        await update.message.reply_text("Please state your OF-username to continue.")
+        await update.message.reply_text(of_username_help_message())
         return
 
     if status == "awaiting_of_username":
@@ -1850,6 +1919,21 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     text=expired_alert,
                     reply_markup=build_admin_home_keyboard(),
                 )
+            return
+
+        if admin_action == "notify_unverified":
+            summary = await notify_unverified_low_priority_users(context.bot, state)
+            save_state(state)
+            await context.bot.send_message(
+                chat_id=query.message.chat.id,
+                text=(
+                    "Unverified low-priority users notified.\n\n"
+                    f"Sent: {summary['notified']}\n"
+                    f"Failed: {summary['failed']}"
+                ),
+                reply_markup=build_admin_home_keyboard(),
+            )
+            await query.answer("Notification pass complete.")
             return
 
         await query.answer("Unknown admin action.", show_alert=True)
@@ -2039,6 +2123,27 @@ async def expiring(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.message.reply_text(
         format_expiring_message(state),
+        reply_markup=build_admin_home_keyboard(),
+    )
+
+
+async def notify_unverified_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.effective_chat or not update.message:
+        return
+    if update.effective_chat.type != "private":
+        return
+
+    state = load_state()
+    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
+    if admin_chat_id != update.effective_chat.id:
+        return
+
+    summary = await notify_unverified_low_priority_users(context.bot, state)
+    save_state(state)
+    await update.message.reply_text(
+        "Unverified low-priority users notified.\n\n"
+        f"Sent: {summary['notified']}\n"
+        f"Failed: {summary['failed']}",
         reply_markup=build_admin_home_keyboard(),
     )
 
@@ -2399,7 +2504,7 @@ async def non_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await relay_buyer_message(update, context, state, record)
         return
     if record.get("status") == "awaiting_of_username":
-        await update.message.reply_text("Please send your OF-username as text.")
+        await update.message.reply_text(of_username_help_message())
     elif record.get("status") == "awaiting_budget_range":
         await update.message.reply_text("Please choose a budget range using the buttons above.")
     elif record.get("status") == "awaiting_purchase_intent":
@@ -2424,6 +2529,7 @@ def main() -> None:
     app.add_handler(CommandHandler("senddirect", senddirect_manual))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("expiring", expiring))
+    app.add_handler(CommandHandler("notifyunverified", notify_unverified_manual))
     app.add_handler(CommandHandler("syncsubs", sync_subs))
     app.add_handler(CommandHandler("verifyof", verifyof))
     app.add_handler(CommandHandler("ofdiag", ofdiag))
