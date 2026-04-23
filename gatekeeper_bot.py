@@ -105,6 +105,8 @@ BUDGET_OPTIONS = [
     {"key": "500_plus", "label": "$500+", "floor": 500, "ceiling": None, "priority": "priority"},
 ]
 
+TEST_SESSION_ID_OFFSET = 9_000_000_000_000_000
+
 QUICK_PHRASES = [
     {
         "key": "bought_before",
@@ -427,6 +429,7 @@ def load_state() -> dict[str, Any]:
             "relay_topics": {},
             "content_vault_chat_id": None,
             "vault_items": {},
+            "test_sessions": {},
         }
     try:
         state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -438,12 +441,14 @@ def load_state() -> dict[str, Any]:
             "relay_topics": {},
             "content_vault_chat_id": None,
             "vault_items": {},
+            "test_sessions": {},
         }
     state.setdefault("admin_chat_id", None)
     state.setdefault("users", {})
     state.setdefault("relay_topics", {})
     state.setdefault("content_vault_chat_id", None)
     state.setdefault("vault_items", {})
+    state.setdefault("test_sessions", {})
     return state
 
 
@@ -536,6 +541,99 @@ def get_user_record(state: dict[str, Any], user_id: int) -> dict[str, Any]:
     return record
 
 
+def get_test_session_user_id(user_id: int) -> int:
+    return TEST_SESSION_ID_OFFSET + abs(user_id)
+
+
+def get_test_sessions(state: dict[str, Any]) -> dict[str, Any]:
+    return state.setdefault("test_sessions", {})
+
+
+def is_test_mode_active(state: dict[str, Any], user: Any) -> bool:
+    if user is None:
+        return False
+    session = get_test_sessions(state).get(str(user.id))
+    return bool(session and session.get("active"))
+
+
+def get_active_private_record(state: dict[str, Any], user: Any) -> dict[str, Any]:
+    if is_test_mode_active(state, user):
+        record = get_user_record(state, get_test_session_user_id(user.id))
+        record["test_mode"] = True
+        return record
+    return get_user_record(state, user.id)
+
+
+def is_sandbox_record(record: dict[str, Any]) -> bool:
+    return bool(record.get("test_mode"))
+
+
+def begin_test_mode_session(state: dict[str, Any], user: Any) -> dict[str, Any]:
+    session = get_test_sessions(state).setdefault(str(user.id), {})
+    session["active"] = True
+    session["started_at"] = to_iso(utc_now())
+    session["buyer_user_id"] = get_test_session_user_id(user.id)
+
+    record = get_user_record(state, session["buyer_user_id"])
+    record.clear()
+    record.update(default_user_record())
+    record["test_mode"] = True
+    record["status"] = "new"
+    record["telegram_username"] = "test_mode"
+    record["first_name"] = "Test"
+    record["last_name"] = "Buyer"
+    record["approved_at"] = None
+    record["expires_at"] = None
+    record["last_checked_at"] = None
+    record["subscription_status"] = "unknown"
+    record["subscription_expires_at"] = None
+    record["onlyfans_user_id"] = None
+    record["budget_range_key"] = None
+    record["budget_range_label"] = None
+    record["budget_floor"] = None
+    record["review_priority"] = "normal"
+    record["purchase_intent"] = None
+    record["queued_at"] = None
+    record["contact_mode"] = None
+    record["relay_topic_id"] = None
+    record["relay_topic_name"] = None
+    record["relay_enabled_at"] = None
+    record["relay_closed_at"] = None
+    record["direct_shared_at"] = None
+    record["identity_proof_requested_at"] = None
+    record["identity_proof_sent_at"] = None
+    record["payment_message_id"] = None
+    record["payment_status"] = "not_requested"
+    record["payment_requested_at"] = None
+    record["payment_confirmed_at"] = None
+    record["payment_reminded_at"] = None
+    record["content_unlocks"] = []
+    record["not_fit_at"] = None
+    record["banned_at"] = None
+    record["ban_reason"] = None
+    record["clarification_requested_at"] = None
+    record["clarification_response"] = None
+    record["internal_label"] = None
+    begin_application(record)
+    record["test_mode"] = True
+    record["test_mode_started_at"] = session["started_at"]
+    return record
+
+
+def end_test_mode_session(state: dict[str, Any], user: Any) -> None:
+    session = get_test_sessions(state).get(str(user.id))
+    if session is not None:
+        session["active"] = False
+        session["ended_at"] = to_iso(utc_now())
+
+
+def get_test_mode_real_user_id(state: dict[str, Any], sandbox_user_id: int) -> int | None:
+    for admin_user_id, session in get_test_sessions(state).items():
+        if int(session.get("buyer_user_id") or 0) == sandbox_user_id and session.get("active"):
+            return int(admin_user_id)
+    return None
+
+
 def get_relay_topics(state: dict[str, Any]) -> dict[str, Any]:
     return state.setdefault("relay_topics", {})
 
@@ -622,18 +720,28 @@ def direct_access_message(private_username: str, record: dict[str, Any]) -> str:
     )
 
 
-def payment_message() -> str:
+def payment_message(record: dict[str, Any] | None = None) -> str:
+    extra = ""
+    if record and record.get("test_mode"):
+        extra = "\n\nTest mode is active. Use the sandbox controls below to simulate payment and unlock content."
     return (
         "Payment link\n"
         f"{get_payment_url()}\n\n"
         "Use the PayPal button below for purchases so payment info stays easy to find."
+        f"{extra}"
     )
 
 
-def build_payment_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("💸 PayPal", url=get_payment_url())]]
-    )
+def build_payment_keyboard(user_id: int | None = None, record: dict[str, Any] | None = None) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton("💸 PayPal", url=get_payment_url())]]
+    if user_id is not None and record is not None and record.get("test_mode"):
+        rows.append(
+            [
+                InlineKeyboardButton("🧪 Simulate paid", callback_data=f"test:paid:{user_id}"),
+                InlineKeyboardButton("🚪 Exit test mode", callback_data=f"test:exit:{user_id}"),
+            ]
+        )
+    return InlineKeyboardMarkup(rows)
 
 
 def build_relay_topic_keyboard(user_id: int, record: dict[str, Any] | None = None) -> InlineKeyboardMarkup:
@@ -967,6 +1075,8 @@ def format_admin_home(state: dict[str, Any]) -> str:
     }
     soon = utc_now() + timedelta(days=7)
     for record in state.get("users", {}).values():
+        if is_sandbox_record(record):
+            continue
         status = record.get("status")
         priority = record.get("review_priority")
         expires_at = parse_iso(record.get("expires_at"))
@@ -1029,6 +1139,7 @@ def format_admin_help() -> str:
         "/expiring\n"
         "/notifyunverified\n"
         "/syncsubs\n"
+        "/testmode\n"
         "/verifyof <onlyfans_username>\n"
         "/ofdiag"
     )
@@ -1050,6 +1161,8 @@ def format_pending_line(user_id: int, record: dict[str, Any]) -> str:
 def get_queue_records(state: dict[str, Any], mode: str) -> list[tuple[int, dict[str, Any]]]:
     records: list[tuple[int, dict[str, Any]]] = []
     for user_id_text, record in state.get("users", {}).items():
+        if is_sandbox_record(record):
+            continue
         status = record.get("status")
         priority = record.get("review_priority")
         if mode == "all" and status in {"pending", "low_priority"}:
@@ -1080,6 +1193,8 @@ def queue_mode_title(mode: str) -> str:
 def get_pending_items(state: dict[str, Any], mode: str) -> list[str]:
     items = []
     for user_id_text, record in state.get("users", {}).items():
+        if is_sandbox_record(record):
+            continue
         status = record.get("status")
         priority = record.get("review_priority")
         if mode == "all" and status in {"pending", "low_priority"}:
@@ -1107,6 +1222,8 @@ def get_expiring_items(state: dict[str, Any]) -> list[str]:
     soon = now + timedelta(days=7)
     items = []
     for user_id_text, record in state.get("users", {}).items():
+        if is_sandbox_record(record):
+            continue
         expires_at = parse_iso(record.get("expires_at"))
         if record.get("status") == "approved" and expires_at and expires_at <= soon:
             items.append(
@@ -1131,6 +1248,8 @@ async def notify_unverified_low_priority_users(bot: Any, state: dict[str, Any]) 
     failed = 0
     skipped = 0
     for user_id_text, record in state.get("users", {}).items():
+        if is_sandbox_record(record):
+            continue
         if record.get("status") != "low_priority" or record.get("subscription_status") != "inactive":
             continue
 
@@ -1155,6 +1274,8 @@ async def notify_unverified_low_priority_users(bot: Any, state: dict[str, Any]) 
 def get_low_priority_records(state: dict[str, Any]) -> list[tuple[int, dict[str, Any]]]:
     items: list[tuple[int, dict[str, Any]]] = []
     for user_id_text, record in state.get("users", {}).items():
+        if is_sandbox_record(record):
+            continue
         if record.get("status") == "low_priority":
             items.append((int(user_id_text), record))
     items.sort(key=lambda item: item[1].get("queued_at") or "", reverse=False)
@@ -1208,6 +1329,8 @@ async def send_expiring_cards(bot: Any, chat_id: int, state: dict[str, Any]) -> 
     soon = now + timedelta(days=7)
     records: list[tuple[int, dict[str, Any]]] = []
     for user_id_text, record in state.get("users", {}).items():
+        if is_sandbox_record(record):
+            continue
         user_id = int(user_id_text)
         expires_at = parse_iso(record.get("expires_at"))
         if record.get("status") == "approved" and expires_at and expires_at <= soon:
@@ -1242,6 +1365,7 @@ def format_admin_digest(state: dict[str, Any]) -> str:
     soon = now + timedelta(days=7)
     sections: list[str] = ["Weekly admin digest"]
     users = [(int(user_id), record) for user_id, record in state.get("users", {}).items()]
+    users = [(user_id, record) for user_id, record in users if not is_sandbox_record(record)]
 
     def add_section(title: str, rows: list[str], *, empty: str = "Nothing waiting.") -> None:
         sections.extend(["", title])
@@ -1669,6 +1793,8 @@ def sync_subscribers(state: dict[str, Any]) -> dict[str, Any]:
     }
 
     for user_id_text, record in state.get("users", {}).items():
+        if is_sandbox_record(record):
+            continue
         user_id = int(user_id_text)
         mark_expired_if_needed(record, now=now)
         claimed_username = normalize_of_username(str(record.get("of_username") or ""))
@@ -1914,12 +2040,14 @@ async def deliver_vault_item(
     state: dict[str, Any],
     user_id: int,
     item_key: str,
+    *,
+    target_chat_id: int | None = None,
 ) -> None:
     item = get_vault_items(state).get(item_key)
     if item is None:
         raise RuntimeError("That vault item is no longer registered.")
     await bot.copy_message(
-        chat_id=user_id,
+        chat_id=target_chat_id if target_chat_id is not None else user_id,
         from_chat_id=int(item["source_chat_id"]),
         message_id=int(item["source_message_id"]),
         protect_content=True,
@@ -1973,14 +2101,21 @@ async def ensure_relay_topic(
     return topic_id, topic_name
 
 
-async def send_and_pin_payment_message(bot: Any, user_id: int, record: dict[str, Any]) -> None:
+async def send_and_pin_payment_message(
+    bot: Any,
+    user_id: int,
+    record: dict[str, Any],
+    *,
+    callback_user_id: int | None = None,
+) -> None:
     current_time = utc_now()
     record["payment_status"] = "pending"
     record["payment_requested_at"] = to_iso(current_time)
+    callback_target_id = callback_user_id if callback_user_id is not None else user_id
     message = await bot.send_message(
         chat_id=user_id,
-        text=payment_message(),
-        reply_markup=build_payment_keyboard(),
+        text=payment_message(record),
+        reply_markup=build_payment_keyboard(callback_target_id, record),
         protect_content=True,
     )
     record["payment_message_id"] = message.message_id
@@ -2151,6 +2286,91 @@ async def ask_budget_question(message_target: Any) -> None:
     )
 
 
+def test_mode_access_message(record: dict[str, Any]) -> str:
+    private_username = get_required_env("PRIVATE_TELEGRAM_USERNAME")
+    return (
+        "Test mode is active.\n\n"
+        f"{direct_access_message(private_username, record)}\n\n"
+        "Use the sandbox buttons below to simulate payment and unlock content."
+    )
+
+
+def test_mode_prompt_message(record: dict[str, Any]) -> str:
+    status = record.get("status")
+    if status == "awaiting_of_username":
+        return of_username_help_message()
+    if status == "awaiting_budget_range":
+        return "Please choose a budget range using the buttons above."
+    if status == "awaiting_purchase_intent":
+        return "Please tell me what you are looking to purchase in text."
+    if status == "awaiting_clarification":
+        return template("clarification_request")
+    if is_access_active(record):
+        return test_mode_access_message(record)
+    return (
+        "Test mode is active.\n\n"
+        "Send a fake OnlyFans username to walk the buyer flow. "
+        "Run /testmode again to exit the sandbox."
+    )
+
+
+async def handle_test_mode_private_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    state: dict[str, Any],
+    record: dict[str, Any],
+) -> None:
+    user = update.effective_user
+    message = update.message
+    if user is None or message is None:
+        return
+
+    mark_expired_if_needed(record)
+    message_text = (message.text or message.caption or "").strip()
+    if record.get("status") in {"new", "rejected", "expired"}:
+        if record.get("status") != "new":
+            begin_application(record)
+        save_state(state)
+        await message.reply_text(of_username_help_message())
+        return
+
+    if is_access_active(record):
+        save_state(state)
+        await message.reply_text(test_mode_access_message(record))
+        return
+
+    status = record.get("status")
+    if status == "awaiting_of_username":
+        if not message_text:
+            await message.reply_text(of_username_help_message())
+            return
+        record["of_username"] = message_text
+        record["status"] = "awaiting_budget_range"
+        save_state(state)
+        await ask_budget_question(message)
+        return
+
+    if status == "awaiting_budget_range":
+        await message.reply_text("Please choose a budget range using the buttons above.")
+        return
+
+    if status == "awaiting_purchase_intent":
+        if not message_text:
+            await message.reply_text("Please tell me what you are looking to purchase in text.")
+            return
+        record["purchase_intent"] = message_text
+        await complete_application(update, context, state, record)
+        return
+
+    if status == "awaiting_clarification":
+        await message.reply_text(template("clarification_request"))
+        return
+
+    begin_application(record)
+    save_state(state)
+    await message.reply_text(of_username_help_message())
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.effective_chat or not update.message:
         return
@@ -2159,6 +2379,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     state = load_state()
     user = update.effective_user
+    if is_test_mode_active(state, user):
+        record = get_active_private_record(state, user)
+        record["telegram_username"] = "test_mode"
+        record["first_name"] = "Test"
+        record["last_name"] = "Buyer"
+        if record.get("status") in {"new", "rejected", "expired"}:
+            begin_application(record)
+        save_state(state)
+        await update.message.reply_text(test_mode_prompt_message(record))
+        return
+
     record = get_user_record(state, user.id)
     record["telegram_username"] = user.username
     record["first_name"] = user.first_name
@@ -2214,6 +2445,24 @@ async def complete_application(
 ) -> None:
     user = update.effective_user
     if user is None or update.message is None:
+        return
+
+    if record.get("test_mode"):
+        current_time = utc_now()
+        record["subscription_status"] = "active"
+        record["subscription_expires_at"] = to_iso(current_time + timedelta(days=get_access_duration_days()))
+        record["onlyfans_user_id"] = f"test-{user.id}"
+        grant_access(record, now=current_time)
+        record["status"] = "approved"
+        save_state(state)
+        await update.message.reply_text(application_confirmation_message(record))
+        await update.message.reply_text(test_mode_access_message(record))
+        await send_and_pin_payment_message(
+            context.bot,
+            user.id,
+            record,
+            callback_user_id=get_test_session_user_id(user.id),
+        )
         return
 
     admin_chat_id = resolve_admin_chat_id(state, user)
@@ -2305,6 +2554,14 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     state = load_state()
     user = update.effective_user
+    if is_test_mode_active(state, user):
+        record = get_active_private_record(state, user)
+        record["telegram_username"] = "test_mode"
+        record["first_name"] = "Test"
+        record["last_name"] = "Buyer"
+        await handle_test_mode_private_message(update, context, state, record)
+        return
+
     record = get_user_record(state, user.id)
     record["telegram_username"] = user.username
     record["first_name"] = user.first_name
@@ -2398,7 +2655,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     data = query.data or ""
 
     if data.startswith("budget:"):
-        record = get_user_record(state, query.from_user.id)
+        record = get_active_private_record(state, query.from_user)
         mark_expired_if_needed(record)
         if record.get("status") != "awaiting_budget_range":
             await query.answer("That budget step is no longer active.", show_alert=True)
@@ -2430,6 +2687,45 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 chat_id=query.message.chat.id,
                 text="What are you looking to purchase in our first interaction?",
             )
+        return
+
+    if data.startswith("test:"):
+        _, _, rest = data.partition(":")
+        test_action, _, user_id_text = rest.partition(":")
+        if not user_id_text.isdigit():
+            await query.answer("Invalid test action.", show_alert=True)
+            return
+        user_id = int(user_id_text)
+        record = get_user_record(state, user_id)
+        if not record.get("test_mode"):
+            await query.answer("That sandbox session is no longer active.", show_alert=True)
+            return
+
+        if test_action == "paid":
+            if record.get("status") != "approved":
+                await query.answer("Complete the test approval first.", show_alert=True)
+                return
+            record["payment_status"] = "paid"
+            record["payment_confirmed_at"] = to_iso(utc_now())
+            save_state(state)
+            log_event("payment_confirmed", buyer_id=user_id, trigger="test")
+            await query.answer("Payment simulated.")
+            await query.edit_message_text(
+                "Payment marked as received.",
+                reply_markup=build_post_approval_keyboard(user_id, record),
+            )
+            return
+
+        if test_action == "exit":
+            end_test_mode_session(state, query.from_user)
+            save_state(state)
+            await query.answer("Test mode exited.")
+            await query.edit_message_text(
+                "Test mode exited. Send /start to return to the admin dashboard."
+            )
+            return
+
+        await query.answer("Unknown test action.", show_alert=True)
         return
 
     if not callback_is_from_admin_surface(state, query):
@@ -2622,7 +2918,13 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if item is None:
             await query.answer("That vault item is no longer registered.", show_alert=True)
             return
-        await deliver_vault_item(context.bot, state, unlock_user_id, item_key)
+        await deliver_vault_item(
+            context.bot,
+            state,
+            unlock_user_id,
+            item_key,
+            target_chat_id=query.message.chat.id if unlock_record.get("test_mode") else None,
+        )
         unlock_record.setdefault("content_unlocks", []).append(
             {
                 "item_key": item_key,
@@ -2966,6 +3268,29 @@ async def sync_subs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     expired_alert = format_expired_access_alert(summary)
     if expired_alert:
         await update.message.reply_text(expired_alert)
+
+
+async def testmode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.effective_chat or not update.message:
+        return
+    if update.effective_chat.type != "private":
+        return
+
+    state = load_state()
+    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
+    if admin_chat_id != update.effective_chat.id:
+        return
+
+    if is_test_mode_active(state, update.effective_user):
+        end_test_mode_session(state, update.effective_user)
+        save_state(state)
+        await update.message.reply_text("Test mode exited. Send /start to return to the admin dashboard.")
+        return
+
+    record = begin_test_mode_session(state, update.effective_user)
+    save_state(state)
+    log_event("test_mode_started", buyer_id=update.effective_user.id)
+    await update.message.reply_text(test_mode_prompt_message(record))
 
 
 async def verifyof(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3450,6 +3775,15 @@ async def non_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     state = load_state()
+    user = update.effective_user
+    if is_test_mode_active(state, user):
+        record = get_active_private_record(state, user)
+        record["telegram_username"] = "test_mode"
+        record["first_name"] = "Test"
+        record["last_name"] = "Buyer"
+        await handle_test_mode_private_message(update, context, state, record)
+        return
+
     record = get_user_record(state, update.effective_user.id)
     mark_expired_if_needed(record)
     if is_closed_record(record):
@@ -3495,6 +3829,7 @@ def main() -> None:
     app.add_handler(CommandHandler("expiring", expiring))
     app.add_handler(CommandHandler("notifyunverified", notify_unverified_manual))
     app.add_handler(CommandHandler("syncsubs", sync_subs))
+    app.add_handler(CommandHandler("testmode", testmode))
     app.add_handler(CommandHandler("verifyof", verifyof))
     app.add_handler(CommandHandler("ofdiag", ofdiag))
     app.add_handler(CallbackQueryHandler(button_click))
