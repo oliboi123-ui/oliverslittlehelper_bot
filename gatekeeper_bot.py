@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import json
 import logging
 import os
@@ -121,7 +121,38 @@ QUICK_PHRASES = [
         "label": "💬 Ask budget",
         "text": "What budget range are you thinking for this?",
     },
+    {
+        "key": "price_reply",
+        "label": "💸 Budget reply",
+        "text": None,
+    },
 ]
+
+PRICE_RULES = [
+    {
+        "key": "jerkoff",
+        "keywords": ("jerkoff", "jerk off", "j/o", "joi", "wank"),
+        "label": "jerkoff vids",
+        "minimum": 250,
+    },
+    {
+        "key": "ass_spreading",
+        "keywords": ("ass", "spreading", "spread"),
+        "label": "ass content (spreading)",
+        "minimum": 300,
+    },
+    {
+        "key": "fingering",
+        "keywords": ("finger", "fingering"),
+        "label": "fingering",
+        "minimum": 400,
+    },
+]
+
+DEFAULT_CONTENT_PRICE = {
+    "label": "2-3 vanilla photos",
+    "minimum": 75,
+}
 
 
 TEMPLATES = {
@@ -390,15 +421,29 @@ def count_line(count: int, singular: str, plural: str | None = None) -> str:
 def load_state() -> dict[str, Any]:
     state_path = get_state_path()
     if not state_path.exists():
-        return {"admin_chat_id": None, "users": {}, "relay_topics": {}}
+        return {
+            "admin_chat_id": None,
+            "users": {},
+            "relay_topics": {},
+            "content_vault_chat_id": None,
+            "vault_items": {},
+        }
     try:
         state = json.loads(state_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         LOGGER.warning("State file was invalid JSON, starting fresh.")
-        return {"admin_chat_id": None, "users": {}, "relay_topics": {}}
+        return {
+            "admin_chat_id": None,
+            "users": {},
+            "relay_topics": {},
+            "content_vault_chat_id": None,
+            "vault_items": {},
+        }
     state.setdefault("admin_chat_id", None)
     state.setdefault("users", {})
     state.setdefault("relay_topics", {})
+    state.setdefault("content_vault_chat_id", None)
+    state.setdefault("vault_items", {})
     return state
 
 
@@ -472,6 +517,7 @@ def default_user_record() -> dict[str, Any]:
         "payment_requested_at": None,
         "payment_confirmed_at": None,
         "payment_reminded_at": None,
+        "content_unlocks": [],
         "not_fit_at": None,
         "banned_at": None,
         "ban_reason": None,
@@ -590,20 +636,25 @@ def build_payment_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def build_relay_topic_keyboard(user_id: int) -> InlineKeyboardMarkup:
+def build_relay_topic_keyboard(user_id: int, record: dict[str, Any] | None = None) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(item["label"], callback_data=f"q:{item['key']}:{user_id}")]
         for item in QUICK_PHRASES
+        if item["text"] is not None
     ]
     rows.extend(
         [
             [
+                InlineKeyboardButton("💸 Budget reply", callback_data=f"q:price_reply:{user_id}"),
                 InlineKeyboardButton("💸 PayPal", callback_data=f"pay:{user_id}"),
-                InlineKeyboardButton("Status", callback_data=f"st:{user_id}"),
             ],
             [
-                InlineKeyboardButton("Revoke", callback_data=f"rv:{user_id}"),
-                InlineKeyboardButton("Remove", callback_data=f"rm:{user_id}"),
+                InlineKeyboardButton("🎁 Unlock content", callback_data=f"ul:{user_id}"),
+                InlineKeyboardButton("👤 Status", callback_data=f"st:{user_id}"),
+            ],
+            [
+                InlineKeyboardButton("🚫 Revoke", callback_data=f"rv:{user_id}"),
+                InlineKeyboardButton("🗑 Remove", callback_data=f"rm:{user_id}"),
             ],
         ]
     )
@@ -685,6 +736,58 @@ def get_quick_phrase(key: str) -> dict[str, str] | None:
     return None
 
 
+def price_rule_for_record(record: dict[str, Any]) -> dict[str, Any]:
+    intent = str(record.get("purchase_intent") or "").strip().lower()
+    for rule in PRICE_RULES:
+        if any(keyword in intent for keyword in rule["keywords"]):
+            return rule
+    return DEFAULT_CONTENT_PRICE
+
+
+def build_budget_reply_message(record: dict[str, Any]) -> str:
+    budget = clean_text(record.get("budget_range_label"), empty="that budget")
+    intent = clean_text(record.get("purchase_intent"), empty="that request").strip().lower()
+    rule = price_rule_for_record(record)
+    if rule["minimum"] == DEFAULT_CONTENT_PRICE["minimum"]:
+        return (
+            f"I saw you put {budget} for {intent}. Sadly that is not gonna cut it :/\n\n"
+            f"The lowest I sell for is ${rule['minimum']}, which gets you {rule['label']}."
+        )
+
+    return (
+        f"I saw you put {budget} for {intent}. Sadly that is not gonna cut it :/\n\n"
+        f"I charge ${rule['minimum']} minimum for {rule['label']}.\n"
+        f"The lowest I sell for is ${DEFAULT_CONTENT_PRICE['minimum']}, which gets you {DEFAULT_CONTENT_PRICE['label']}."
+    )
+
+
+def get_vault_items(state: dict[str, Any]) -> dict[str, Any]:
+    return state.setdefault("vault_items", {})
+
+
+def vault_item_sort_key(item: dict[str, Any]) -> str:
+    return str(item.get("created_at") or "")
+
+
+def build_vault_item_label(item_key: str, item: dict[str, Any]) -> str:
+    title = clean_text(item.get("title"), empty=item_key)
+    price = item.get("price")
+    if price is not None:
+        return f"{title} (${price})"
+    return title
+
+
+def build_vault_item_picker_keyboard(state: dict[str, Any], user_id: int) -> InlineKeyboardMarkup:
+    items = sorted(get_vault_items(state).items(), key=lambda pair: vault_item_sort_key(pair[1]))
+    rows = [
+        [InlineKeyboardButton(build_vault_item_label(item_key, item), callback_data=f"vk:{item_key}:{user_id}")]
+        for item_key, item in items[:20]
+    ]
+    if not rows:
+        rows = [[InlineKeyboardButton("No vault items", callback_data=f"noop:{user_id}")]]
+    return InlineKeyboardMarkup(rows)
+
+
 def build_budget_keyboard() -> InlineKeyboardMarkup:
     rows = []
     for start in range(0, len(BUDGET_OPTIONS), 2):
@@ -727,23 +830,35 @@ def build_admin_review_keyboard(user_id: int) -> InlineKeyboardMarkup:
     )
 
 
-def build_post_approval_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
+def build_post_approval_keyboard(user_id: int, record: dict[str, Any] | None = None) -> InlineKeyboardMarkup:
+    rows = [
         [
+            InlineKeyboardButton("✅ Paid", callback_data=f"paid:{user_id}"),
+            InlineKeyboardButton("🔔 Remind Pay", callback_data=f"rp:{user_id}"),
+        ]
+    ]
+    payment_status = str((record or {}).get("payment_status") or "").strip().lower()
+    if record is None or payment_status == "paid":
+        rows.append(
             [
-                InlineKeyboardButton("✅ Paid", callback_data=f"paid:{user_id}"),
-                InlineKeyboardButton("🔔 Remind Pay", callback_data=f"rp:{user_id}"),
-            ],
+                InlineKeyboardButton("🎁 Unlock content", callback_data=f"ul:{user_id}"),
+                InlineKeyboardButton("👤 Status", callback_data=f"st:{user_id}"),
+            ]
+        )
+    else:
+        rows.append(
             [
                 InlineKeyboardButton("👤 Status", callback_data=f"st:{user_id}"),
                 InlineKeyboardButton("🚫 Revoke", callback_data=f"rv:{user_id}"),
-            ],
-            [
-                InlineKeyboardButton("🗑 Remove", callback_data=f"rm:{user_id}"),
-                InlineKeyboardButton("🚫 Ban", callback_data=f"ban:{user_id}"),
-            ],
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton("🗑 Remove", callback_data=f"rm:{user_id}"),
+            InlineKeyboardButton("🚫 Ban", callback_data=f"ban:{user_id}"),
         ]
     )
+    return InlineKeyboardMarkup(rows)
 
 
 def build_closed_record_keyboard(user_id: int) -> InlineKeyboardMarkup:
@@ -762,7 +877,7 @@ def build_user_action_keyboard(user_id: int, record: dict[str, Any]) -> InlineKe
     if status in {"pending", "low_priority"}:
         return build_admin_review_keyboard(user_id)
     if status == "approved":
-        return build_post_approval_keyboard(user_id)
+        return build_post_approval_keyboard(user_id, record)
     return build_closed_record_keyboard(user_id)
 
 
@@ -870,21 +985,23 @@ def format_admin_home(state: dict[str, Any]) -> str:
 
     active_review_count = counts["priority"] + counts["normal"]
     followup_count = counts["awaiting_payment"] + counts["expiring"] + counts["expired"]
-    lines = ["Oliver's Little Helper", "Admin inbox", ""]
+    lines = ["Oliver's Little Helper", "Control room", ""]
 
     if active_review_count == 0 and followup_count == 0 and counts["low"] == 0:
         lines.append("All clear.")
     else:
+        lines.append("Needs attention")
         if active_review_count:
-            lines.append(f"Pending review: {active_review_count}")
+            lines.append(f"Review inbox: {active_review_count}")
         if counts["awaiting_payment"]:
-            lines.append(f"Payments awaiting follow-up: {counts['awaiting_payment']}")
+            lines.append(f"Payments to follow up: {counts['awaiting_payment']}")
         if counts["expiring"]:
             lines.append(f"Expiring soon: {counts['expiring']}")
         if counts["expired"]:
             lines.append(f"Expired access: {counts['expired']}")
         if counts["low"]:
-            lines.append(f"Slow queue: {counts['low']}")
+            lead_word = "lead" if counts["low"] == 1 else "leads"
+            lines.append(f"Slow queue: {counts['low']} {lead_word}")
 
     return "\n".join(lines)
 
@@ -905,6 +1022,9 @@ def format_admin_help() -> str:
         "/senddirect <user_id>\n"
         "/revoke <user_id>\n"
         "/removeuser <user_id>\n"
+        "/vaultregister\n"
+        "/vaultadd <key> [title] (reply to a vault post)\n"
+        "/vaultlist\n"
         "/status <user_id>\n"
         "/expiring\n"
         "/notifyunverified\n"
@@ -1732,6 +1852,80 @@ async def remove_user_from_system(
     state.setdefault("users", {}).pop(str(user_id), None)
 
 
+def normalize_vault_key(value: str) -> str:
+    cleaned = normalize_username(value).replace("-", "_")
+    return "".join(ch for ch in cleaned if ch.isalnum() or ch == "_")
+
+
+def register_vault_item(
+    state: dict[str, Any],
+    *,
+    key: str,
+    title: str,
+    source_chat_id: int,
+    source_message_id: int,
+    registered_by: int | None = None,
+) -> None:
+    vault_items = get_vault_items(state)
+    vault_items[key] = {
+        "title": title,
+        "source_chat_id": source_chat_id,
+        "source_message_id": source_message_id,
+        "registered_by": registered_by,
+        "created_at": to_iso(utc_now()),
+    }
+
+
+def format_vault_items(state: dict[str, Any]) -> str:
+    items = sorted(get_vault_items(state).items(), key=lambda pair: vault_item_sort_key(pair[1]))
+    if not items:
+        return "No vault items registered yet."
+    lines = ["Vault items", ""]
+    for key, item in items[:50]:
+        lines.append(f"{key} | {build_vault_item_label(key, item)}")
+    return "\n".join(lines)
+
+
+async def send_vault_picker(
+    bot: Any,
+    chat_id: int,
+    state: dict[str, Any],
+    user_id: int,
+    *,
+    message_thread_id: int | None = None,
+) -> None:
+    record = get_user_record(state, user_id)
+    kwargs: dict[str, Any] = {}
+    if message_thread_id is not None:
+        kwargs["message_thread_id"] = message_thread_id
+    await bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"Unlock content for {format_person_label(record)}\n"
+            f"Payment: {payment_status_line(record)}"
+        ),
+        reply_markup=build_vault_item_picker_keyboard(state, user_id),
+        **kwargs,
+    )
+
+
+async def deliver_vault_item(
+    bot: Any,
+    state: dict[str, Any],
+    user_id: int,
+    item_key: str,
+) -> None:
+    item = get_vault_items(state).get(item_key)
+    if item is None:
+        raise RuntimeError("That vault item is no longer registered.")
+    await bot.copy_message(
+        chat_id=user_id,
+        from_chat_id=int(item["source_chat_id"]),
+        message_id=int(item["source_message_id"]),
+        protect_content=True,
+    )
+
+
 def begin_application(record: dict[str, Any]) -> None:
     record["status"] = "awaiting_of_username"
     record["of_username"] = None
@@ -1977,13 +2171,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         state["admin_chat_id"] = admin_chat_id
         save_state(state)
         log_event("admin_dashboard_opened", first_setup=first_admin_setup)
-        heading = (
-            "Setup complete. Admin inbox ready."
-            if first_admin_setup
-            else "Admin inbox ready."
-        )
         await update.message.reply_text(
-            f"{heading}\n\n{format_admin_home(state)}",
+            format_admin_home(state),
             reply_markup=build_admin_home_keyboard(),
         )
         return
@@ -2247,6 +2436,35 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await query.answer("Not allowed.", show_alert=True)
         return
 
+    if data.startswith("q:"):
+        _, _, rest = data.partition(":")
+        phrase_key, _, user_id_text = rest.partition(":")
+        if not user_id_text.isdigit():
+            await query.answer("Invalid phrase action.", show_alert=True)
+            return
+        user_id = int(user_id_text)
+        record = get_user_record(state, user_id)
+        if not is_access_active(record):
+            await query.answer("This buyer does not have active access.", show_alert=True)
+            return
+        if phrase_key == "price_reply":
+            response_text = build_budget_reply_message(record)
+        else:
+            phrase = get_quick_phrase(phrase_key)
+            if phrase is None or phrase.get("text") is None:
+                await query.answer("That phrase no longer exists.", show_alert=True)
+                return
+            response_text = str(phrase["text"])
+        await context.bot.send_message(chat_id=user_id, text=response_text, protect_content=True)
+        await query.answer("Phrase sent.")
+        if query.message.chat.type == "supergroup":
+            await context.bot.send_message(
+                chat_id=query.message.chat.id,
+                message_thread_id=query.message.message_thread_id,
+                text="Sent.",
+            )
+        return
+
     if data.startswith("adm:"):
         parts = data.split(":")
         admin_action = parts[1] if len(parts) > 1 else ""
@@ -2373,6 +2591,56 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await query.answer("Details sent.")
         return
 
+    if action == "ul":
+        if record.get("status") != "approved" or str(record.get("payment_status") or "").strip().lower() != "paid":
+            await query.answer("Mark payment as paid first.", show_alert=True)
+            return
+        if not get_vault_items(state):
+            await query.answer("No vault items are registered yet.", show_alert=True)
+            return
+        await send_vault_picker(
+            context.bot,
+            query.message.chat.id,
+            state,
+            user_id,
+            message_thread_id=query.message.message_thread_id if query.message.chat.type == "supergroup" else None,
+        )
+        await query.answer("Pick a vault item.")
+        return
+
+    if action == "vk":
+        item_key, _, unlock_user_id_text = user_id_text.partition(":")
+        if not unlock_user_id_text.isdigit():
+            await query.answer("Invalid vault item.", show_alert=True)
+            return
+        unlock_user_id = int(unlock_user_id_text)
+        unlock_record = get_user_record(state, unlock_user_id)
+        if unlock_record.get("status") != "approved" or str(unlock_record.get("payment_status") or "").strip().lower() != "paid":
+            await query.answer("Mark payment as paid first.", show_alert=True)
+            return
+        item = get_vault_items(state).get(item_key)
+        if item is None:
+            await query.answer("That vault item is no longer registered.", show_alert=True)
+            return
+        await deliver_vault_item(context.bot, state, unlock_user_id, item_key)
+        unlock_record.setdefault("content_unlocks", []).append(
+            {
+                "item_key": item_key,
+                "delivered_at": to_iso(utc_now()),
+            }
+        )
+        save_state(state)
+        await query.answer("Content unlocked.")
+        message_kwargs: dict[str, Any] = {}
+        if query.message.chat.type == "supergroup":
+            message_kwargs["message_thread_id"] = query.message.message_thread_id
+        await context.bot.send_message(
+            chat_id=query.message.chat.id,
+            text=f"Unlocked: {build_vault_item_label(item_key, item)}",
+            **message_kwargs,
+        )
+        return
+
     if action == "pay":
         if record.get("status") != "approved":
             await query.answer("Only approved buyers can receive the payment link.", show_alert=True)
@@ -2487,7 +2755,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await context.bot.send_message(chat_id=user_id, text=template("payment_confirmed"))
         await query.edit_message_text(
             format_review_card(user_id, record, "Payment confirmed"),
-            reply_markup=build_post_approval_keyboard(user_id),
+            reply_markup=build_post_approval_keyboard(user_id, record),
         )
         await query.answer("Marked paid.")
         return
@@ -2503,7 +2771,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await context.bot.send_message(chat_id=user_id, text=template("payment_reminder"))
         await query.edit_message_text(
             format_review_card(user_id, record, "Payment reminder sent"),
-            reply_markup=build_post_approval_keyboard(user_id),
+            reply_markup=build_post_approval_keyboard(user_id, record),
         )
         await query.answer("Reminder sent.")
         return
@@ -2533,7 +2801,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 )
                 await query.edit_message_text(
                     format_review_card(user_id, record, f"Approved in relay mode\nTopic: {topic_name}"),
-                    reply_markup=build_post_approval_keyboard(user_id),
+                    reply_markup=build_post_approval_keyboard(user_id, record),
                 )
                 await query.answer(f"Relay approved in topic {topic_id}.")
             else:
@@ -2547,7 +2815,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 )
                 await query.edit_message_text(
                     format_review_card(user_id, record, "Approved direct"),
-                    reply_markup=build_post_approval_keyboard(user_id),
+                    reply_markup=build_post_approval_keyboard(user_id, record),
                 )
                 await query.answer("Approved direct.")
         except Exception as exc:
@@ -2983,6 +3251,80 @@ async def senddirect_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.message.reply_text("Direct handle sent.")
 
 
+async def vaultregister_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.effective_chat or not update.message:
+        return
+    if update.effective_chat.type != "supergroup":
+        return
+
+    state = load_state()
+    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
+    if admin_chat_id is None:
+        await update.message.reply_text("Not allowed.")
+        return
+
+    state["content_vault_chat_id"] = update.effective_chat.id
+    save_state(state)
+    await update.message.reply_text("Content vault registered for this chat.")
+
+
+async def vaultadd_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.effective_chat or not update.message:
+        return
+    if update.effective_chat.type != "supergroup":
+        return
+
+    state = load_state()
+    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
+    if admin_chat_id is None:
+        await update.message.reply_text("Not allowed.")
+        return
+
+    if update.message.reply_to_message is None:
+        await update.message.reply_text("Reply to the vault post with /vaultadd <key> [title]")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /vaultadd <key> [title]")
+        return
+
+    key = normalize_vault_key(context.args[0])
+    if not key:
+        await update.message.reply_text("Usage: /vaultadd <key> [title]")
+        return
+
+    title = " ".join(context.args[1:]).strip()
+    if not title:
+        title = clean_text(update.message.reply_to_message.caption or update.message.reply_to_message.text, empty=key)
+
+    register_vault_item(
+        state,
+        key=key,
+        title=title,
+        source_chat_id=update.effective_chat.id,
+        source_message_id=update.message.reply_to_message.message_id,
+        registered_by=update.effective_user.id,
+    )
+    state["content_vault_chat_id"] = update.effective_chat.id
+    save_state(state)
+    await update.message.reply_text(f"Saved vault item {key}.")
+
+
+async def vaultlist_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.effective_chat or not update.message:
+        return
+    if update.effective_chat.type != "private" and update.effective_chat.type != "supergroup":
+        return
+
+    state = load_state()
+    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
+    if admin_chat_id is None and update.effective_chat.id != state.get("content_vault_chat_id"):
+        await update.message.reply_text("Not allowed.")
+        return
+
+    await update.message.reply_text(format_vault_items(state))
+
+
 async def revoke_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.effective_chat or not update.message:
         return
@@ -3145,6 +3487,9 @@ def main() -> None:
     app.add_handler(CommandHandler("senddirect", senddirect_manual))
     app.add_handler(CommandHandler("revoke", revoke_manual))
     app.add_handler(CommandHandler("removeuser", removeuser_manual))
+    app.add_handler(CommandHandler("vaultregister", vaultregister_manual))
+    app.add_handler(CommandHandler("vaultadd", vaultadd_manual))
+    app.add_handler(CommandHandler("vaultlist", vaultlist_manual))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("details", details_command))
     app.add_handler(CommandHandler("expiring", expiring))
