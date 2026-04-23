@@ -3217,6 +3217,23 @@ async def testmode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await start(update, context)
 
 
+async def testreset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.effective_chat or not update.message:
+        return
+    if update.effective_chat.type != "private":
+        return
+
+    state = load_state()
+    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
+    if admin_chat_id != update.effective_chat.id:
+        return
+
+    begin_test_mode_session(state, update.effective_user)
+    save_state(state)
+    log_event("test_mode_reset", buyer_id=update.effective_user.id)
+    await start(update, context)
+
+
 async def verifyof(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.effective_chat or not update.message:
         return
@@ -3785,6 +3802,7 @@ def main() -> None:
     app.add_handler(CommandHandler("notifyunverified", notify_unverified_manual))
     app.add_handler(CommandHandler("syncsubs", sync_subs))
     app.add_handler(CommandHandler("testmode", testmode))
+    app.add_handler(CommandHandler("testreset", testreset))
     app.add_handler(CommandHandler("verifyof", verifyof))
     app.add_handler(CommandHandler("ofdiag", ofdiag))
     app.add_handler(CallbackQueryHandler(button_click))
