@@ -770,6 +770,13 @@ def build_relay_topic_keyboard(user_id: int, record: dict[str, Any] | None = Non
     return InlineKeyboardMarkup(rows)
 
 
+def get_buyer_chat_id(record: dict[str, Any], fallback_user_id: int) -> int:
+    chat_id = record.get("test_mode_chat_id")
+    if isinstance(chat_id, int) and chat_id:
+        return chat_id
+    return fallback_user_id
+
+
 def user_label(user_id: int, user_data: dict[str, Any]) -> str:
     return format_person_label(user_data)
 
@@ -2165,14 +2172,6 @@ async def send_relay_contact(
     chat_id = target_chat_id if target_chat_id is not None else user_id
     await bot.send_message(chat_id=chat_id, text=relay_access_message(record), protect_content=True)
     await send_and_pin_payment_message(bot, user_id, record, target_chat_id=chat_id, callback_user_id=user_id)
-    relay_group_id = get_relay_group_id()
-    if relay_group_id is not None:
-        await bot.send_message(
-            chat_id=relay_group_id,
-            message_thread_id=topic_id,
-            text="Relay controls",
-            reply_markup=build_relay_topic_keyboard(user_id),
-        )
     return topic_id, topic_name
 
 
@@ -2638,6 +2637,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if not is_access_active(record):
             await query.answer("This buyer does not have active access.", show_alert=True)
             return
+        target_chat_id = get_buyer_chat_id(record, user_id)
         if phrase_key == "price_reply":
             response_text = build_budget_reply_message(record)
         else:
@@ -2646,7 +2646,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 await query.answer("That phrase no longer exists.", show_alert=True)
                 return
             response_text = str(phrase["text"])
-        await context.bot.send_message(chat_id=user_id, text=response_text, protect_content=True)
+        await context.bot.send_message(chat_id=target_chat_id, text=response_text, protect_content=True)
         await query.answer("Phrase sent.")
         if query.message.chat.type == "supergroup":
             await context.bot.send_message(
