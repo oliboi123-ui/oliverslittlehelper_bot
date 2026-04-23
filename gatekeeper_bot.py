@@ -870,36 +870,22 @@ def format_admin_home(state: dict[str, Any]) -> str:
 
     active_review_count = counts["priority"] + counts["normal"]
     followup_count = counts["awaiting_payment"] + counts["expiring"] + counts["expired"]
-    lines = ["Oliver's Little Helper", "Control room", ""]
+    lines = ["Oliver's Little Helper", "Admin inbox", ""]
 
     if active_review_count == 0 and followup_count == 0 and counts["low"] == 0:
-        lines.extend(
-            [
-                "You're clear right now.",
-                "No urgent leads, payment follow-ups, or access issues need attention.",
-            ]
-        )
+        lines.append("All clear.")
     else:
-        lines.append("Needs attention")
-        if counts["priority"]:
-            lines.append(f"Hot leads waiting: {counts['priority']}")
-        if counts["normal"]:
-            lines.append(f"Standard leads waiting: {counts['normal']}")
+        if active_review_count:
+            lines.append(f"Pending review: {active_review_count}")
         if counts["awaiting_payment"]:
-            lines.append(f"Payments to follow up: {counts['awaiting_payment']}")
+            lines.append(f"Payments awaiting follow-up: {counts['awaiting_payment']}")
         if counts["expiring"]:
-            lines.append(f"Access ending soon: {counts['expiring']}")
+            lines.append(f"Expiring soon: {counts['expiring']}")
         if counts["expired"]:
             lines.append(f"Expired access: {counts['expired']}")
         if counts["low"]:
-            lines.extend(["", f"Slow queue: {counts['low']} lead{'s' if counts['low'] != 1 else ''}"])
+            lines.append(f"Slow queue: {counts['low']}")
 
-    lines.extend(
-        [
-            "",
-            "Use the buttons below when you want to review, sync, or get a full briefing.",
-        ]
-    )
     return "\n".join(lines)
 
 
@@ -1992,9 +1978,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         save_state(state)
         log_event("admin_dashboard_opened", first_setup=first_admin_setup)
         heading = (
-            "Setup complete. This chat is now your private admin inbox."
+            "Setup complete. Admin inbox ready."
             if first_admin_setup
-            else "Welcome back. Here's your control room."
+            else "Admin inbox ready."
         )
         await update.message.reply_text(
             f"{heading}\n\n{format_admin_home(state)}",
