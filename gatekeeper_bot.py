@@ -726,27 +726,17 @@ def direct_access_message(private_username: str, record: dict[str, Any]) -> str:
 
 
 def payment_message(record: dict[str, Any] | None = None) -> str:
-    extra = ""
-    if record and record.get("test_mode"):
-        extra = "\n\nTest mode is active. Use the sandbox controls below to simulate payment and unlock content."
     return (
         "Payment link\n"
         f"{get_payment_url()}\n\n"
         "Use the PayPal button below for purchases so payment info stays easy to find."
-        f"{extra}"
     )
 
 
 def build_payment_keyboard(user_id: int | None = None, record: dict[str, Any] | None = None) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton("💸 PayPal", url=get_payment_url())]]
-    if user_id is not None and record is not None and record.get("test_mode"):
-        rows.append(
-            [
-                InlineKeyboardButton("🧪 Simulate paid", callback_data=f"test:paid:{user_id}"),
-                InlineKeyboardButton("🚪 Exit test mode", callback_data=f"test:exit:{user_id}"),
-            ]
-        )
-    return InlineKeyboardMarkup(rows)
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("💸 PayPal", url=get_payment_url())]]
+    )
 
 
 def build_relay_topic_keyboard(user_id: int, record: dict[str, Any] | None = None) -> InlineKeyboardMarkup:
@@ -2111,6 +2101,7 @@ async def send_and_pin_payment_message(
     user_id: int,
     record: dict[str, Any],
     *,
+    target_chat_id: int | None = None,
     callback_user_id: int | None = None,
 ) -> None:
     current_time = utc_now()
@@ -2118,7 +2109,7 @@ async def send_and_pin_payment_message(
     record["payment_requested_at"] = to_iso(current_time)
     callback_target_id = callback_user_id if callback_user_id is not None else user_id
     message = await bot.send_message(
-        chat_id=user_id,
+        chat_id=target_chat_id if target_chat_id is not None else user_id,
         text=payment_message(record),
         reply_markup=build_payment_keyboard(callback_target_id, record),
         protect_content=True,
@@ -2142,12 +2133,13 @@ async def send_direct_contact(
     record: dict[str, Any],
     *,
     now: datetime | None = None,
+    target_chat_id: int | None = None,
 ) -> None:
     current_time = now or utc_now()
     private_username = get_required_env("PRIVATE_TELEGRAM_USERNAME")
     set_contact_mode(record, "direct", now=current_time)
-    await bot.send_message(chat_id=user_id, text=direct_access_message(private_username, record))
-    await send_and_pin_payment_message(bot, user_id, record)
+    await bot.send_message(chat_id=target_chat_id if target_chat_id is not None else user_id, text=direct_access_message(private_username, record))
+    await send_and_pin_payment_message(bot, user_id, record, target_chat_id=target_chat_id)
 
 
 async def send_relay_contact(
@@ -2164,7 +2156,7 @@ async def send_relay_contact(
     set_contact_mode(record, "relay", now=current_time)
     chat_id = target_chat_id if target_chat_id is not None else user_id
     await bot.send_message(chat_id=chat_id, text=relay_access_message(record), protect_content=True)
-    await send_and_pin_payment_message(bot, chat_id, record, callback_user_id=user_id)
+    await send_and_pin_payment_message(bot, user_id, record, target_chat_id=chat_id, callback_user_id=user_id)
     relay_group_id = get_relay_group_id()
     if relay_group_id is not None:
         await bot.send_message(
@@ -2296,90 +2288,6 @@ async def ask_budget_question(message_target: Any) -> None:
     )
 
 
-def test_mode_access_message(record: dict[str, Any]) -> str:
-    return (
-        "Relay sandbox is active.\n\n"
-        f"{relay_access_message(record)}\n\n"
-        "Use the sandbox buttons below to simulate payment and unlock content."
-    )
-
-
-def test_mode_prompt_message(record: dict[str, Any]) -> str:
-    status = record.get("status")
-    if status == "awaiting_of_username":
-        return of_username_help_message()
-    if status == "awaiting_budget_range":
-        return "Please choose a budget range using the buttons above."
-    if status == "awaiting_purchase_intent":
-        return "Please tell me what you are looking to purchase in text."
-    if status == "awaiting_clarification":
-        return template("clarification_request")
-    if is_access_active(record):
-        return test_mode_access_message(record)
-    return (
-        "Relay sandbox is active.\n\n"
-        "Send a message to walk the buyer flow. "
-        "Run /testmode again to exit the sandbox."
-    )
-
-
-async def handle_test_mode_private_message(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    state: dict[str, Any],
-    record: dict[str, Any],
-) -> None:
-    user = update.effective_user
-    message = update.message
-    if user is None or message is None:
-        return
-
-    mark_expired_if_needed(record)
-    message_text = (message.text or message.caption or "").strip()
-    if record.get("status") in {"new", "rejected", "expired"}:
-        if record.get("status") != "new":
-            begin_application(record)
-        save_state(state)
-        await message.reply_text(of_username_help_message())
-        return
-
-    if is_access_active(record):
-        save_state(state)
-        await message.reply_text(test_mode_access_message(record))
-        return
-
-    status = record.get("status")
-    if status == "awaiting_of_username":
-        if not message_text:
-            await message.reply_text(of_username_help_message())
-            return
-        record["of_username"] = message_text
-        record["status"] = "awaiting_budget_range"
-        save_state(state)
-        await ask_budget_question(message)
-        return
-
-    if status == "awaiting_budget_range":
-        await message.reply_text("Please choose a budget range using the buttons above.")
-        return
-
-    if status == "awaiting_purchase_intent":
-        if not message_text:
-            await message.reply_text("Please tell me what you are looking to purchase in text.")
-            return
-        record["purchase_intent"] = message_text
-        await complete_application(update, context, state, record)
-        return
-
-    if status == "awaiting_clarification":
-        await message.reply_text(template("clarification_request"))
-        return
-
-    begin_application(record)
-    save_state(state)
-    await message.reply_text(of_username_help_message())
-
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.effective_chat or not update.message:
         return
@@ -2388,25 +2296,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     state = load_state()
     user = update.effective_user
-    if is_test_mode_active(state, user):
-        record = get_active_private_record(state, user)
-        record["telegram_username"] = "test_mode"
-        record["first_name"] = "Test"
-        record["last_name"] = "Buyer"
-        if record.get("status") in {"new", "rejected", "expired"}:
-            begin_application(record)
-        save_state(state)
-        await update.message.reply_text(test_mode_prompt_message(record))
-        return
-
-    record = get_user_record(state, user.id)
+    test_mode_active = is_test_mode_active(state, user)
+    record = get_active_private_record(state, user) if test_mode_active else get_user_record(state, user.id)
     record["telegram_username"] = user.username
     record["first_name"] = user.first_name
     record["last_name"] = user.last_name
     mark_expired_if_needed(record)
 
     admin_chat_id = resolve_admin_chat_id(state, user)
-    if admin_chat_id == update.effective_chat.id:
+    if not test_mode_active and admin_chat_id == update.effective_chat.id:
         first_admin_setup = state.get("admin_chat_id") != admin_chat_id
         state["admin_chat_id"] = admin_chat_id
         save_state(state)
@@ -2456,29 +2354,12 @@ async def complete_application(
     if user is None or update.message is None:
         return
 
-    if record.get("test_mode"):
-        current_time = utc_now()
-        record["subscription_status"] = "active"
-        record["subscription_expires_at"] = to_iso(current_time + timedelta(days=get_access_duration_days()))
-        record["onlyfans_user_id"] = f"test-{user.id}"
-        grant_access(record, now=current_time)
-        record["status"] = "approved"
-        save_state(state)
-        await update.message.reply_text(application_confirmation_message(record))
-        await send_relay_contact(
-            context.bot,
-            state,
-            int(record.get("test_mode_buyer_user_id") or get_test_session_user_id(user.id)),
-            record,
-            now=current_time,
-            target_chat_id=user.id,
-        )
-        return
-
-    admin_chat_id = resolve_admin_chat_id(state, user)
+    test_mode = bool(record.get("test_mode"))
+    admin_chat_id = get_relay_group_id() if test_mode else resolve_admin_chat_id(state, user)
+    admin_user_id = int(record.get("test_mode_buyer_user_id") or user.id)
     exact_match_note = ""
-    verified_subscription = not ofauth_is_configured()
-    if ofauth_is_configured():
+    verified_subscription = True if test_mode else not ofauth_is_configured()
+    if not test_mode and ofauth_is_configured():
         try:
             verification_result = await asyncio.to_thread(
                 verify_onlyfans_username,
@@ -2500,6 +2381,11 @@ async def complete_application(
                 record["subscription_status"] = "inactive"
                 record["subscription_expires_at"] = None
                 verified_subscription = False
+    elif test_mode:
+        current_time = utc_now()
+        record["subscription_status"] = "active"
+        record["subscription_expires_at"] = to_iso(current_time + timedelta(days=get_access_duration_days()))
+        record["onlyfans_user_id"] = f"test-{admin_user_id}"
 
     if not verified_subscription:
         submitted_username = str(record.get("of_username") or "").strip()
@@ -2523,7 +2409,7 @@ async def complete_application(
         save_state(state)
         log_event(
             "low_priority_queued",
-            buyer_id=user.id,
+            buyer_id=admin_user_id,
             budget_key=record.get("budget_range_key"),
             verified=record.get("subscription_status") == "active",
         )
@@ -2534,7 +2420,7 @@ async def complete_application(
     save_state(state)
     log_event(
         "application_submitted",
-        buyer_id=user.id,
+        buyer_id=admin_user_id,
         priority=record.get("review_priority"),
         budget_key=record.get("budget_range_key"),
         verified=record.get("subscription_status") == "active",
@@ -2543,16 +2429,16 @@ async def complete_application(
 
     if not admin_chat_id:
         LOGGER.warning("No admin chat configured yet. Request stored but not delivered.")
-        log_event("admin_not_configured", logging.WARNING, buyer_id=user.id)
+        log_event("admin_not_configured", logging.WARNING, buyer_id=admin_user_id)
         return
 
-    admin_text = format_review_card(user.id, record, "New gatekeeper request")
+    admin_text = format_review_card(admin_user_id, record, "New gatekeeper request")
     if exact_match_note:
         admin_text = f"{admin_text}\n{exact_match_note}"
     await context.bot.send_message(
         chat_id=admin_chat_id,
         text=admin_text,
-        reply_markup=build_admin_review_keyboard(user.id),
+        reply_markup=build_admin_review_keyboard(admin_user_id),
     )
 
 
@@ -2564,20 +2450,15 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     state = load_state()
     user = update.effective_user
-    if is_test_mode_active(state, user):
-        record = get_active_private_record(state, user)
-        record["telegram_username"] = "test_mode"
-        record["first_name"] = "Test"
-        record["last_name"] = "Buyer"
-    else:
-        record = get_user_record(state, user.id)
-        record["telegram_username"] = user.username
-        record["first_name"] = user.first_name
-        record["last_name"] = user.last_name
+    test_mode_active = is_test_mode_active(state, user)
+    record = get_active_private_record(state, user) if test_mode_active else get_user_record(state, user.id)
+    record["telegram_username"] = user.username
+    record["first_name"] = user.first_name
+    record["last_name"] = user.last_name
     mark_expired_if_needed(record)
 
     admin_chat_id = resolve_admin_chat_id(state, user)
-    if admin_chat_id == update.effective_chat.id:
+    if not test_mode_active and admin_chat_id == update.effective_chat.id:
         await update.message.reply_text(
             format_admin_home(state),
             reply_markup=build_admin_home_keyboard(),
@@ -2706,7 +2587,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         user_id = int(user_id_text)
         record = get_user_record(state, user_id)
         if not record.get("test_mode"):
-            await query.answer("That sandbox session is no longer active.", show_alert=True)
+            await query.answer("That session is no longer active.", show_alert=True)
             return
 
         if test_action == "paid":
@@ -2728,9 +2609,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             end_test_mode_session(state, query.from_user)
             save_state(state)
             await query.answer("Test mode exited.")
-            await query.edit_message_text(
-                "Test mode exited. Send /start to return to the admin dashboard."
-            )
+            await query.edit_message_text("Exited test mode.")
             return
 
         await query.answer("Unknown test action.", show_alert=True)
@@ -2960,7 +2839,14 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if record.get("status") != "approved":
             await query.answer("Only approved buyers can receive the payment link.", show_alert=True)
             return
-        await send_and_pin_payment_message(context.bot, user_id, record)
+        payment_chat_id = int(record.get("test_mode_chat_id") or 0) or None
+        await send_and_pin_payment_message(
+            context.bot,
+            user_id,
+            record,
+            target_chat_id=payment_chat_id,
+            callback_user_id=user_id,
+        )
         save_state(state)
         await query.answer("Payment link sent.")
         if query.message.chat.type == "supergroup":
@@ -3100,12 +2986,14 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         grant_access(record, now=current_time)
         try:
             if action == "ar":
+                payment_target_chat_id = int(record.get("test_mode_chat_id") or 0) or None
                 topic_id, topic_name = await send_relay_contact(
                     context.bot,
                     state,
                     user_id,
                     record,
                     now=current_time,
+                    target_chat_id=payment_target_chat_id,
                 )
                 save_state(state)
                 log_event(
@@ -3120,7 +3008,14 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 )
                 await query.answer(f"Relay approved in topic {topic_id}.")
             else:
-                await send_direct_contact(context.bot, user_id, record, now=current_time)
+                direct_target_chat_id = int(record.get("test_mode_chat_id") or 0) or None
+                await send_direct_contact(
+                    context.bot,
+                    user_id,
+                    record,
+                    now=current_time,
+                    target_chat_id=direct_target_chat_id,
+                )
                 save_state(state)
                 log_event(
                     "approved_direct",
@@ -3297,47 +3192,13 @@ async def testmode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if is_test_mode_active(state, update.effective_user):
         end_test_mode_session(state, update.effective_user)
         save_state(state)
-        await update.message.reply_text("Test mode exited. Send /start to return to the admin dashboard.")
+        await update.message.reply_text("Exited test mode.")
         return
 
-    record = begin_test_mode_session(state, update.effective_user)
-    current_time = utc_now()
-    grant_access(record, now=current_time)
-    record["status"] = "approved"
-    record["subscription_status"] = "active"
-    record["subscription_expires_at"] = to_iso(current_time + timedelta(days=get_access_duration_days()))
-    record["onlyfans_user_id"] = f"test-{update.effective_user.id}"
-    record["payment_status"] = "pending"
-    record["payment_requested_at"] = None
-    record["payment_confirmed_at"] = None
-    record["test_mode"] = True
+    begin_test_mode_session(state, update.effective_user)
     save_state(state)
-    relay_group_id = get_relay_group_id()
-    if relay_group_id is None:
-        await update.message.reply_text("Relay is not configured yet. Set RELAY_ADMIN_GROUP_ID first.")
-        return
-
-    try:
-        topic_id, topic_name = await send_relay_contact(
-            context.bot,
-            state,
-            record["test_mode_buyer_user_id"],
-            record,
-            now=current_time,
-            target_chat_id=update.effective_user.id,
-        )
-    except Exception as exc:
-        LOGGER.exception("Could not start relay test mode.")
-        await update.message.reply_text(f"Test mode could not start: {exc}")
-        return
-
-    save_state(state)
-    log_event("test_mode_started", buyer_id=update.effective_user.id, relay_topic_id=topic_id, relay_topic_name=topic_name)
-    await update.message.reply_text(
-        "Relay test mode is active.\n\n"
-        f"Topic: {topic_name}\n"
-        "Use this chat like a buyer. Run /testmode again to exit."
-    )
+    log_event("test_mode_started", buyer_id=update.effective_user.id)
+    await start(update, context)
 
 
 async def verifyof(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3787,13 +3648,27 @@ async def manual_decision(
         current_time = utc_now()
         grant_access(record, now=current_time)
         try:
+            target_chat_id = int(record.get("test_mode_chat_id") or 0) or None
             if approval_mode == "relay":
-                await send_relay_contact(context.bot, state, user_id, record, now=current_time)
+                await send_relay_contact(
+                    context.bot,
+                    state,
+                    user_id,
+                    record,
+                    now=current_time,
+                    target_chat_id=target_chat_id,
+                )
                 save_state(state)
                 log_event("approved_relay", buyer_id=user_id, trigger="command")
                 await update.message.reply_text("Approved in relay mode.")
             else:
-                await send_direct_contact(context.bot, user_id, record, now=current_time)
+                await send_direct_contact(
+                    context.bot,
+                    user_id,
+                    record,
+                    now=current_time,
+                    target_chat_id=target_chat_id,
+                )
                 save_state(state)
                 log_event("approved_direct", buyer_id=user_id, trigger="command")
                 await update.message.reply_text("Approved and sent.")
@@ -3823,13 +3698,10 @@ async def non_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     state = load_state()
     user = update.effective_user
-    if is_test_mode_active(state, user):
-        record = get_active_private_record(state, user)
-        record["telegram_username"] = "test_mode"
-        record["first_name"] = "Test"
-        record["last_name"] = "Buyer"
-    else:
-        record = get_user_record(state, update.effective_user.id)
+    record = get_active_private_record(state, user) if is_test_mode_active(state, user) else get_user_record(state, user.id)
+    record["telegram_username"] = user.username
+    record["first_name"] = user.first_name
+    record["last_name"] = user.last_name
     mark_expired_if_needed(record)
     if is_closed_record(record):
         save_state(state)
