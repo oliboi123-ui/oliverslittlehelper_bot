@@ -570,6 +570,29 @@ def build_post_approval_keyboard(user_id: int) -> InlineKeyboardMarkup:
     )
 
 
+def build_admin_home_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Pending", callback_data="adm:pending:all"),
+                InlineKeyboardButton("Priority", callback_data="adm:pending:priority"),
+            ],
+            [
+                InlineKeyboardButton("Low Queue", callback_data="adm:pending:low"),
+                InlineKeyboardButton("Expiring", callback_data="adm:expiring"),
+            ],
+            [
+                InlineKeyboardButton("Weekly Digest", callback_data="adm:digest"),
+                InlineKeyboardButton("Sync OFAuth", callback_data="adm:sync"),
+            ],
+            [
+                InlineKeyboardButton("Refresh", callback_data="adm:home"),
+                InlineKeyboardButton("Help", callback_data="adm:help"),
+            ],
+        ]
+    )
+
+
 def format_review_card(user_id: int, record: dict[str, Any], heading: str) -> str:
     status = str(record.get("status") or "unknown").replace("_", " ").title()
     lines = [
@@ -598,6 +621,69 @@ def format_review_card(user_id: int, record: dict[str, Any], heading: str) -> st
     return "\n".join(lines)
 
 
+def format_admin_home(state: dict[str, Any]) -> str:
+    counts = {
+        "priority": 0,
+        "normal": 0,
+        "low": 0,
+        "awaiting_payment": 0,
+        "expiring": 0,
+        "expired": 0,
+    }
+    soon = utc_now() + timedelta(days=7)
+    for record in state.get("users", {}).values():
+        status = record.get("status")
+        priority = record.get("review_priority")
+        expires_at = parse_iso(record.get("expires_at"))
+        if status == "pending" and priority == "priority":
+            counts["priority"] += 1
+        elif status == "pending":
+            counts["normal"] += 1
+        elif status == "low_priority":
+            counts["low"] += 1
+        if status == "approved" and record.get("payment_status") in {"requested", "pending"}:
+            counts["awaiting_payment"] += 1
+        if status == "approved" and expires_at and expires_at <= soon:
+            counts["expiring"] += 1
+        elif status == "expired":
+            counts["expired"] += 1
+
+    lines = [
+        "Admin dashboard",
+        "",
+        f"Priority leads: {counts['priority']}",
+        f"Normal pending: {counts['normal']}",
+        f"Low queue: {counts['low']}",
+        f"Awaiting payment: {counts['awaiting_payment']}",
+        f"Expiring soon: {counts['expiring']}",
+        f"Expired: {counts['expired']}",
+        "",
+        "Use the buttons below. New buyer requests will still arrive here automatically.",
+    ]
+    return "\n".join(lines)
+
+
+def format_admin_help() -> str:
+    return (
+        "Admin controls\n\n"
+        "Use the dashboard buttons for the common workflow.\n\n"
+        "Useful commands:\n"
+        "/pending [all|low|normal|priority|expired]\n"
+        "/approve <user_id>\n"
+        "/approverelay <user_id>\n"
+        "/reject <user_id>\n"
+        "/priority <user_id>\n"
+        "/lowpriority <user_id>\n"
+        "/renew <user_id>\n"
+        "/senddirect <user_id>\n"
+        "/status <user_id>\n"
+        "/expiring\n"
+        "/syncsubs\n"
+        "/verifyof <onlyfans_username>\n"
+        "/ofdiag"
+    )
+
+
 def format_pending_line(user_id: int, record: dict[str, Any]) -> str:
     parts = [
         str(user_id),
@@ -609,6 +695,55 @@ def format_pending_line(user_id: int, record: dict[str, Any]) -> str:
     if record.get("review_priority") != "normal":
         parts.append(priority_label(record))
     return " | ".join(parts)
+
+
+def get_pending_items(state: dict[str, Any], mode: str) -> list[str]:
+    items = []
+    for user_id_text, record in state.get("users", {}).items():
+        status = record.get("status")
+        priority = record.get("review_priority")
+        if mode == "all" and status in {"pending", "low_priority"}:
+            items.append(format_pending_line(int(user_id_text), record))
+        elif mode == "low" and status == "low_priority":
+            items.append(format_pending_line(int(user_id_text), record))
+        elif mode == "normal" and status == "pending" and priority == "normal":
+            items.append(format_pending_line(int(user_id_text), record))
+        elif mode == "priority" and status == "pending" and priority == "priority":
+            items.append(format_pending_line(int(user_id_text), record))
+        elif mode == "expired" and status == "expired":
+            items.append(format_pending_line(int(user_id_text), record))
+    return items
+
+
+def format_pending_message(state: dict[str, Any], mode: str) -> str:
+    items = get_pending_items(state, mode)
+    if not items:
+        return f"No requests found for filter '{mode}'."
+    return "\n".join(items[:50])
+
+
+def get_expiring_items(state: dict[str, Any]) -> list[str]:
+    now = utc_now()
+    soon = now + timedelta(days=7)
+    items = []
+    for user_id_text, record in state.get("users", {}).items():
+        expires_at = parse_iso(record.get("expires_at"))
+        if record.get("status") == "approved" and expires_at and expires_at <= soon:
+            items.append(
+                f"{int(user_id_text)} | {display_name(record)} | expires {format_date_for_user(record.get('expires_at'))} | {budget_line(record)}"
+            )
+        elif record.get("status") == "expired":
+            items.append(
+                f"{int(user_id_text)} | {display_name(record)} | expired"
+            )
+    return items
+
+
+def format_expiring_message(state: dict[str, Any]) -> str:
+    items = get_expiring_items(state)
+    if not items:
+        return "No users expiring soon."
+    return "\n".join(items[:50])
 
 
 def get_low_priority_records(state: dict[str, Any]) -> list[tuple[int, dict[str, Any]]]:
@@ -1401,24 +1536,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     admin_chat_id = resolve_admin_chat_id(state, user)
     if admin_chat_id == update.effective_chat.id:
+        first_admin_setup = state.get("admin_chat_id") != admin_chat_id
         state["admin_chat_id"] = admin_chat_id
         save_state(state)
+        heading = (
+            "Setup complete. This chat is now the admin inbox."
+            if first_admin_setup
+            else "Welcome back."
+        )
         await update.message.reply_text(
-            "Admin chat registered. New requests will be sent here.\n\n"
-            "Commands:\n"
-            "/pending [all|low|normal|priority|expired]\n"
-            "/approve <user_id>\n"
-            "/approverelay <user_id>\n"
-            "/reject <user_id>\n"
-            "/priority <user_id>\n"
-            "/lowpriority <user_id>\n"
-            "/renew <user_id>\n"
-            "/senddirect <user_id>\n"
-            "/status <user_id>\n"
-            "/expiring\n"
-            "/syncsubs\n"
-            "/verifyof <onlyfans_username>\n"
-            "/ofdiag"
+            f"{heading}\n\n{format_admin_home(state)}",
+            reply_markup=build_admin_home_keyboard(),
         )
         return
 
@@ -1625,6 +1753,88 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await query.answer("Not allowed.", show_alert=True)
         return
 
+    if data.startswith("adm:"):
+        parts = data.split(":")
+        admin_action = parts[1] if len(parts) > 1 else ""
+
+        if admin_action == "home":
+            await query.edit_message_text(
+                format_admin_home(state),
+                reply_markup=build_admin_home_keyboard(),
+            )
+            await query.answer("Dashboard refreshed.")
+            return
+
+        if admin_action == "pending":
+            mode = parts[2] if len(parts) > 2 else "all"
+            await context.bot.send_message(
+                chat_id=query.message.chat.id,
+                text=format_pending_message(state, mode),
+                reply_markup=build_admin_home_keyboard(),
+            )
+            await query.answer("List sent.")
+            return
+
+        if admin_action == "expiring":
+            await context.bot.send_message(
+                chat_id=query.message.chat.id,
+                text=format_expiring_message(state),
+                reply_markup=build_admin_home_keyboard(),
+            )
+            await query.answer("Expiring list sent.")
+            return
+
+        if admin_action == "digest":
+            await context.bot.send_message(
+                chat_id=query.message.chat.id,
+                text=format_admin_digest(state),
+                reply_markup=build_admin_home_keyboard(),
+            )
+            await query.answer("Digest sent.")
+            return
+
+        if admin_action == "help":
+            await context.bot.send_message(
+                chat_id=query.message.chat.id,
+                text=format_admin_help(),
+                reply_markup=build_admin_home_keyboard(),
+            )
+            await query.answer("Help sent.")
+            return
+
+        if admin_action == "sync":
+            if not ofauth_is_configured():
+                await query.answer("OFAuth is not configured.", show_alert=True)
+                return
+            await query.answer("Syncing OnlyFans...")
+            try:
+                summary = await asyncio.to_thread(sync_subscribers, state)
+            except Exception as exc:
+                LOGGER.exception("OFAuth sync failed from admin dashboard.")
+                await context.bot.send_message(
+                    chat_id=query.message.chat.id,
+                    text=f"OnlyFans sync failed: {exc}",
+                    reply_markup=build_admin_home_keyboard(),
+                )
+                return
+            save_state(state)
+            await context.bot.send_message(
+                chat_id=query.message.chat.id,
+                text=format_sync_summary(summary),
+                reply_markup=build_admin_home_keyboard(),
+            )
+            expired_alert = format_expired_access_alert(summary)
+            if expired_alert:
+                await context.bot.send_message(
+                    chat_id=query.message.chat.id,
+                    text=expired_alert,
+                    reply_markup=build_admin_home_keyboard(),
+                )
+            return
+
+        await query.answer("Unknown admin action.", show_alert=True)
+        return
+
     action, _, user_id_text = data.partition(":")
     if not user_id_text.isdigit():
         await query.answer("Invalid action.", show_alert=True)
@@ -1790,26 +2000,10 @@ async def pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     mode = normalize_username(context.args[0]) if context.args else "all"
-    items = []
-    for user_id_text, record in state.get("users", {}).items():
-        status = record.get("status")
-        priority = record.get("review_priority")
-        if mode == "all" and status in {"pending", "low_priority"}:
-            items.append(format_pending_line(int(user_id_text), record))
-        elif mode == "low" and status == "low_priority":
-            items.append(format_pending_line(int(user_id_text), record))
-        elif mode == "normal" and status == "pending" and priority == "normal":
-            items.append(format_pending_line(int(user_id_text), record))
-        elif mode == "priority" and status == "pending" and priority == "priority":
-            items.append(format_pending_line(int(user_id_text), record))
-        elif mode == "expired" and status == "expired":
-            items.append(format_pending_line(int(user_id_text), record))
-
-    if not items:
-        await update.message.reply_text(f"No requests found for filter '{mode}'.")
-        return
-
-    await update.message.reply_text("\n".join(items[:50]))
+    await update.message.reply_text(
+        format_pending_message(state, mode),
+        reply_markup=build_admin_home_keyboard(),
+    )
 
 
 async def expiring(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1823,25 +2017,10 @@ async def expiring(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if admin_chat_id != update.effective_chat.id:
         return
 
-    now = utc_now()
-    soon = now + timedelta(days=7)
-    items = []
-    for user_id_text, record in state.get("users", {}).items():
-        expires_at = parse_iso(record.get("expires_at"))
-        if record.get("status") == "approved" and expires_at and expires_at <= soon:
-            items.append(
-                f"{int(user_id_text)} | {display_name(record)} | expires {format_date_for_user(record.get('expires_at'))} | {budget_line(record)}"
-            )
-        elif record.get("status") == "expired":
-            items.append(
-                f"{int(user_id_text)} | {display_name(record)} | expired"
-            )
-
-    if not items:
-        await update.message.reply_text("No users expiring soon.")
-        return
-
-    await update.message.reply_text("\n".join(items[:50]))
+    await update.message.reply_text(
+        format_expiring_message(state),
+        reply_markup=build_admin_home_keyboard(),
+    )
 
 
 async def sync_subs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
