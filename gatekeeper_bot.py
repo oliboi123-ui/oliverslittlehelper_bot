@@ -38,6 +38,7 @@ PAYPAL_MAIN_LOOP: asyncio.AbstractEventLoop | None = None
 PAYPAL_BOT: Any | None = None
 PAYPAL_WEBHOOK_SERVER: ThreadingHTTPServer | None = None
 PAYPAL_WEBHOOK_THREAD: threading.Thread | None = None
+PAYPAL_CHECKOUT_BLOCKED_REASON: str | None = None
 
 
 LOG_RECORD_RESERVED_KEYS = set(
@@ -906,6 +907,8 @@ def build_payment_keyboard(
         rows = [[InlineKeyboardButton("Pay with PayPal", callback_data=f"pay:{callback_ref}")]]
     else:
         rows = [[InlineKeyboardButton("Pay with PayPal", url=get_payment_url())]]
+    if record is not None and record.get("test_mode") and record.get("status") == "approved" and callback_ref is not None:
+        rows.append([InlineKeyboardButton("Browse PPVs", callback_data=f"ppv:menu:{callback_ref}")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1599,6 +1602,19 @@ async def send_paypal_checkout_message(
     payment_context: str = "manual",
     payment_item_keys: list[str] | None = None,
 ) -> None:
+    global PAYPAL_CHECKOUT_BLOCKED_REASON
+    if PAYPAL_CHECKOUT_BLOCKED_REASON:
+        await send_and_pin_payment_message(
+            bot,
+            user_id,
+            record,
+            target_chat_id=target_chat_id,
+            callback_user_id=user_id,
+            payment_context=payment_context,
+            payment_item_keys=payment_item_keys,
+        )
+        return
+
     record["payment_due_amount"] = int(amount) if float(amount).is_integer() else float(amount)
     record["payment_currency"] = currency.upper()
     record["payment_context"] = clean_text(payment_context, empty="manual").strip().lower() or "manual"
@@ -1618,6 +1634,7 @@ async def send_paypal_checkout_message(
     except Exception as exc:
         error_text = str(exc)
         if "PAYEE_ACCOUNT_RESTRICTED" in error_text or "merchant account is restricted" in error_text.lower():
+            PAYPAL_CHECKOUT_BLOCKED_REASON = "restricted"
             LOGGER.warning("PayPal checkout blocked by restricted merchant account; falling back to manual payment card for user %s.", user_id)
             await send_and_pin_payment_message(
                 bot,
@@ -3935,7 +3952,131 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     if data.startswith("ppv:"):
-        await query.answer("PPVs are admin-only for now.", show_alert=True)
+        _, _, rest = data.partition(":")
+        ppv_action, _, tail = rest.partition(":")
+        record = get_active_private_record(state, query.from_user)
+        mark_expired_if_needed(record)
+        if query.message is None or query.message.chat.type != "private":
+            await query.answer("Not allowed.", show_alert=True)
+            return
+        if not is_access_active(record):
+            await query.answer("PPVs are available after approval.", show_alert=True)
+            return
+        if not record.get("test_mode"):
+            await query.answer("PPVs are admin-only for now.", show_alert=True)
+            return
+
+        user_id = callback_user_id if callback_user_id is not None else query.from_user.id
+        buyer_chat_id = query.message.chat.id
+
+        if ppv_action == "menu":
+            await send_ppv_picker(
+                context.bot,
+                buyer_chat_id,
+                state,
+                query.from_user.id,
+                record=record,
+            )
+            await query.answer("PPVs opened.")
+            return
+
+        if ppv_action == "pick":
+            item_key, _, _ = tail.partition(":")
+            if not item_key:
+                await query.answer("Invalid PPV item.", show_alert=True)
+                return
+            item = get_ppv_items(state).get(item_key)
+            if item is None:
+                await query.answer("That PPV item is no longer registered.", show_alert=True)
+                return
+            cart = get_ppv_cart(record)
+            if item_key not in cart:
+                cart.append(item_key)
+            save_state(state)
+            if query.message is not None:
+                await query.edit_message_text(
+                    build_ppv_menu_text(record, state),
+                    reply_markup=build_ppv_picker_keyboard(state, query.from_user.id, record),
+                )
+            await query.answer(f"Added {build_ppv_item_label(item_key, item)} to cart.")
+            await context.bot.send_message(
+                chat_id=buyer_chat_id,
+                text=f"Added to cart: {build_ppv_item_label(item_key, item)}",
+                protect_content=True,
+            )
+            return
+
+        if ppv_action == "cart":
+            if query.message is not None:
+                await query.edit_message_text(
+                    build_ppv_menu_text(record, state),
+                    reply_markup=build_ppv_cart_keyboard(query.from_user.id, record),
+                )
+            await query.answer("Cart opened.")
+            return
+
+        if ppv_action == "checkout":
+            cart = get_ppv_cart(record)
+            if not cart:
+                await query.answer("Your cart is empty.", show_alert=True)
+                return
+            total = 0
+            for item_key in cart:
+                item = get_ppv_items(state).get(item_key)
+                if item is not None and isinstance(item.get("price"), int):
+                    total += int(item["price"])
+            currency = str(record.get("payment_currency") or "USD").upper()
+            record["ppv_selected_item_key"] = cart[0]
+            first_item = get_ppv_items(state).get(cart[0])
+            record["ppv_selected_item_title"] = first_item.get("title") if first_item else None
+            record["ppv_selected_item_price"] = first_item.get("price") if first_item else None
+            try:
+                await send_paypal_checkout_message(
+                    context.bot,
+                    state,
+                    user_id,
+                    record,
+                    amount=total,
+                    currency=currency,
+                    description="PPV cart checkout",
+                    text=(
+                        f"Payment ready\n\nAmount due: {format_currency_amount(total, currency)}\n\n"
+                        "Tap PayPal below to complete the purchase."
+                    ),
+                    target_chat_id=buyer_chat_id,
+                    payment_context="ppv",
+                    payment_item_keys=cart,
+                )
+                await query.answer("PayPal checkout sent.")
+                if query.message.chat.type == "supergroup":
+                    await context.bot.send_message(
+                        chat_id=query.message.chat.id,
+                        message_thread_id=query.message.message_thread_id,
+                        text="PayPal checkout sent.",
+                    )
+                return
+            except Exception:
+                LOGGER.exception("PayPal checkout creation failed for user %s.", user_id)
+            await send_and_pin_payment_message(
+                context.bot,
+                user_id,
+                record,
+                target_chat_id=buyer_chat_id,
+                callback_user_id=user_id,
+                payment_context="ppv",
+                payment_item_keys=cart,
+            )
+            save_state(state)
+            await query.answer("Payment link sent.")
+            if query.message.chat.type == "supergroup":
+                await context.bot.send_message(
+                    chat_id=query.message.chat.id,
+                    message_thread_id=query.message.message_thread_id,
+                    text="Payment link sent.",
+                )
+            return
+
+        await query.answer("Unknown PPV action.", show_alert=True)
         return
 
     if data.startswith("adm:"):
