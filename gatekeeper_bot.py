@@ -1,11 +1,17 @@
-﻿import asyncio
+import asyncio
+import base64
 import json
 import logging
 import os
 import socket
 import sys
+import threading
 import time
+import uuid
+import zlib
 from datetime import datetime, timedelta, timezone
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib import error as urllib_error
@@ -25,6 +31,11 @@ from telegram.ext import (
 
 
 LOGGER = logging.getLogger("gatekeeper_bot")
+
+PAYPAL_MAIN_LOOP: asyncio.AbstractEventLoop | None = None
+PAYPAL_BOT: Any | None = None
+PAYPAL_WEBHOOK_SERVER: ThreadingHTTPServer | None = None
+PAYPAL_WEBHOOK_THREAD: threading.Thread | None = None
 
 
 LOG_RECORD_RESERVED_KEYS = set(
@@ -110,22 +121,22 @@ TEST_SESSION_ID_OFFSET = 9_000_000_000_000_000
 QUICK_PHRASES = [
     {
         "key": "bought_before",
-        "label": "❓ Bought before?",
+        "label": "? Bought before?",
         "text": "Have you purchased content from me before?",
     },
     {
         "key": "what_content",
-        "label": "🧾 What do you want?",
+        "label": "?? What do you want?",
         "text": "What kind of content are you looking for today?",
     },
     {
         "key": "budget",
-        "label": "💬 Ask budget",
+        "label": "?? Ask budget",
         "text": "What budget range are you thinking for this?",
     },
     {
         "key": "price_reply",
-        "label": "💸 Budget reply",
+        "label": "?? Budget reply",
         "text": None,
     },
 ]
@@ -291,6 +302,55 @@ def get_payment_url() -> str:
     return os.getenv("PAYMENT_URL", "https://paypal.me/mirage22m").strip()
 
 
+def get_paypal_env() -> str:
+    return os.getenv("PAYPAL_ENV", "live").strip().lower()
+
+
+def get_paypal_api_base() -> str:
+    return "https://api-m.sandbox.paypal.com" if get_paypal_env() == "sandbox" else "https://api-m.paypal.com"
+
+
+def get_paypal_client_id() -> str | None:
+    return get_optional_env("PAYPAL_CLIENT_ID")
+
+
+def get_paypal_client_secret() -> str | None:
+    return get_optional_env("PAYPAL_CLIENT_SECRET")
+
+
+def get_paypal_webhook_id() -> str | None:
+    return get_optional_env("PAYPAL_WEBHOOK_ID")
+
+
+def get_paypal_public_base_url() -> str | None:
+    return get_optional_env("PAYPAL_PUBLIC_BASE_URL")
+
+
+def get_paypal_return_url() -> str | None:
+    base_url = get_paypal_public_base_url()
+    if not base_url:
+        return None
+    return base_url.rstrip("/") + "/paypal/return"
+
+
+def get_paypal_cancel_url() -> str | None:
+    base_url = get_paypal_public_base_url()
+    if not base_url:
+        return None
+    return base_url.rstrip("/") + "/paypal/cancel"
+
+
+def get_paypal_webhook_url() -> str | None:
+    base_url = get_paypal_public_base_url()
+    if not base_url:
+        return None
+    return base_url.rstrip("/") + "/paypal/webhook"
+
+
+def get_paypal_webhook_port() -> int:
+    return int(os.getenv("PAYPAL_WEBHOOK_PORT", os.getenv("PORT", "8080")))
+
+
 def relay_is_configured() -> bool:
     return get_relay_group_id() is not None
 
@@ -426,6 +486,7 @@ def load_state() -> dict[str, Any]:
             "content_vault_chat_id": None,
             "vault_items": {},
             "ppv_items": {},
+            "paypal_orders": {},
             "test_sessions": {},
         }
     try:
@@ -439,6 +500,7 @@ def load_state() -> dict[str, Any]:
             "content_vault_chat_id": None,
             "vault_items": {},
             "ppv_items": {},
+            "paypal_orders": {},
             "test_sessions": {},
         }
     state.setdefault("admin_chat_id", None)
@@ -447,6 +509,7 @@ def load_state() -> dict[str, Any]:
     state.setdefault("content_vault_chat_id", None)
     state.setdefault("vault_items", {})
     state.setdefault("ppv_items", {})
+    state.setdefault("paypal_orders", {})
     state.setdefault("test_sessions", {})
     return state
 
@@ -521,12 +584,16 @@ def default_user_record() -> dict[str, Any]:
         "payment_requested_at": None,
         "payment_confirmed_at": None,
         "payment_reminded_at": None,
+        "payment_due_amount": None,
+        "payment_currency": "USD",
+        "paypal_order_id": None,
         "ppv_selected_item_key": None,
         "ppv_selected_item_title": None,
         "ppv_selected_item_price": None,
         "ppv_cart": [],
         "ppv_delivery_history": {},
         "content_unlocks": [],
+        "paypal_order_id": None,
         "not_fit_at": None,
         "trash_at": None,
         "banned_at": None,
@@ -621,9 +688,13 @@ def begin_test_mode_session(state: dict[str, Any], user: Any) -> dict[str, Any]:
     record["payment_requested_at"] = None
     record["payment_confirmed_at"] = None
     record["payment_reminded_at"] = None
+    record["payment_due_amount"] = None
+    record["payment_currency"] = "USD"
     record["ppv_selected_item_key"] = None
     record["ppv_selected_item_title"] = None
     record["ppv_selected_item_price"] = None
+    record["payment_due_amount"] = None
+    record["payment_currency"] = "USD"
     record["ppv_cart"] = []
     record["ppv_delivery_history"] = {}
     record["content_unlocks"] = []
@@ -742,29 +813,465 @@ def direct_access_message(private_username: str, record: dict[str, Any]) -> str:
     )
 
 
+def format_currency_amount(amount: int | float | str | None, currency: str = "USD") -> str:
+    if amount is None:
+        return ""
+    if isinstance(amount, str):
+        try:
+            amount = float(amount)
+        except ValueError:
+            return amount
+    if currency.upper() == "USD":
+        return f"${float(amount):.2f}"
+    return f"{currency.upper()} {float(amount):.2f}"
+
+
+def format_currency_amount(amount: int | float | str | None, currency: str = "USD") -> str:
+    if amount is None:
+        return ""
+    if isinstance(amount, str):
+        try:
+            amount = float(amount)
+        except ValueError:
+            return amount
+    if currency.upper() == "USD":
+        return f"${float(amount):.2f}"
+    return f"{currency.upper()} {float(amount):.2f}"
+
+
 def payment_message(record: dict[str, Any] | None = None) -> str:
-    ppv_title = clean_text((record or {}).get("ppv_selected_item_title"), empty="")
-    ppv_price = (record or {}).get("ppv_selected_item_price")
-    ppv_block = ""
+    record = record or {}
+    ppv_title = clean_text(record.get("ppv_selected_item_title"), empty="")
+    ppv_price = record.get("ppv_selected_item_price")
+    due_amount = record.get("payment_due_amount")
+    due_currency = str(record.get("payment_currency") or "USD")
+    lines = [
+        "Payment link",
+        f"{get_payment_url()}",
+        "",
+        "Use the PayPal button below for purchases so payment info stays easy to find.",
+    ]
+    if due_amount is not None:
+        lines.extend(["", f"Amount due: {format_currency_amount(due_amount, due_currency)}"])
     if ppv_title:
-        ppv_block = (
-            "\n\nPPV selected: "
-            f"{ppv_title}"
-            + (f" (${ppv_price})" if ppv_price is not None else "")
-        )
-    return (
-        "Payment link\n"
-        f"{get_payment_url()}\n\n"
-        "Use the PayPal button below for purchases so payment info stays easy to find."
-        f"{ppv_block}"
+        ppv_line = f"PPV selected: {ppv_title}"
+        if ppv_price is not None:
+            ppv_line += f" ({format_currency_amount(ppv_price, due_currency)})"
+        lines.extend(["", ppv_line])
+    return "\n".join(lines)
+
+
+def build_payment_keyboard(
+    user_id: int | None = None,
+    record: dict[str, Any] | None = None,
+    *,
+    payment_url: str | None = None,
+) -> InlineKeyboardMarkup:
+    if payment_url:
+        rows = [[InlineKeyboardButton("?? PayPal", url=payment_url)]]
+    elif user_id is not None:
+        rows = [[InlineKeyboardButton("?? PayPal", callback_data=f"pay:{user_id}")]]
+    else:
+        rows = [[InlineKeyboardButton("?? PayPal", url=get_payment_url())]]
+    if user_id is not None:
+        rows.append([InlineKeyboardButton("?? PPVs", callback_data=f"ppv:menu:{user_id}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def paypal_is_configured() -> bool:
+    return bool(
+        get_paypal_client_id()
+        and get_paypal_client_secret()
+        and get_paypal_webhook_id()
+        and get_paypal_public_base_url()
     )
 
 
-def build_payment_keyboard(user_id: int | None = None, record: dict[str, Any] | None = None) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton("💸 PayPal", url=get_payment_url())]]
-    if user_id is not None:
-        rows.append([InlineKeyboardButton("📦 PPVs", callback_data=f"ppv:menu:{user_id}")])
-    return InlineKeyboardMarkup(rows)
+def get_paypal_orders(state: dict[str, Any]) -> dict[str, Any]:
+    return state.setdefault("paypal_orders", {})
+
+
+def schedule_bot_message(*, chat_id: int, text: str, **kwargs: Any) -> None:
+    if PAYPAL_BOT is None or PAYPAL_MAIN_LOOP is None:
+        return
+    asyncio.run_coroutine_threadsafe(
+        PAYPAL_BOT.send_message(chat_id=chat_id, text=text, **kwargs),
+        PAYPAL_MAIN_LOOP,
+    )
+
+
+def paypal_api_request_json(method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    client_id = get_paypal_client_id()
+    client_secret = get_paypal_client_secret()
+    if not client_id or not client_secret:
+        raise RuntimeError("PayPal is not configured.")
+    request_data = None
+    headers = {"Accept": "application/json"}
+    if payload is not None:
+        request_data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    auth = base64.b64encode(f"{client_id}:{client_secret}".encode("utf-8")).decode("ascii")
+    headers["Authorization"] = f"Basic {auth}"
+    request = urllib_request.Request(
+        get_paypal_api_base().rstrip("/") + path,
+        data=request_data,
+        method=method,
+        headers=headers,
+    )
+    try:
+        with urllib_request.urlopen(request, timeout=30) as response:
+            body = response.read().decode("utf-8")
+    except urllib_error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"PayPal API error ({exc.code}): {detail}") from exc
+    if not body:
+        return {}
+    return json.loads(body)
+
+
+def paypal_get_access_token() -> str:
+    client_id = get_paypal_client_id()
+    client_secret = get_paypal_client_secret()
+    if not client_id or not client_secret:
+        raise RuntimeError("PayPal is not configured.")
+    auth = base64.b64encode(f"{client_id}:{client_secret}".encode("utf-8")).decode("ascii")
+    request = urllib_request.Request(
+        get_paypal_api_base().rstrip("/") + "/v1/oauth2/token",
+        data=urllib_parse.urlencode({"grant_type": "client_credentials"}).encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": f"Basic {auth}",
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    try:
+        with urllib_request.urlopen(request, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib_error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"PayPal token request failed ({exc.code}): {detail}") from exc
+    token = str(payload.get("access_token") or "").strip()
+    if not token:
+        raise RuntimeError("PayPal did not return an access token.")
+    return token
+
+
+def paypal_create_order(
+    state: dict[str, Any],
+    user_id: int,
+    *,
+    amount: int | float,
+    currency: str = "USD",
+    description: str,
+    purpose: str,
+) -> tuple[str, str]:
+    if not paypal_is_configured():
+        raise RuntimeError("PayPal checkout is not configured.")
+    return_url = get_paypal_return_url()
+    cancel_url = get_paypal_cancel_url()
+    if not return_url or not cancel_url:
+        raise RuntimeError("Set PAYPAL_PUBLIC_BASE_URL so the bot can build return and cancel URLs.")
+    token = paypal_get_access_token()
+    invoice_id = f"tg-{user_id}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
+    order_payload = {
+        "intent": "CAPTURE",
+        "purchase_units": [
+            {
+                "custom_id": str(user_id),
+                "invoice_id": invoice_id,
+                "description": description[:127],
+                "amount": {
+                    "currency_code": currency.upper(),
+                    "value": f"{float(amount):.2f}",
+                },
+            }
+        ],
+        "application_context": {
+            "brand_name": "Oliver's Little Helper",
+            "return_url": return_url,
+            "cancel_url": cancel_url,
+        },
+    }
+    request = urllib_request.Request(
+        get_paypal_api_base().rstrip("/") + "/v2/checkout/orders",
+        data=json.dumps(order_payload).encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "PayPal-Request-Id": f"{user_id}-{uuid.uuid4().hex}",
+        },
+    )
+    try:
+        with urllib_request.urlopen(request, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib_error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"PayPal order creation failed ({exc.code}): {detail}") from exc
+    order_id = str(payload.get("id") or "").strip()
+    if not order_id:
+        raise RuntimeError("PayPal did not return an order id.")
+    approval_url = ""
+    for link in payload.get("links", []):
+        if link.get("rel") in {"approve", "payer-action"} and link.get("href"):
+            approval_url = str(link["href"])
+            break
+    if not approval_url:
+        raise RuntimeError("PayPal did not return an approval URL.")
+    orders = get_paypal_orders(state)
+    record = get_user_record(state, user_id)
+    record["paypal_order_id"] = order_id
+    record["payment_due_amount"] = int(amount) if float(amount).is_integer() else float(amount)
+    record["payment_currency"] = currency.upper()
+    record["payment_status"] = "pending"
+    record["payment_requested_at"] = to_iso(utc_now())
+    orders[order_id] = {
+        "user_id": user_id,
+        "purpose": purpose,
+        "amount": f"{float(amount):.2f}",
+        "currency": currency.upper(),
+        "description": description,
+        "approval_url": approval_url,
+        "status": "created",
+        "created_at": to_iso(utc_now()),
+    }
+    save_state(state)
+    return order_id, approval_url
+
+
+def paypal_verify_webhook(raw_body: bytes, headers: Any) -> dict[str, Any]:
+    if not paypal_is_configured():
+        raise RuntimeError("PayPal webhook verification is not configured.")
+    webhook_event = json.loads(raw_body.decode("utf-8"))
+    verification_payload = {
+        "auth_algo": headers.get("PAYPAL-AUTH-ALGO") or headers.get("paypal-auth-algo"),
+        "cert_url": headers.get("PAYPAL-CERT-URL") or headers.get("paypal-cert-url"),
+        "transmission_id": headers.get("PAYPAL-TRANSMISSION-ID") or headers.get("paypal-transmission-id"),
+        "transmission_sig": headers.get("PAYPAL-TRANSMISSION-SIG") or headers.get("paypal-transmission-sig"),
+        "transmission_time": headers.get("PAYPAL-TRANSMISSION-TIME") or headers.get("paypal-transmission-time"),
+        "webhook_id": get_paypal_webhook_id(),
+        "webhook_event": webhook_event,
+    }
+    if not all(verification_payload.get(key) for key in ("auth_algo", "cert_url", "transmission_id", "transmission_sig", "transmission_time", "webhook_id")):
+        raise RuntimeError("Missing PayPal signature headers.")
+    token = paypal_get_access_token()
+    request = urllib_request.Request(
+        get_paypal_api_base().rstrip("/") + "/v1/notifications/verify-webhook-signature",
+        data=json.dumps(verification_payload).encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib_request.urlopen(request, timeout=30) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib_error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"PayPal webhook verification failed ({exc.code}): {detail}") from exc
+    if str(result.get("verification_status") or "").upper() != "SUCCESS":
+        raise RuntimeError("PayPal webhook verification failed.")
+    return webhook_event
+
+
+def paypal_mark_payment_complete(state: dict[str, Any], order_id: str, event: dict[str, Any]) -> tuple[int, dict[str, Any]] | None:
+    orders = get_paypal_orders(state)
+    order_entry = orders.get(order_id)
+    user_id = None
+    if order_entry and str(order_entry.get("user_id") or "").isdigit():
+        user_id = int(order_entry["user_id"])
+    else:
+        for raw_user_id, record in state.get("users", {}).items():
+            if str(record.get("paypal_order_id") or "") == order_id:
+                user_id = int(raw_user_id)
+                break
+    if user_id is None:
+        return None
+    record = get_user_record(state, user_id)
+    record["payment_status"] = "paid"
+    record["payment_confirmed_at"] = to_iso(utc_now())
+    record["payment_due_amount"] = record.get("payment_due_amount")
+    record["paypal_order_id"] = order_id
+    if order_entry is not None:
+        order_entry["status"] = "completed"
+        order_entry["completed_at"] = to_iso(utc_now())
+    orders.pop(order_id, None)
+    save_state(state)
+    return user_id, record
+
+
+def paypal_notify_payment_complete(state: dict[str, Any], user_id: int, record: dict[str, Any], event: dict[str, Any]) -> None:
+    buyer_chat_id = get_buyer_chat_id(record, user_id)
+    schedule_bot_message(
+        chat_id=buyer_chat_id,
+        text=template("payment_confirmed"),
+        protect_content=True,
+    )
+    admin_chat_id = get_relay_group_id() if record.get("test_mode") else state.get("admin_chat_id")
+    if admin_chat_id is not None:
+        schedule_bot_message(
+            chat_id=int(admin_chat_id),
+            text=f"PayPal payment confirmed for {format_person_label(record)} ({user_id}).",
+        )
+
+
+def paypal_process_webhook(raw_body: bytes, headers: Any) -> str:
+    state = load_state()
+    event = paypal_verify_webhook(raw_body, headers)
+    event_type = str(event.get("event_type") or "").strip()
+    if event_type != "PAYMENT.CAPTURE.COMPLETED":
+        return f"Ignored {event_type or 'unknown'}"
+    resource = event.get("resource") or {}
+    related_ids = (resource.get("supplementary_data") or {}).get("related_ids") or {}
+    order_id = str(related_ids.get("order_id") or "").strip()
+    if not order_id:
+        raise RuntimeError("PayPal webhook did not include an order id.")
+    result = paypal_mark_payment_complete(state, order_id, event)
+    if result is None:
+        return f"Order {order_id} not found"
+    user_id, record = result
+    paypal_notify_payment_complete(state, user_id, record, event)
+    log_event("paypal_payment_confirmed", buyer_id=user_id, order_id=order_id)
+    return f"Payment confirmed for {user_id}"
+
+
+class PaypalWebhookHandler(BaseHTTPRequestHandler):
+    server_version = "OliverLittleHelperPayPal/1.0"
+
+    def log_message(self, format: str, *args: Any) -> None:
+        LOGGER.info("paypal webhook %s", format % args)
+
+    def _send_text(self, status: HTTPStatus, body: str) -> None:
+        data = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _send_html(self, status: HTTPStatus, body: str) -> None:
+        data = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self) -> None:
+        if self.path.startswith("/paypal/return"):
+            self._send_html(
+                HTTPStatus.OK,
+                "<html><body><h1>Payment received</h1><p>You can close this page and return to Telegram.</p></body></html>",
+            )
+            return
+        if self.path.startswith("/paypal/cancel"):
+            self._send_html(
+                HTTPStatus.OK,
+                "<html><body><h1>Payment cancelled</h1><p>You can return to Telegram.</p></body></html>",
+            )
+            return
+        self._send_text(HTTPStatus.OK, "OK")
+
+    def do_POST(self) -> None:
+        if not self.path.startswith("/paypal/webhook"):
+            self._send_text(HTTPStatus.NOT_FOUND, "Not found")
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+        except ValueError:
+            self._send_text(HTTPStatus.BAD_REQUEST, "Invalid content length")
+            return
+        raw_body = self.rfile.read(length)
+        try:
+            message = paypal_process_webhook(raw_body, self.headers)
+        except Exception as exc:
+            LOGGER.exception("PayPal webhook processing failed.")
+            self._send_text(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        self._send_text(HTTPStatus.OK, message)
+
+
+def start_paypal_webhook_server(loop: asyncio.AbstractEventLoop, bot: Any) -> None:
+    global PAYPAL_MAIN_LOOP, PAYPAL_BOT, PAYPAL_WEBHOOK_SERVER, PAYPAL_WEBHOOK_THREAD
+    PAYPAL_MAIN_LOOP = loop
+    PAYPAL_BOT = bot
+    if PAYPAL_WEBHOOK_SERVER is not None:
+        return
+    PAYPAL_WEBHOOK_SERVER = ThreadingHTTPServer(("0.0.0.0", get_paypal_webhook_port()), PaypalWebhookHandler)
+    PAYPAL_WEBHOOK_THREAD = threading.Thread(target=PAYPAL_WEBHOOK_SERVER.serve_forever, name="paypal-webhook", daemon=True)
+    PAYPAL_WEBHOOK_THREAD.start()
+    log_event("paypal_webhook_server_started", port=get_paypal_webhook_port())
+
+
+def stop_paypal_webhook_server() -> None:
+    global PAYPAL_WEBHOOK_SERVER
+    if PAYPAL_WEBHOOK_SERVER is None:
+        return
+    PAYPAL_WEBHOOK_SERVER.shutdown()
+    PAYPAL_WEBHOOK_SERVER.server_close()
+    PAYPAL_WEBHOOK_SERVER = None
+
+
+def paypal_checkout_amount_from_record(record: dict[str, Any]) -> int | None:
+    amount = record.get("payment_due_amount")
+    if amount is None:
+        return None
+    try:
+        return int(amount)
+    except (TypeError, ValueError):
+        try:
+            return int(float(amount))
+        except (TypeError, ValueError):
+            return None
+
+
+async def send_paypal_checkout_message(
+    bot: Any,
+    state: dict[str, Any],
+    user_id: int,
+    record: dict[str, Any],
+    *,
+    amount: int | float,
+    currency: str = "USD",
+    description: str,
+    text: str,
+    target_chat_id: int | None = None,
+) -> None:
+    order_id, approval_url = await asyncio.to_thread(
+        paypal_create_order,
+        state,
+        user_id,
+        amount=amount,
+        currency=currency,
+        description=description,
+        purpose=description[:64],
+    )
+    record["payment_due_amount"] = int(amount) if float(amount).is_integer() else float(amount)
+    record["payment_currency"] = currency.upper()
+    record["paypal_order_id"] = order_id
+    record["payment_status"] = "pending"
+    record["payment_requested_at"] = to_iso(utc_now())
+    save_state(state)
+    message = await bot.send_message(
+        chat_id=target_chat_id if target_chat_id is not None else user_id,
+        text=text,
+        reply_markup=build_payment_keyboard(user_id, record, payment_url=approval_url),
+        protect_content=True,
+    )
+    record["payment_message_id"] = message.message_id
+    try:
+        await bot.pin_chat_message(
+            chat_id=target_chat_id if target_chat_id is not None else user_id,
+            message_id=message.message_id,
+            disable_notification=True,
+        )
+    except Exception:
+        LOGGER.exception("Could not pin PayPal checkout message for user %s.", user_id)
+    save_state(state)
 
 
 def build_relay_topic_keyboard(user_id: int, record: dict[str, Any] | None = None) -> InlineKeyboardMarkup:
@@ -776,16 +1283,16 @@ def build_relay_topic_keyboard(user_id: int, record: dict[str, Any] | None = Non
     rows.extend(
         [
             [
-                InlineKeyboardButton("💸 Budget reply", callback_data=f"q:price_reply:{user_id}"),
-                InlineKeyboardButton("💸 PayPal", callback_data=f"pay:{user_id}"),
+                InlineKeyboardButton("?? Budget reply", callback_data=f"q:price_reply:{user_id}"),
+                InlineKeyboardButton("?? PayPal", callback_data=f"pay:{user_id}"),
             ],
             [
-                InlineKeyboardButton("🎁 Unlock content", callback_data=f"ul:{user_id}"),
-                InlineKeyboardButton("👤 Status", callback_data=f"st:{user_id}"),
+                InlineKeyboardButton("?? Unlock content", callback_data=f"ul:{user_id}"),
+                InlineKeyboardButton("?? Status", callback_data=f"st:{user_id}"),
             ],
             [
-                InlineKeyboardButton("🚫 Revoke", callback_data=f"rv:{user_id}"),
-                InlineKeyboardButton("🗑 Remove", callback_data=f"rm:{user_id}"),
+                InlineKeyboardButton("?? Revoke", callback_data=f"rv:{user_id}"),
+                InlineKeyboardButton("?? Remove", callback_data=f"rm:{user_id}"),
             ],
         ]
     )
@@ -965,8 +1472,8 @@ def build_ppv_picker_keyboard(state: dict[str, Any], user_id: int) -> InlineKeyb
     ]
     rows.append(
         [
-            InlineKeyboardButton("🛒 View cart", callback_data=f"ppv:cart:{user_id}"),
-            InlineKeyboardButton("💸 Checkout", callback_data=f"ppv:checkout:{user_id}"),
+            InlineKeyboardButton("?? View cart", callback_data=f"ppv:cart:{user_id}"),
+            InlineKeyboardButton("?? Checkout", callback_data=f"ppv:checkout:{user_id}"),
         ]
     )
     if not rows[:-1]:
@@ -989,28 +1496,28 @@ def build_admin_review_keyboard(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("✅ Approve", callback_data=f"ar:{user_id}"),
-                InlineKeyboardButton("📩 Direct", callback_data=f"ad:{user_id}"),
+                InlineKeyboardButton("? Approve", callback_data=f"ar:{user_id}"),
+                InlineKeyboardButton("?? Direct", callback_data=f"ad:{user_id}"),
             ],
             [
-                InlineKeyboardButton("❌ Reject", callback_data=f"r:{user_id}"),
+                InlineKeyboardButton("? Reject", callback_data=f"r:{user_id}"),
             ],
             [
-                InlineKeyboardButton("💬 Clarify", callback_data=f"clar:{user_id}"),
-                InlineKeyboardButton("↩ Retry Username", callback_data=f"retryof:{user_id}"),
+                InlineKeyboardButton("?? Clarify", callback_data=f"clar:{user_id}"),
+                InlineKeyboardButton("? Retry Username", callback_data=f"retryof:{user_id}"),
             ],
             [
-                InlineKeyboardButton("⭐ Promising", callback_data=f"label_promising:{user_id}"),
-                InlineKeyboardButton("🧊 Skip", callback_data=f"label_skip:{user_id}"),
-                InlineKeyboardButton("⚠ Dangerous", callback_data=f"label_dangerous:{user_id}"),
+                InlineKeyboardButton("? Promising", callback_data=f"label_promising:{user_id}"),
+                InlineKeyboardButton("?? Skip", callback_data=f"label_skip:{user_id}"),
+                InlineKeyboardButton("? Dangerous", callback_data=f"label_dangerous:{user_id}"),
             ],
             [
-                InlineKeyboardButton("⬆ Move Up", callback_data=f"p:{user_id}"),
-                InlineKeyboardButton("⏳ Slow Queue", callback_data=f"l:{user_id}"),
+                InlineKeyboardButton("? Move Up", callback_data=f"p:{user_id}"),
+                InlineKeyboardButton("? Slow Queue", callback_data=f"l:{user_id}"),
             ],
             [
-                InlineKeyboardButton("🚫 Ban", callback_data=f"ban:{user_id}"),
-                InlineKeyboardButton("👤 Details", callback_data=f"st:{user_id}"),
+                InlineKeyboardButton("?? Ban", callback_data=f"ban:{user_id}"),
+                InlineKeyboardButton("?? Details", callback_data=f"st:{user_id}"),
             ],
         ]
     )
@@ -1019,29 +1526,29 @@ def build_admin_review_keyboard(user_id: int) -> InlineKeyboardMarkup:
 def build_post_approval_keyboard(user_id: int, record: dict[str, Any] | None = None) -> InlineKeyboardMarkup:
     rows = [
         [
-            InlineKeyboardButton("✅ Paid", callback_data=f"paid:{user_id}"),
-            InlineKeyboardButton("🔔 Remind Pay", callback_data=f"rp:{user_id}"),
+            InlineKeyboardButton("? Paid", callback_data=f"paid:{user_id}"),
+            InlineKeyboardButton("?? Remind Pay", callback_data=f"rp:{user_id}"),
         ]
     ]
     payment_status = str((record or {}).get("payment_status") or "").strip().lower()
     if record is None or payment_status == "paid":
         rows.append(
             [
-                InlineKeyboardButton("🎁 Unlock content", callback_data=f"ul:{user_id}"),
-                InlineKeyboardButton("👤 Status", callback_data=f"st:{user_id}"),
+                InlineKeyboardButton("?? Unlock content", callback_data=f"ul:{user_id}"),
+                InlineKeyboardButton("?? Status", callback_data=f"st:{user_id}"),
             ]
         )
     else:
         rows.append(
             [
-                InlineKeyboardButton("👤 Status", callback_data=f"st:{user_id}"),
-                InlineKeyboardButton("🚫 Revoke", callback_data=f"rv:{user_id}"),
+                InlineKeyboardButton("?? Status", callback_data=f"st:{user_id}"),
+                InlineKeyboardButton("?? Revoke", callback_data=f"rv:{user_id}"),
             ]
         )
     rows.append(
         [
-            InlineKeyboardButton("🗑 Remove", callback_data=f"rm:{user_id}"),
-            InlineKeyboardButton("🚫 Ban", callback_data=f"ban:{user_id}"),
+            InlineKeyboardButton("?? Remove", callback_data=f"rm:{user_id}"),
+            InlineKeyboardButton("?? Ban", callback_data=f"ban:{user_id}"),
         ]
     )
     return InlineKeyboardMarkup(rows)
@@ -1142,8 +1649,8 @@ def build_ppv_cart_keyboard(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("🧾 Checkout", callback_data=f"ppv:checkout:{user_id}"),
-                InlineKeyboardButton("↩ Back", callback_data=f"ppv:menu:{user_id}"),
+                InlineKeyboardButton("?? Checkout", callback_data=f"ppv:checkout:{user_id}"),
+                InlineKeyboardButton("? Back", callback_data=f"ppv:menu:{user_id}"),
             ]
         ]
     )
@@ -1193,8 +1700,8 @@ def build_closed_record_keyboard(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("👤 Status", callback_data=f"st:{user_id}"),
-                InlineKeyboardButton("🗑 Remove", callback_data=f"rm:{user_id}"),
+                InlineKeyboardButton("?? Status", callback_data=f"st:{user_id}"),
+                InlineKeyboardButton("?? Remove", callback_data=f"rm:{user_id}"),
             ],
         ]
     )
@@ -1213,23 +1720,23 @@ def build_admin_home_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("📥 Review Inbox", callback_data="adm:pending:all"),
-                InlineKeyboardButton("🔥 Hot Leads", callback_data="adm:pending:priority"),
+                InlineKeyboardButton("?? Review Inbox", callback_data="adm:pending:all"),
+                InlineKeyboardButton("?? Hot Leads", callback_data="adm:pending:priority"),
             ],
             [
-                InlineKeyboardButton("⏳ Slow Queue", callback_data="adm:pending:low"),
-                InlineKeyboardButton("👀 Access Watch", callback_data="adm:expiring"),
+                InlineKeyboardButton("? Slow Queue", callback_data="adm:pending:low"),
+                InlineKeyboardButton("?? Access Watch", callback_data="adm:expiring"),
             ],
             [
-                InlineKeyboardButton("📋 Full Briefing", callback_data="adm:digest"),
-                InlineKeyboardButton("🔄 Sync OFAuth", callback_data="adm:sync"),
+                InlineKeyboardButton("?? Full Briefing", callback_data="adm:digest"),
+                InlineKeyboardButton("?? Sync OFAuth", callback_data="adm:sync"),
             ],
             [
-                InlineKeyboardButton("❔ Help Unverified", callback_data="adm:notify_unverified"),
+                InlineKeyboardButton("? Help Unverified", callback_data="adm:notify_unverified"),
             ],
             [
-                InlineKeyboardButton("🔁 Refresh", callback_data="adm:home"),
-                InlineKeyboardButton("📜 Command Menu", callback_data="adm:help"),
+                InlineKeyboardButton("?? Refresh", callback_data="adm:home"),
+                InlineKeyboardButton("?? Command Menu", callback_data="adm:help"),
             ],
         ]
     )
@@ -1356,6 +1863,7 @@ def format_admin_help() -> str:
         "/priority <user_id>\n"
         "/lowpriority <user_id>\n"
         "/setof <user_id> <onlyfans_username>\n"
+        "/requestpay <user_id> <amount> [currency]\n"
         "/renew <user_id>\n"
         "/senddirect <user_id>\n"
         "/revoke <user_id>\n"
@@ -1399,8 +1907,9 @@ def format_operator_help() -> str:
         "/ppvadd dickpic_01 250 line:dickpic Dickpic 01\n\n"
         "OnlyFans:\n"
         "/setof <user_id> <onlyfans_username>\n\n"
+        "/requestpay <user_id> <amount> [currency]\n\n"
         "PayPal:\n"
-        "The current setup is a payment link button. Full PayPal automation needs a checkout app or webhook that confirms payment back into the bot."
+        "The current setup can generate a PayPal checkout link once you set an amount, or fall back to the payment link button. Full automation still needs the webhook endpoint."
     )
 
 
@@ -2988,313 +3497,46 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             if not cart:
                 await query.answer("Your cart is empty.", show_alert=True)
                 return
+            total = 0
+            for item_key in cart:
+                item = get_ppv_items(state).get(item_key)
+                if item is not None and isinstance(item.get("price"), int):
+                    total += int(item["price"])
+            currency = str(record.get("payment_currency") or "USD").upper()
             record["ppv_selected_item_key"] = cart[0]
             first_item = get_ppv_items(state).get(cart[0])
             record["ppv_selected_item_title"] = first_item.get("title") if first_item else None
             record["ppv_selected_item_price"] = first_item.get("price") if first_item else None
-            save_state(state)
-            await context.bot.send_message(
-                chat_id=buyer_chat_id,
-                text=(
-                    f"{build_ppv_checkout_summary(record, state)}\n\n"
-                    "Use the PayPal button below to complete the purchase."
-                ),
-                reply_markup=build_payment_keyboard(query.from_user.id, record),
-                protect_content=True,
-            )
-            await query.answer("Checkout ready.")
-            return
-
-        if ppv_action == "back":
-            await query.answer("Returning to PPVs.")
-            if query.message is not None:
-                await query.edit_message_text("PPV menu closed.")
-            return
-
-        await query.answer("Unknown PPV action.", show_alert=True)
-        return
-
-    if not callback_is_from_admin_surface(state, query):
-        await query.answer("Not allowed.", show_alert=True)
-        return
-
-    if data.startswith("q:"):
-        _, _, rest = data.partition(":")
-        phrase_key, _, user_id_text = rest.partition(":")
-        if not user_id_text.isdigit():
-            await query.answer("Invalid phrase action.", show_alert=True)
-            return
-        user_id = int(user_id_text)
-        record = get_user_record(state, user_id)
-        if not is_access_active(record):
-            await query.answer("This buyer does not have active access.", show_alert=True)
-            return
-        target_chat_id = get_buyer_chat_id(record, user_id)
-        if phrase_key == "price_reply":
-            response_text = build_budget_reply_message(record)
-        else:
-            phrase = get_quick_phrase(phrase_key)
-            if phrase is None or phrase.get("text") is None:
-                await query.answer("That phrase no longer exists.", show_alert=True)
-                return
-            response_text = str(phrase["text"])
-        await context.bot.send_message(chat_id=target_chat_id, text=response_text, protect_content=True)
-        await query.answer("Phrase sent.")
-        if query.message.chat.type == "supergroup":
-            await context.bot.send_message(
-                chat_id=query.message.chat.id,
-                message_thread_id=query.message.message_thread_id,
-                text=f"Sent quick reply:\n{response_text}",
-            )
-        return
-
-    if data.startswith("adm:"):
-        parts = data.split(":")
-        admin_action = parts[1] if len(parts) > 1 else ""
-
-        if admin_action == "home":
-            await query.edit_message_text(
-                format_admin_home(state),
-                reply_markup=build_admin_home_keyboard(),
-            )
-            await query.answer("Dashboard refreshed.")
-            return
-
-        if admin_action == "pending":
-            mode = parts[2] if len(parts) > 2 else "all"
-            await send_queue_cards(context.bot, query.message.chat.id, state, mode)
-            await query.answer("List sent.")
-            return
-
-        if admin_action == "expiring":
-            await send_expiring_cards(context.bot, query.message.chat.id, state)
-            await query.answer("Expiring list sent.")
-            return
-
-        if admin_action == "digest":
-            await context.bot.send_message(
-                chat_id=query.message.chat.id,
-                text=format_admin_digest(state),
-                reply_markup=build_admin_home_keyboard(),
-            )
-            await query.answer("Digest sent.")
-            return
-
-        if admin_action == "help":
-            await context.bot.send_message(
-                chat_id=query.message.chat.id,
-                text=format_admin_help(),
-                reply_markup=build_admin_home_keyboard(),
-            )
-            await query.answer("Help sent.")
-            return
-
-        if admin_action == "sync":
-            if not ofauth_is_configured():
-                await query.answer("OFAuth is not configured.", show_alert=True)
-                return
-            await query.answer("Syncing OnlyFans...")
-            log_event("ofauth_sync_started", trigger="dashboard")
             try:
-                summary = await asyncio.to_thread(sync_subscribers, state)
-            except Exception as exc:
-                LOGGER.exception("OFAuth sync failed from admin dashboard.")
-                log_event("ofauth_sync_failed", logging.ERROR, trigger="dashboard")
-                await context.bot.send_message(
-                    chat_id=query.message.chat.id,
-                    text=f"OnlyFans sync failed: {exc}",
-                    reply_markup=build_admin_home_keyboard(),
-                )
-                return
-            save_state(state)
-            log_event(
-                "ofauth_sync_completed",
-                trigger="dashboard",
-                active_seen=summary.get("active_subscribers_seen"),
-                matched=summary.get("matched"),
-                renewed=summary.get("renewed"),
-                expired=summary.get("expired"),
-                inactive=summary.get("inactive"),
-                partial=bool(summary.get("warnings")),
-            )
-            await context.bot.send_message(
-                chat_id=query.message.chat.id,
-                text=format_sync_summary(summary),
-                reply_markup=build_admin_home_keyboard(),
-            )
-            expired_alert = format_expired_access_alert(summary)
-            if expired_alert:
-                await context.bot.send_message(
-                    chat_id=query.message.chat.id,
-                    text=expired_alert,
-                    reply_markup=build_admin_home_keyboard(),
-                )
-            return
-
-        if admin_action == "notify_unverified":
-            summary = await notify_unverified_low_priority_users(context.bot, state)
-            save_state(state)
-            log_event(
-                "unverified_users_notified",
-                trigger="dashboard",
-                notified=summary["notified"],
-                failed=summary["failed"],
-                skipped=summary["skipped"],
-            )
-            await context.bot.send_message(
-                chat_id=query.message.chat.id,
-                text=(
-                    "Unverified low-priority users notified.\n\n"
-                    f"Sent: {summary['notified']}\n"
-                    f"Failed: {summary['failed']}"
-                ),
-                reply_markup=build_admin_home_keyboard(),
-            )
-            await query.answer("Notification pass complete.")
-            return
-
-        await query.answer("Unknown admin action.", show_alert=True)
-        return
-
-    action, _, user_id_text = data.partition(":")
-    if not user_id_text.isdigit():
-        await query.answer("Invalid action.", show_alert=True)
-        return
-
-    user_id = int(user_id_text)
-    record = get_user_record(state, user_id)
-
-    if action == "st":
-        markup = build_user_action_keyboard(user_id, record)
-        await context.bot.send_message(
-            chat_id=query.message.chat.id,
-            text=format_detailed_status_message(user_id, record),
-            reply_markup=markup,
-        )
-        await query.answer("Details sent.")
-        return
-
-    if action == "ul":
-        if record.get("status") != "approved" or str(record.get("payment_status") or "").strip().lower() != "paid":
-            await query.answer("Mark payment as paid first.", show_alert=True)
-            return
-        cart = get_ppv_cart(record)
-        if cart:
-            total = 0
-            delivered_labels: list[str] = []
-            delivered_counts = get_ppv_delivery_history(record)
-            for item_key in cart:
-                item = get_ppv_items(state).get(item_key)
-                if item is None:
-                    continue
-                base_key = str(item.get("sequence_key") or item_key).strip() or item_key
-                delivery_count = int(delivered_counts.get(base_key, 0))
-                delivery_key = resolve_ppv_sequence_item_key(state, item_key, delivery_count)
-                if delivery_key is None:
-                    continue
-                delivery_item = get_ppv_items(state).get(delivery_key)
-                if delivery_item is None:
-                    continue
-                await deliver_ppv_item(
+                await send_paypal_checkout_message(
                     context.bot,
                     state,
                     user_id,
-                    delivery_key,
-                    target_chat_id=get_buyer_chat_id(record, user_id),
+                    record,
+                    amount=total,
+                    currency=currency,
+                    description="PPV cart checkout",
+                    text=(
+                        f"Payment ready\n\nAmount due: {format_currency_amount(total, currency)}\n\n"
+                        "Tap PayPal below to complete the purchase."
+                    ),
+                    target_chat_id=buyer_chat_id,
                 )
-                delivered_labels.append(build_ppv_item_label(delivery_key, delivery_item))
-                delivered_counts[base_key] = delivery_count + 1
-                record.setdefault("content_unlocks", []).append(
-                    {
-                        "item_key": delivery_key,
-                        "delivered_at": to_iso(utc_now()),
-                    }
-                )
-                if isinstance(delivery_item.get("price"), int):
-                    total += int(delivery_item["price"])
-            record["ppv_selected_item_key"] = cart[0]
-            first_item = get_ppv_items(state).get(cart[0])
-            record["ppv_selected_item_title"] = first_item.get("title") if first_item else None
-            record["ppv_selected_item_price"] = first_item.get("price") if first_item else None
-            record["ppv_cart"] = []
-            save_state(state)
-            await query.answer("PPVs unlocked.")
-            message_kwargs: dict[str, Any] = {}
-            if query.message.chat.type == "supergroup":
-                message_kwargs["message_thread_id"] = query.message.message_thread_id
-            await context.bot.send_message(
-                chat_id=query.message.chat.id,
-                text=f"Unlocked PPVs: {', '.join(delivered_labels)}",
-                **message_kwargs,
-            )
-            return
-        if not get_vault_items(state):
-            await query.answer("No vault items are registered yet.", show_alert=True)
-            return
-        await send_vault_picker(
-            context.bot,
-            query.message.chat.id,
-            state,
-            user_id,
-            message_thread_id=query.message.message_thread_id if query.message.chat.type == "supergroup" else None,
-        )
-        await query.answer("Pick a vault item.")
-        return
-
-    if action == "vk":
-        item_key, _, unlock_user_id_text = user_id_text.partition(":")
-        if not unlock_user_id_text.isdigit():
-            await query.answer("Invalid vault item.", show_alert=True)
-            return
-        unlock_user_id = int(unlock_user_id_text)
-        unlock_record = get_user_record(state, unlock_user_id)
-        if unlock_record.get("status") != "approved" or str(unlock_record.get("payment_status") or "").strip().lower() != "paid":
-            await query.answer("Mark payment as paid first.", show_alert=True)
-            return
-        item = get_vault_items(state).get(item_key)
-        if item is None:
-            await query.answer("That vault item is no longer registered.", show_alert=True)
-            return
-        target_chat_id = (
-            int(unlock_record.get("test_mode_chat_id"))
-            if unlock_record.get("test_mode") and unlock_record.get("test_mode_chat_id") is not None
-            else None
-        )
-        await deliver_vault_item(
-            context.bot,
-            state,
-            unlock_user_id,
-            item_key,
-            target_chat_id=target_chat_id,
-        )
-        unlock_record.setdefault("content_unlocks", []).append(
-            {
-                "item_key": item_key,
-                "delivered_at": to_iso(utc_now()),
-            }
-        )
-        save_state(state)
-        await query.answer("Content unlocked.")
-        message_kwargs: dict[str, Any] = {}
-        if query.message.chat.type == "supergroup":
-            message_kwargs["message_thread_id"] = query.message.message_thread_id
-        await context.bot.send_message(
-            chat_id=query.message.chat.id,
-            text=f"Unlocked: {build_vault_item_label(item_key, item)}",
-            **message_kwargs,
-        )
-        return
-
-    if action == "pay":
-        if record.get("status") != "approved":
-            await query.answer("Only approved buyers can receive the payment link.", show_alert=True)
-            return
-        payment_chat_id = int(record.get("test_mode_chat_id") or 0) or None
+                await query.answer("PayPal checkout sent.")
+                if query.message.chat.type == "supergroup":
+                    await context.bot.send_message(
+                        chat_id=query.message.chat.id,
+                        message_thread_id=query.message.message_thread_id,
+                        text="PayPal checkout sent.",
+                    )
+                return
+            except Exception:
+                LOGGER.exception("PayPal checkout creation failed for user %s.", user_id)
         await send_and_pin_payment_message(
             context.bot,
             user_id,
             record,
-            target_chat_id=payment_chat_id,
+            target_chat_id=buyer_chat_id,
             callback_user_id=user_id,
         )
         save_state(state)
@@ -3800,6 +4042,83 @@ async def setof_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+async def requestpay_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.effective_chat or not update.message:
+        return
+    if update.effective_chat.type != "private":
+        return
+
+    state = load_state()
+    if is_private_buyer_test_context(state, update):
+        await update.message.reply_text("Exit /testmode first to use /requestpay.")
+        return
+    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
+    if admin_chat_id != update.effective_chat.id:
+        await update.message.reply_text("Open the admin chat first, then use /requestpay there.")
+        return
+
+    if len(context.args) < 2 or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: /requestpay <user_id> <amount> [currency]")
+        return
+
+    user_id = int(context.args[0])
+    try:
+        amount = float(str(context.args[1]).strip())
+    except ValueError:
+        await update.message.reply_text("Amount must be a number.")
+        return
+    if amount <= 0:
+        await update.message.reply_text("Amount must be above zero.")
+        return
+
+    currency = str(context.args[2]).strip().upper() if len(context.args) > 2 else "USD"
+    record = get_user_record(state, user_id)
+    record["payment_due_amount"] = int(amount) if amount.is_integer() else amount
+    record["payment_currency"] = currency or "USD"
+    record["payment_status"] = "requested"
+    record["payment_requested_at"] = to_iso(utc_now())
+    record["payment_confirmed_at"] = None
+    record["paypal_order_id"] = None
+    save_state(state)
+    log_event("payment_requested_amount_set", buyer_id=user_id, trigger="command", amount=record["payment_due_amount"], currency=record["payment_currency"])
+    buyer_chat_id = get_buyer_chat_id(record, user_id)
+    amount_text = format_currency_amount(record["payment_due_amount"], record["payment_currency"])
+    try:
+        if paypal_is_configured():
+            await send_paypal_checkout_message(
+                context.bot,
+                state,
+                user_id,
+                record,
+                amount=record["payment_due_amount"],
+                currency=record["payment_currency"],
+                description="Payment request",
+                text=(
+                    f"Payment ready\n\nAmount due: {amount_text}\n\n"
+                    "Tap PayPal below to complete the purchase."
+                ),
+                target_chat_id=buyer_chat_id,
+            )
+        else:
+            await send_and_pin_payment_message(
+                context.bot,
+                user_id,
+                record,
+                target_chat_id=buyer_chat_id,
+                callback_user_id=user_id,
+            )
+    except Exception as exc:
+        LOGGER.exception("Could not send payment request for user %s.", user_id)
+        await update.message.reply_text(
+            f"Set payment request for {user_id} to {amount_text}, but I couldn't send the payment card: {exc}"
+        )
+        return
+
+    await update.message.reply_text(
+        f"Set payment request for {user_id} to {amount_text} and sent the payment card."
+    )
+
+
 async def ofdiag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.effective_chat or not update.message:
         return
@@ -3979,7 +4298,7 @@ async def ppvhelp_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text(format_operator_help())
 
 
-async def reprioritize(update: Update, context: Types.DEFAULT_TYPE, new_priority: str) -> None:
+async def reprioritize(update: Update, context: ContextTypes.DEFAULT_TYPE, new_priority: str) -> None:
     if not update.effective_user or not update.effective_chat or not update.message:
         return
     if update.effective_chat.type != "private":
@@ -4414,6 +4733,7 @@ def main() -> None:
     app.add_handler(CommandHandler("trash", trash_manual))
     app.add_handler(CommandHandler("renew", renew_manual))
     app.add_handler(CommandHandler("senddirect", senddirect_manual))
+    app.add_handler(CommandHandler("requestpay", requestpay_manual))
     app.add_handler(CommandHandler("revoke", revoke_manual))
     app.add_handler(CommandHandler("removeuser", removeuser_manual))
     app.add_handler(CommandHandler("vaultregister", vaultregister_manual))
@@ -4441,7 +4761,11 @@ def main() -> None:
     app.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, non_text_message))
 
     log_event("bot_started")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    start_paypal_webhook_server(loop, app.bot)
+    try:
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
+    finally:
+        stop_paypal_webhook_server()
 
 
 if __name__ == "__main__":
