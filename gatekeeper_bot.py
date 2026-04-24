@@ -162,10 +162,6 @@ TEMPLATES = {
     "low_priority": (
         "Your request is saved in my slower review queue. You do not need to resend anything."
     ),
-    "not_fit": (
-        "Thanks for reaching out. I do not think this is the right fit, "
-        "so I will not be moving forward."
-    ),
     "banned": "This request is closed. Do not contact this bot again.",
     "rejected": "Sorry, this request was not approved.",
     "payment_reminder": (
@@ -997,7 +993,6 @@ def build_admin_review_keyboard(user_id: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("📩 Direct", callback_data=f"ad:{user_id}"),
             ],
             [
-                InlineKeyboardButton("🪫 Not a Fit", callback_data=f"nf:{user_id}"),
                 InlineKeyboardButton("❌ Reject", callback_data=f"r:{user_id}"),
             ],
             [
@@ -1360,6 +1355,7 @@ def format_admin_help() -> str:
         "/reject <user_id>\n"
         "/priority <user_id>\n"
         "/lowpriority <user_id>\n"
+        "/setof <user_id> <onlyfans_username>\n"
         "/renew <user_id>\n"
         "/senddirect <user_id>\n"
         "/revoke <user_id>\n"
@@ -1401,6 +1397,8 @@ def format_operator_help() -> str:
         "Use a sequence key if you want repeat purchases to move to the next item in line.\n\n"
         "PPV add example:\n"
         "/ppvadd dickpic_01 250 line:dickpic Dickpic 01\n\n"
+        "OnlyFans:\n"
+        "/setof <user_id> <onlyfans_username>\n\n"
         "PayPal:\n"
         "The current setup is a payment link button. Full PayPal automation needs a checkout app or webhook that confirms payment back into the bot."
     )
@@ -1671,8 +1669,7 @@ def format_admin_digest(state: dict[str, Any]) -> str:
     add_section("Expired", expired_rows)
 
     banned_count = sum(1 for _, record in users if record.get("status") == "banned")
-    not_fit_count = sum(1 for _, record in users if record.get("status") == "not_fit")
-    sections.extend(["", f"Closed: {not_fit_count} not fit, {banned_count} banned."])
+    sections.extend(["", f"Closed: {banned_count} banned."])
     sections.append("Use /pending, /status <user_id>, or the admin buttons for action.")
     return "\n".join(sections)
 
@@ -3399,22 +3396,6 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await query.answer("Banned.")
         return
 
-    if action == "nf":
-        record["status"] = "not_fit"
-        record["not_fit_at"] = to_iso(utc_now())
-        save_state(state)
-        log_event("not_fit", buyer_id=user_id, trigger="button")
-        try:
-            await context.bot.send_message(
-                chat_id=get_buyer_chat_id(record, user_id),
-                text=template("not_fit"),
-            )
-        except Exception:
-            LOGGER.exception("Could not notify not-fit user %s.", user_id)
-        await query.edit_message_text(format_review_card(user_id, record, "Closed as not a fit"))
-        await query.answer("Closed as not a fit.")
-        return
-
     if action == "paid":
         if record.get("status") != "approved":
             await query.answer("Only approved buyers can be marked paid.", show_alert=True)
@@ -3781,6 +3762,42 @@ async def verifyof(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if verification_result.get("reason"):
             lines.append(f"Reason: {verification_result['reason']}")
     await update.message.reply_text("\n".join(lines))
+
+
+async def setof_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.effective_chat or not update.message:
+        return
+    if update.effective_chat.type != "private":
+        return
+
+    state = load_state()
+    if is_private_buyer_test_context(state, update):
+        return
+    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
+    if admin_chat_id != update.effective_chat.id:
+        return
+
+    if len(context.args) < 2 or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: /setof <user_id> <onlyfans_username>")
+        return
+
+    user_id = int(context.args[0])
+    claimed_username = normalize_of_username(" ".join(context.args[1:]))
+    if not claimed_username:
+        await update.message.reply_text("Usage: /setof <user_id> <onlyfans_username>")
+        return
+
+    record = get_user_record(state, user_id)
+    record["of_username"] = claimed_username
+    record["subscription_status"] = "unknown"
+    record["subscription_expires_at"] = None
+    record["onlyfans_user_id"] = None
+    record["last_checked_at"] = None
+    save_state(state)
+    log_event("onlyfans_username_updated", buyer_id=user_id, trigger="command")
+    await update.message.reply_text(
+        f"Updated OnlyFans username for {user_id} to {claimed_username}."
+    )
 
 
 async def ofdiag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4413,6 +4430,7 @@ def main() -> None:
     app.add_handler(CommandHandler("testmode", testmode))
     app.add_handler(CommandHandler("testreset", testreset))
     app.add_handler(CommandHandler("verifyof", verifyof))
+    app.add_handler(CommandHandler("setof", setof_manual))
     app.add_handler(CommandHandler("ofdiag", ofdiag))
     app.add_handler(CallbackQueryHandler(button_click))
     app.add_handler(
