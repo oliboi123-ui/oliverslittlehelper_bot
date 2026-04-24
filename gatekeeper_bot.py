@@ -949,6 +949,52 @@ def get_payment_item_keys(record: dict[str, Any] | None) -> list[str]:
     return keys
 
 
+def get_payment_alert_chat_id(state: dict[str, Any], record: dict[str, Any]) -> int | None:
+    if record.get("test_mode"):
+        relay_group_id = get_relay_group_id()
+        if relay_group_id is not None:
+            return int(relay_group_id)
+    admin_chat_id = state.get("admin_chat_id")
+    if admin_chat_id is not None:
+        try:
+            return int(admin_chat_id)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+async def send_manual_release_request(
+    bot: Any,
+    state: dict[str, Any],
+    user_id: int,
+    record: dict[str, Any],
+    *,
+    heading: str,
+    reason: str,
+    order_id: str | None = None,
+) -> None:
+    admin_chat_id = get_payment_alert_chat_id(state, record)
+    if admin_chat_id is None:
+        LOGGER.warning("No admin chat available for manual release request: %s", reason)
+        return
+    alert_lines = [
+        heading,
+        "",
+        format_review_card(user_id, record, heading),
+        "",
+        f"Reason: {reason}",
+    ]
+    if order_id:
+        alert_lines.append(f"Order: {order_id}")
+    alert_lines.append("Please press Unlock content if this payment should release a PPV now.")
+    await bot.send_message(
+        chat_id=admin_chat_id,
+        text="\n".join(alert_lines),
+        reply_markup=build_post_approval_keyboard(user_id, record),
+        protect_content=True,
+    )
+
+
 async def fulfill_paid_content(
     bot: Any,
     state: dict[str, Any],
@@ -958,8 +1004,6 @@ async def fulfill_paid_content(
     order_id: str | None = None,
     target_chat_id: int | None = None,
 ) -> list[str]:
-    if get_payment_context(record) != "ppv":
-        return []
     ensure_content_delivery_allowed(record)
 
     current_order_id = clean_text(order_id or record.get("paypal_order_id"), empty="")
@@ -972,6 +1016,16 @@ async def fulfill_paid_content(
     if not item_keys and clean_text(record.get("ppv_selected_item_key"), empty=""):
         item_keys = [clean_text(record.get("ppv_selected_item_key"), empty="")]
     if not item_keys:
+        if get_payment_context(record) == "ppv":
+            await send_manual_release_request(
+                bot,
+                state,
+                user_id,
+                record,
+                heading="PPV release needs review",
+                reason="Payment was confirmed, but no PPV item was attached to this order.",
+                order_id=current_order_id or record.get("paypal_order_id"),
+            )
         return []
 
     orders = get_paypal_orders(state)
@@ -1017,6 +1071,15 @@ async def fulfill_paid_content(
             order_entry["delivery_status"] = "failed"
             order_entry["delivery_failed_at"] = to_iso(utc_now())
         save_state(state)
+        await send_manual_release_request(
+            bot,
+            state,
+            user_id,
+            record,
+            heading="PPV release failed",
+            reason="The bot confirmed payment but failed while sending the content.",
+            order_id=current_order_id or record.get("paypal_order_id"),
+        )
         raise
 
     record["payment_fulfilled_at"] = to_iso(utc_now())
