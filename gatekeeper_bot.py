@@ -3515,6 +3515,37 @@ async def send_relay_contact(
     return topic_id, topic_name
 
 
+async def send_testmode_contact(
+    bot: Any,
+    state: dict[str, Any],
+    user_id: int,
+    record: dict[str, Any],
+    *,
+    now: datetime | None = None,
+    target_chat_id: int | None = None,
+) -> tuple[str, str]:
+    try:
+        await send_relay_contact(
+            bot,
+            state,
+            user_id,
+            record,
+            now=now,
+            target_chat_id=target_chat_id,
+        )
+        return "relay", "Test mode started in relay mode."
+    except Exception as exc:
+        LOGGER.exception("Test buyer relay setup failed, falling back to direct mode.")
+        await send_direct_contact(
+            bot,
+            user_id,
+            record,
+            now=now,
+            target_chat_id=target_chat_id,
+        )
+        return "direct", f"Test mode started in direct fallback because relay was unavailable: {exc}"
+
+
 def get_relay_user_id(state: dict[str, Any], topic_id: int | None) -> int | None:
     if topic_id is None:
         return None
@@ -4772,19 +4803,15 @@ async def testmode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     save_state(state)
     log_event("test_mode_started", buyer_id=update.effective_user.id, mode="buyer")
     record = get_active_private_record(state, update.effective_user)
-    try:
-        await send_relay_contact(
-            context.bot,
-            state,
-            int(record.get("test_mode_buyer_user_id") or update.effective_user.id),
-            record,
-            now=utc_now(),
-        )
-    except Exception as exc:
-        LOGGER.exception("Test buyer relay setup failed.")
-        await update.message.reply_text(f"Test mode started, but relay setup failed: {exc}")
-        return
+    _, status_message = await send_testmode_contact(
+        context.bot,
+        state,
+        int(record.get("test_mode_buyer_user_id") or update.effective_user.id),
+        record,
+        now=utc_now(),
+    )
     save_state(state)
+    await update.message.reply_text(status_message)
 
 
 async def testmodefull(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4821,19 +4848,15 @@ async def testreset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     log_event("test_mode_reset", buyer_id=update.effective_user.id, mode=mode)
     if mode == "buyer":
         record = get_active_private_record(state, update.effective_user)
-        try:
-            await send_relay_contact(
-                context.bot,
-                state,
-                int(record.get("test_mode_buyer_user_id") or update.effective_user.id),
-                record,
-                now=utc_now(),
-            )
-        except Exception as exc:
-            LOGGER.exception("Test buyer relay reset failed.")
-            await update.message.reply_text(f"Test mode reset, but relay setup failed: {exc}")
-            return
+        _, status_message = await send_testmode_contact(
+            context.bot,
+            state,
+            int(record.get("test_mode_buyer_user_id") or update.effective_user.id),
+            record,
+            now=utc_now(),
+        )
         save_state(state)
+        await update.message.reply_text(status_message.replace("started", "reset"))
         return
     await start(update, context)
 
