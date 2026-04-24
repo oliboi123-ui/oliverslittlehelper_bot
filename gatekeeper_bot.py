@@ -1599,24 +1599,40 @@ async def send_paypal_checkout_message(
     payment_context: str = "manual",
     payment_item_keys: list[str] | None = None,
 ) -> None:
-    order_id, approval_url = await asyncio.to_thread(
-        paypal_create_order,
-        state,
-        user_id,
-        amount=amount,
-        currency=currency,
-        description=description,
-        purpose=description[:64],
-    )
     record["payment_due_amount"] = int(amount) if float(amount).is_integer() else float(amount)
     record["payment_currency"] = currency.upper()
-    record["paypal_order_id"] = order_id
-    record["payment_status"] = "pending"
-    record["payment_requested_at"] = to_iso(utc_now())
     record["payment_context"] = clean_text(payment_context, empty="manual").strip().lower() or "manual"
     record["payment_item_keys"] = [clean_text(key, empty="") for key in (payment_item_keys or []) if clean_text(key, empty="")]
     record["payment_fulfilled_at"] = None
     record["payment_fulfilled_order_id"] = None
+    try:
+        order_id, approval_url = await asyncio.to_thread(
+            paypal_create_order,
+            state,
+            user_id,
+            amount=amount,
+            currency=currency,
+            description=description,
+            purpose=description[:64],
+        )
+    except Exception as exc:
+        error_text = str(exc)
+        if "PAYEE_ACCOUNT_RESTRICTED" in error_text or "merchant account is restricted" in error_text.lower():
+            LOGGER.warning("PayPal checkout blocked by restricted merchant account; falling back to manual payment card for user %s.", user_id)
+            await send_and_pin_payment_message(
+                bot,
+                user_id,
+                record,
+                target_chat_id=target_chat_id,
+                callback_user_id=user_id,
+                payment_context=payment_context,
+                payment_item_keys=payment_item_keys,
+            )
+            return
+        raise
+    record["paypal_order_id"] = order_id
+    record["payment_status"] = "pending"
+    record["payment_requested_at"] = to_iso(utc_now())
     save_state(state)
     message = await bot.send_message(
         chat_id=target_chat_id if target_chat_id is not None else user_id,
@@ -3726,11 +3742,11 @@ async def complete_application(
     admin_text = format_review_card(admin_user_id, record, "New gatekeeper request")
     if exact_match_note:
         admin_text = f"{admin_text}\n{exact_match_note}"
-        await context.bot.send_message(
-            chat_id=admin_chat_id,
-            text=admin_text,
-            reply_markup=build_admin_review_keyboard(admin_user_id, record),
-        )
+    await context.bot.send_message(
+        chat_id=admin_chat_id,
+        text=admin_text,
+        reply_markup=build_admin_review_keyboard(admin_user_id, record),
+    )
 
 
 async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
