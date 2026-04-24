@@ -3443,6 +3443,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     state = load_state()
     data = query.data or ""
+    action = data.partition(":")[0]
 
     if data.startswith("budget:"):
         record = get_active_private_record(state, query.from_user)
