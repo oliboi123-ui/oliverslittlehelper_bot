@@ -933,6 +933,7 @@ def build_admin_review_keyboard(user_id: int) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton("⭐ Promising", callback_data=f"label_promising:{user_id}"),
                 InlineKeyboardButton("🧊 Skip", callback_data=f"label_skip:{user_id}"),
+                InlineKeyboardButton("⚠ Dangerous", callback_data=f"label_dangerous:{user_id}"),
             ],
             [
                 InlineKeyboardButton("⬆ Move Up", callback_data=f"p:{user_id}"),
@@ -2653,7 +2654,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await context.bot.send_message(
                 chat_id=query.message.chat.id,
                 message_thread_id=query.message.message_thread_id,
-                text="Sent.",
+                text=f"Sent quick reply:\n{response_text}",
             )
         return
 
@@ -2921,8 +2922,13 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await query.answer("Username retry requested.")
         return
 
-    if action in {"label_promising", "label_skip"}:
-        record["internal_label"] = "promising" if action == "label_promising" else "not_worth_time"
+    if action in {"label_promising", "label_skip", "label_dangerous"}:
+        if action == "label_promising":
+            record["internal_label"] = "promising"
+        elif action == "label_skip":
+            record["internal_label"] = "not_worth_time"
+        else:
+            record["internal_label"] = "dangerous"
         save_state(state)
         log_event("internal_label_set", buyer_id=user_id, label=record["internal_label"])
         await query.edit_message_text(
