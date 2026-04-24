@@ -388,34 +388,53 @@ def starter_keyboard(record: dict[str, Any]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(buttons)
 
 
-def plus_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("best value bundle \U0001f48e", callback_data="menu:plus_bundle")],
-            [InlineKeyboardButton("premium ppvs \U0001f525", callback_data="menu:plus_ppvs")],
+def plus_keyboard(record: dict[str, Any]) -> InlineKeyboardMarkup:
+    if record.get("tier") == TIER_STARTER:
+        rows = [
+            [InlineKeyboardButton("step in with bundle 💎", callback_data="menu:plus_bundle")],
+            [InlineKeyboardButton("step in with premium ppvs 🔥", callback_data="menu:plus_ppvs")],
             [InlineKeyboardButton("back", callback_data="nav:home")],
         ]
-    )
+    else:
+        rows = [
+            [InlineKeyboardButton("best value bundle 💎", callback_data="menu:plus_bundle")],
+            [InlineKeyboardButton("premium ppvs 🔥", callback_data="menu:plus_ppvs")],
+            [InlineKeyboardButton("back", callback_data="nav:home")],
+        ]
+    return InlineKeyboardMarkup(rows)
 
 
-def plus_bundle_keyboard() -> InlineKeyboardMarkup:
+def plus_bundle_keyboard(record: dict[str, Any]) -> InlineKeyboardMarkup:
+    if record.get("tier") == TIER_STARTER:
+        label = "buy bundle + skip to Pro 💎"
+    elif record.get("tier") == TIER_PLUS:
+        label = "buy bundle + open Pro 💎"
+    else:
+        label = CATALOG["plus_bundle"]["button_label"]
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton(CATALOG["plus_bundle"]["button_label"], callback_data="buy:plus_bundle")],
+            [InlineKeyboardButton(label, callback_data="buy:plus_bundle")],
             [InlineKeyboardButton("back", callback_data="menu:plus")],
         ]
     )
 
 
-def plus_ppv_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
+def plus_ppv_keyboard(record: dict[str, Any]) -> InlineKeyboardMarkup:
+    if record.get("tier") == TIER_STARTER:
+        rows = [
+            [InlineKeyboardButton("enter Plus: stroking 🔥", callback_data="buy:plus_ppv_stroking")],
+            [InlineKeyboardButton("enter Plus: ass 🍑", callback_data="buy:plus_ppv_ass")],
+            [InlineKeyboardButton("enter Plus: strip 👕", callback_data="buy:plus_ppv_strip")],
+            [InlineKeyboardButton("back", callback_data="menu:plus")],
+        ]
+    else:
+        rows = [
             [InlineKeyboardButton(CATALOG["plus_ppv_stroking"]["button_label"], callback_data="buy:plus_ppv_stroking")],
             [InlineKeyboardButton(CATALOG["plus_ppv_ass"]["button_label"], callback_data="buy:plus_ppv_ass")],
             [InlineKeyboardButton(CATALOG["plus_ppv_strip"]["button_label"], callback_data="buy:plus_ppv_strip")],
             [InlineKeyboardButton("back", callback_data="menu:plus")],
         ]
-    )
+    return InlineKeyboardMarkup(rows)
 
 
 def pro_keyboard() -> InlineKeyboardMarkup:
@@ -451,7 +470,7 @@ def pro_voice_keyboard() -> InlineKeyboardMarkup:
 def payment_keyboard(settings: Settings, purchase_id: str) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     if settings.payment_url:
-        rows.append([InlineKeyboardButton("open paypal", url=settings.payment_url)])
+        rows.append([InlineKeyboardButton("pay with paypal 💸", url=settings.payment_url)])
     rows.append([InlineKeyboardButton("i've paid \u2705", callback_data=f"paid:{purchase_id}")])
     rows.append([InlineKeyboardButton("my purchases \U0001f4e6", callback_data="menu:purchases")])
     rows.append([InlineKeyboardButton("back", callback_data="nav:home")])
@@ -510,29 +529,35 @@ def current_home_text(record: dict[str, Any]) -> str:
     tier = record.get("tier")
     if tier == TIER_VERIFIED:
         return (
-            "you’re verified \u2705\n"
-            "you’re inside the private menu now.\n\n"
-            "start with Starter to open the first unlock.\n"
-            "Plus and Pro are visible too, but they open as you move through the tiers. "
-            "as you progress, PPV-prices decrease by 25% per tier. buy more, save more :D"
+            "you're verified \u2705\n"
+            "you're inside the private menu now.\n\n"
+            "starter is the first private unlock.\n"
+            "Plus and Pro are visible too, but they open step by step.\n\n"
+            "starter unlock \U0001f5dd\ufe0f\n"
+            "- first paid step\n"
+            "- 3 pics right away\n\n"
+            "as your access grows, lower-tier PPVs get 25% cheaper."
         )
     if tier == TIER_STARTER:
         return (
-            "you’re in Starter \U0001f5dd\ufe0f\n\n"
-            "the first private unlock is open.\n"
-            "Plus comes next with bundles and individual PPVs.\n"
-            "Pro stays visible too, so you can see where the path opens next."
+            "you're in Starter \U0001f5dd\ufe0f\n\n"
+            "your first private unlock is open.\n"
+            "next up is Plus \U0001f48e\n\n"
+            "from here:\n"
+            "- a first Premium PPV moves you into Plus\n"
+            "- the Best Value Bundle skips straight to Pro\n\n"
+            "Pro stays visible too, so the path feels clear."
         )
     if tier == TIER_PLUS:
         return (
-            "you’re in Plus \U0001f48e\n\n"
+            "you're in Plus \U0001f48e\n\n"
             "this is the mid-tier layer.\n"
-            "you can unlock bundles and Premium PPVs here.\n"
-            "one more Plus purchase opens Pro."
+            "bundles and Premium PPVs are open here.\n\n"
+            "one more Plus purchase opens Pro \U0001f525"
         )
     if tier == TIER_PRO:
         return (
-            "you’re in Pro \U0001f525\n\n"
+            "you're in Pro \U0001f525\n\n"
             "you have access to the most personal unlocks now.\n"
             "chat access is open here too, as long as things stay respectful and easygoing."
         )
@@ -549,29 +574,44 @@ def access_text(record: dict[str, Any]) -> str:
         return (
             "your access \U0001f464\n\n"
             "current access: OnlyFans Verified\n\n"
-            "Starter is your first private unlock.\n"
-            "Plus and Pro are visible, but locked for now. PPVs become cheaper as you progress."
+            "unlocked now:\n"
+            "- private menu\n"
+            "- starter path\n\n"
+            "still locked:\n"
+            "- Plus\n"
+            "- Pro\n\n"
+            "PPVs get cheaper as your access grows."
         )
     if tier == TIER_STARTER:
         return (
             "your access \U0001f464\n\n"
             "current access: Starter\n\n"
-            "you’ve opened the first tier.\n"
-            "Plus comes next with bundles and individual PPVs.\n"
-            "Pro opens after Plus."
+            "unlocked now:\n"
+            "- Starter\n"
+            "- first-step private content\n\n"
+            "next:\n"
+            "- Plus with bundles and Premium PPVs\n"
+            "- Pro after that"
         )
     if tier == TIER_PLUS:
         return (
             "your access \U0001f464\n\n"
             "current access: Plus\n\n"
-            "you can unlock Plus items now.\n"
-            "any Plus purchase opens Pro."
+            "unlocked now:\n"
+            "- Plus menu\n"
+            "- Premium PPVs\n"
+            "- bundle access\n\n"
+            "next:\n"
+            "- one more Plus purchase opens Pro"
         )
     if tier == TIER_PRO:
         return (
             "your access \U0001f464\n\n"
             "current access: Pro\n\n"
-            "you have access to Pro products and chat."
+            "unlocked now:\n"
+            "- Pro products\n"
+            "- chat access\n"
+            "- 25% off lower-tier PPVs"
         )
     return "your access \U0001f464\n\nno active access yet."
 
@@ -583,19 +623,23 @@ def rules_text() -> str:
         "purchases are delivered through the bot.\n"
         "chatting is only available at Pro.\n"
         "be respectful and easygoing.\n"
-        "boundaries apply at every tier."
+        "if something needs manual handling, i'll say so clearly."
     )
 
 
 def tier_locked_text(target: str, current_tier: str | None) -> str:
     if target == "plus":
-        return "Plus is locked for now \U0001f512\nstart with Starter first, or wait for manual approval if you’ve bought before."
+        return (
+            "Plus is locked for now \U0001f512\n\n"
+            "start with Starter first,\n"
+            "or wait for manual approval if you've bought before."
+        )
     if target == "pro" and current_tier == TIER_STARTER:
-        return "this is a Pro unlock \U0001f512\nPro opens after a Plus purchase."
+        return "this is a Pro unlock \U0001f512\n\nPro opens after a Plus purchase."
     if target == "pro" and current_tier == TIER_PLUS:
-        return "this opens at Pro \U0001f512\ncomplete any Plus unlock to open Pro access."
+        return "this opens at Pro \U0001f512\n\ncomplete any Plus unlock to open Pro access."
     if target == "chat":
-        return "chat opens at Pro \U0001f4ac\U0001f512\n\nchatting isn’t included yet.\nit unlocks once you reach Pro."
+        return "chat opens at Pro \U0001f4ac\U0001f512\n\nchatting isn't included yet.\nit unlocks once you reach Pro."
     return "this area is locked right now."
 
 
@@ -604,7 +648,7 @@ def what_comes_next_text() -> str:
         "what comes next \U0001f440\n\n"
         "Plus opens the next layer: bundles and individual PPVs.\n"
         "Pro is the highest tier, with the most personal products and chat access.\n\n"
-        "you’ll see more as your access grows."
+        "you'll see more as your access grows."
     )
 
 
@@ -612,49 +656,73 @@ def starter_text(record: dict[str, Any]) -> str:
     if tier_rank(record.get("tier")) >= tier_rank(TIER_STARTER):
         return (
             "starter unlock \U0001f5dd\ufe0f\n\n"
-            "you’ve already opened Starter.\n"
-            "it stays part of your path, but the next real step is Plus."
+            "you already opened Starter.\n"
+            "that part is done.\n\n"
+            "from here, the interesting step is Plus \U0001f48e"
         )
     return (
         "starter unlock \U0001f5dd\ufe0f\n\n"
         "a first private unlock before the higher tiers.\n"
-        "you’ll get 3 randomly selected dickpics from the vault. 2 hard, 1 soft. expect abs :)"
+        "you'll get 3 randomly selected dickpics from the vault.\n"
+        "2 hard, 1 soft.\n\n"
+        "price: $37.00\n"
+        "instant delivery."
     )
 
 
 def plus_text(record: dict[str, Any]) -> str:
     ppv_price = money_text(display_price_cents(record, "plus_ppv_stroking"))
     bundle_price = money_text(display_price_cents(record, "plus_bundle"))
+    if record.get("tier") == TIER_STARTER:
+        return (
+            "plus preview \U0001f48e\n\n"
+            "this is the next layer.\n"
+            "your first Plus buy is also the step that moves you into Plus.\n\n"
+            f"Best Value Bundle: {bundle_price}\n"
+            "- skips straight to Pro\n\n"
+            f"Premium PPVs: {ppv_price} each\n"
+            "- first one moves you into Plus"
+        )
     return (
         "plus menu \U0001f48e\n\n"
         "this is the mid-tier layer.\n"
         "best value bundle comes first, then Premium PPVs.\n\n"
-        f"best value bundle: {bundle_price}\n"
+        f"Best Value Bundle: {bundle_price}\n"
         f"Premium PPVs: {ppv_price} each"
     )
 
 
 def plus_bundle_text(record: dict[str, Any]) -> str:
     price = money_text(display_price_cents(record, "plus_bundle"))
+    if record.get("tier") == TIER_STARTER:
+        extra = "\n\nbuying this skips straight past Plus and puts you into Pro."
+    elif record.get("tier") == TIER_PLUS:
+        extra = "\n\nbuying this opens Pro."
+    else:
+        extra = ""
     return (
         "Best Value Bundle \U0001f48e\n\n"
         "the strongest Plus option.\n"
         "includes 1 stroking video and 1 strip tease.\n\n"
-        "simple bundle, better value, instant unlock.\n\n"
-        f"price: {price}"
+        "two pieces, one cleaner unlock.\n\n"
+        f"price: {price}{extra}"
     )
 
 
 def plus_ppv_text(record: dict[str, Any]) -> str:
     price = money_text(display_price_cents(record, "plus_ppv_stroking"))
-    if tier_rank(record.get("tier")) >= tier_rank(TIER_PRO):
+    if record.get("tier") == TIER_STARTER:
+        suffix = "\n\nfirst Premium PPV = entry into Plus."
+    elif record.get("tier") == TIER_PLUS:
+        suffix = "\n\none more Plus purchase opens Pro."
+    elif tier_rank(record.get("tier")) >= tier_rank(TIER_PRO):
         suffix = "\n\nas Pro, your Plus PPVs are 25% cheaper."
     else:
         suffix = ""
     return (
         "Premium PPVs \U0001f525\n\n"
         "individual Plus unlocks.\n"
-        "pick the type you want and unlock it instantly.\n\n"
+        "pick the type you want.\n\n"
         f"current price: {price} each{suffix}"
     )
 
@@ -663,7 +731,8 @@ def pro_text() -> str:
     return (
         "pro menu \U0001f525\n\n"
         "this is the highest tier.\n"
-        "you can unlock the most personal items here, and chat access opens at this level."
+        "the most personal items sit here.\n"
+        "chat access opens at this level too."
     )
 
 
@@ -688,7 +757,7 @@ def pro_voice_text(record: dict[str, Any]) -> str:
 def pro_chat_text() -> str:
     return (
         "Pro chat access \U0001f4ac\n\n"
-        "since you’ve reached Pro, you can chat directly.\n"
+        "since you've reached Pro, you can chat directly.\n"
         "keep it respectful and easygoing."
     )
 
@@ -699,12 +768,20 @@ def purchase_lines(record: dict[str, Any]) -> list[str]:
     if not purchases:
         lines.append("no purchases yet.")
         return lines
+    status_icons = {
+        "awaiting_payment": "\U0001f4b8",
+        "payment_claimed": "\u23f3",
+        "paid": "\u2705",
+        "pending_manual": "\U0001f6e0\ufe0f",
+        "fulfilled": "\U0001f381",
+    }
     for purchase in reversed(purchases[-12:]):
         status = purchase.get("status", "unknown")
         title = purchase.get("title", "item")
         amount = money_text(int(purchase.get("price_cents", 0)))
         requested_at = format_dt(purchase.get("requested_at"))
-        lines.append(f"- {title} | {amount} | {status} | {requested_at}")
+        icon = status_icons.get(status, "\U0001f4cc")
+        lines.append(f"{icon} {title} - {amount} - {status} - {requested_at}")
     return lines
 
 
@@ -954,21 +1031,21 @@ async def handle_buyer_menu(query: Any, record: dict[str, Any]) -> None:
         if not can_open_plus(record):
             await edit_buyer_view(query, tier_locked_text("plus", tier), simple_back_keyboard("home"))
             return
-        await edit_buyer_view(query, plus_text(record), plus_keyboard())
+        await edit_buyer_view(query, plus_text(record), plus_keyboard(record))
         return
 
     if destination == "plus_bundle":
         if not can_open_plus(record):
             await edit_buyer_view(query, tier_locked_text("plus", tier), simple_back_keyboard("home"))
             return
-        await edit_buyer_view(query, plus_bundle_text(record), plus_bundle_keyboard())
+        await edit_buyer_view(query, plus_bundle_text(record), plus_bundle_keyboard(record))
         return
 
     if destination == "plus_ppvs":
         if not can_open_plus(record):
             await edit_buyer_view(query, tier_locked_text("plus", tier), simple_back_keyboard("home"))
             return
-        await edit_buyer_view(query, plus_ppv_text(record), plus_ppv_keyboard())
+        await edit_buyer_view(query, plus_ppv_text(record), plus_ppv_keyboard(record))
         return
 
     if destination == "pro":
@@ -1473,7 +1550,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 "payment request\n\n"
                 f"{purchase['title']}\n"
                 f"amount due: {money_text(int(purchase['price_cents']))}\n\n"
-                "simple, instant, and no pressure."
+                "tap paypal when you're ready.\n\ni'll keep track of this here."
             ),
             reply_markup=payment_keyboard(settings, purchase["purchase_id"]),
         )
@@ -1506,7 +1583,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await query.edit_message_text(
             text=(
                 "got it.\n\n"
-                "i’ve marked your payment as claimed and i’m checking it now."
+                "i've marked your payment as claimed and i'm checking it now."
             ),
             reply_markup=main_menu_keyboard(),
         )
