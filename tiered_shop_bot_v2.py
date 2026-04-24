@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from dataclasses import dataclass
@@ -141,6 +142,7 @@ def build_application(settings: Settings) -> Application:
 def main() -> None:
     settings = load_settings()
     LOGGER.info("starting v2 bot; test_only_mode=%s", settings.test_only_mode)
+    asyncio.set_event_loop(asyncio.new_event_loop())
     application = build_application(settings)
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
