@@ -1067,6 +1067,29 @@ def paypal_create_order(
     return order_id, approval_url
 
 
+def paypal_capture_order(order_id: str) -> dict[str, Any]:
+    if not paypal_is_configured():
+        raise RuntimeError("PayPal checkout is not configured.")
+    token = paypal_get_access_token()
+    request = urllib_request.Request(
+        get_paypal_api_base().rstrip("/") + f"/v2/checkout/orders/{urllib_parse.quote(order_id)}/capture",
+        data=b"{}",
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "PayPal-Request-Id": f"{order_id}-{uuid.uuid4().hex}",
+        },
+    )
+    try:
+        with urllib_request.urlopen(request, timeout=30) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib_error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"PayPal order capture failed ({exc.code}): {detail}") from exc
+
+
 def paypal_verify_webhook(raw_body: bytes, headers: Any) -> dict[str, Any]:
     if not paypal_is_configured():
         raise RuntimeError("PayPal webhook verification is not configured.")
@@ -1118,6 +1141,10 @@ def paypal_mark_payment_complete(state: dict[str, Any], order_id: str, event: di
     if user_id is None:
         return None
     record = get_user_record(state, user_id)
+    if record.get("payment_status") == "paid":
+        orders.pop(order_id, None)
+        save_state(state)
+        return None
     record["payment_status"] = "paid"
     record["payment_confirmed_at"] = to_iso(utc_now())
     record["payment_due_amount"] = record.get("payment_due_amount")
@@ -1128,6 +1155,18 @@ def paypal_mark_payment_complete(state: dict[str, Any], order_id: str, event: di
     orders.pop(order_id, None)
     save_state(state)
     return user_id, record
+
+
+def paypal_find_order_state(state: dict[str, Any], order_id: str) -> tuple[int, dict[str, Any]] | None:
+    orders = get_paypal_orders(state)
+    order_entry = orders.get(order_id)
+    if order_entry and str(order_entry.get("user_id") or "").isdigit():
+        user_id = int(order_entry["user_id"])
+        return user_id, get_user_record(state, user_id)
+    for raw_user_id, record in state.get("users", {}).items():
+        if str(record.get("paypal_order_id") or "") == order_id:
+            return int(raw_user_id), record
+    return None
 
 
 def paypal_notify_payment_complete(state: dict[str, Any], user_id: int, record: dict[str, Any], event: dict[str, Any]) -> None:
@@ -1187,17 +1226,80 @@ class PaypalWebhookHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _render_return_page(self, title: str, message: str) -> str:
+        return (
+            "<html><head>"
+            "<meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+            "<script>try{history.replaceState(null,'',location.pathname);}catch(e){}</script>"
+            "</head><body>"
+            f"<h1>{title}</h1>"
+            f"<p>{message}</p>"
+            "</body></html>"
+        )
+
     def do_GET(self) -> None:
         if self.path.startswith("/paypal/return"):
+            parsed = urllib_parse.urlsplit(self.path)
+            query = urllib_parse.parse_qs(parsed.query)
+            order_id = str((query.get("token") or [""])[0]).strip()
+            if order_id:
+                state = load_state()
+                order_state = paypal_find_order_state(state, order_id)
+                if order_state is not None:
+                    user_id, record = order_state
+                    if record.get("payment_status") == "paid":
+                        self._send_html(
+                            HTTPStatus.OK,
+                            self._render_return_page(
+                                "Payment confirmed",
+                                "Your payment has been confirmed. You can close this page and return to Telegram.",
+                            ),
+                        )
+                        return
+                    try:
+                        capture_payload = paypal_capture_order(order_id)
+                        if str(capture_payload.get("status") or "").upper() == "COMPLETED":
+                            fresh_state = load_state()
+                            result = paypal_mark_payment_complete(fresh_state, order_id, capture_payload)
+                            if result is not None:
+                                notify_user_id, notify_record = result
+                                paypal_notify_payment_complete(load_state(), notify_user_id, notify_record, capture_payload)
+                                self._send_html(
+                                    HTTPStatus.OK,
+                                    self._render_return_page(
+                                        "Payment confirmed",
+                                        "Your payment has been confirmed. You can close this page and return to Telegram.",
+                                    ),
+                                )
+                                return
+                            confirmed_state = paypal_find_order_state(load_state(), order_id)
+                            if confirmed_state is not None and confirmed_state[1].get("payment_status") == "paid":
+                                self._send_html(
+                                    HTTPStatus.OK,
+                                    self._render_return_page(
+                                        "Payment confirmed",
+                                        "Your payment has been confirmed. You can close this page and return to Telegram.",
+                                    ),
+                                )
+                                return
+                    except Exception:
+                        LOGGER.exception("PayPal return capture failed for order %s.", order_id)
             self._send_html(
                 HTTPStatus.OK,
-                "<html><body><h1>Payment received</h1><p>You can close this page and return to Telegram.</p></body></html>",
+                self._render_return_page(
+                    "Payment processing",
+                    "Your payment is being confirmed now. You can close this page and return to Telegram.",
+                ),
             )
             return
         if self.path.startswith("/paypal/cancel"):
             self._send_html(
                 HTTPStatus.OK,
-                "<html><body><h1>Payment cancelled</h1><p>You can return to Telegram.</p></body></html>",
+                self._render_return_page(
+                    "Payment cancelled",
+                    "Your payment was cancelled. You can return to Telegram.",
+                ),
             )
             return
         self._send_text(HTTPStatus.OK, "OK")
