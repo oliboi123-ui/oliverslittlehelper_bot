@@ -906,8 +906,6 @@ def build_payment_keyboard(
         rows = [[InlineKeyboardButton("Pay with PayPal", callback_data=f"pay:{callback_ref}")]]
     else:
         rows = [[InlineKeyboardButton("Pay with PayPal", url=get_payment_url())]]
-    if callback_ref is not None:
-        rows.append([InlineKeyboardButton("Browse PPVs", callback_data=f"ppv:menu:{callback_ref}")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -995,6 +993,17 @@ async def send_manual_release_request(
     )
 
 
+def ppv_request_record_update(record: dict[str, Any], item_key: str, item: dict[str, Any]) -> None:
+    price = item.get("price")
+    record["payment_context"] = "ppv"
+    record["payment_item_keys"] = [item_key]
+    record["ppv_cart"] = [item_key]
+    record["ppv_selected_item_key"] = item_key
+    record["ppv_selected_item_title"] = clean_text(item.get("title"), empty=item_key)
+    record["ppv_selected_item_price"] = price if isinstance(price, (int, float)) else None
+    record["payment_due_amount"] = price if isinstance(price, (int, float)) else None
+
+
 async def fulfill_paid_content(
     bot: Any,
     state: dict[str, Any],
@@ -1015,8 +1024,14 @@ async def fulfill_paid_content(
         item_keys = get_ppv_cart(record)[:]
     if not item_keys and clean_text(record.get("ppv_selected_item_key"), empty=""):
         item_keys = [clean_text(record.get("ppv_selected_item_key"), empty="")]
+    is_ppv_payment = (
+        get_payment_context(record) == "ppv"
+        or bool(get_payment_item_keys(record))
+        or bool(get_ppv_cart(record))
+        or bool(clean_text(record.get("ppv_selected_item_key"), empty=""))
+    )
     if not item_keys:
-        if get_payment_context(record) == "ppv":
+        if is_ppv_payment:
             await send_manual_release_request(
                 bot,
                 state,
@@ -1081,6 +1096,23 @@ async def fulfill_paid_content(
             order_id=current_order_id or record.get("paypal_order_id"),
         )
         raise
+
+    if not delivered_labels:
+        if order_entry is not None:
+            order_entry["delivery_status"] = "needs_review"
+            order_entry["delivery_failed_at"] = to_iso(utc_now())
+        save_state(state)
+        if is_ppv_payment:
+            await send_manual_release_request(
+                bot,
+                state,
+                user_id,
+                record,
+                heading="PPV release needs review",
+                reason="Payment is confirmed, but no deliverable PPV item was found in the order.",
+                order_id=current_order_id or record.get("paypal_order_id"),
+            )
+        return []
 
     record["payment_fulfilled_at"] = to_iso(utc_now())
     record["payment_fulfilled_order_id"] = current_order_id or record.get("paypal_order_id")
@@ -2240,6 +2272,8 @@ def format_operator_help() -> str:
         "PPVs:\n"
         "/ppvlist\n"
         "/ppvadd <key> <price> [line:<group>] [title] (reply to media)\n\n"
+        "/ppvsend <user_id> <item_key>\n"
+        "/ppvrelease <user_id>\n\n"
         "Queue actions:\n"
         "/pending [all|low|normal|priority|expired]\n"
         "/trash <user_id>\n"
@@ -2252,6 +2286,7 @@ def format_operator_help() -> str:
         "PPV notes:\n"
         "Add the same PPV key again to replace the media, title, or price.\n"
         "Use a sequence key if you want repeat purchases to move to the next item in line.\n\n"
+        "PPV buyer-side shop is disabled for now; send and release PPVs from the admin chat.\n\n"
         "PPV add example:\n"
         "/ppvadd dickpic_01 250 line:dickpic Dickpic 01\n\n"
         "OnlyFans:\n"
@@ -3884,125 +3919,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     if data.startswith("ppv:"):
-        _, _, rest = data.partition(":")
-        ppv_action, _, tail = rest.partition(":")
-        record = get_active_private_record(state, query.from_user)
-        mark_expired_if_needed(record)
-        if query.message is None or query.message.chat.type != "private":
-            await query.answer("Not allowed.", show_alert=True)
-            return
-        if not is_access_active(record):
-            await query.answer("PPVs are available after approval.", show_alert=True)
-            return
-
-        user_id = callback_user_id if callback_user_id is not None else query.from_user.id
-        buyer_chat_id = query.message.chat.id
-
-        if ppv_action == "menu":
-            await send_ppv_picker(
-                context.bot,
-                buyer_chat_id,
-                state,
-                query.from_user.id,
-                record=record,
-            )
-            await query.answer("PPVs opened.")
-            return
-
-        if ppv_action == "pick":
-            item_key, _, _ = tail.partition(":")
-            if not item_key:
-                await query.answer("Invalid PPV item.", show_alert=True)
-                return
-            item = get_ppv_items(state).get(item_key)
-            if item is None:
-                await query.answer("That PPV item is no longer registered.", show_alert=True)
-                return
-            cart = get_ppv_cart(record)
-            if item_key not in cart:
-                cart.append(item_key)
-            save_state(state)
-            if query.message is not None:
-                await query.edit_message_text(
-                    build_ppv_menu_text(record, state),
-                    reply_markup=build_ppv_picker_keyboard(state, query.from_user.id, record),
-                )
-            await query.answer(f"Added {build_ppv_item_label(item_key, item)} to cart.")
-            await context.bot.send_message(
-                chat_id=buyer_chat_id,
-                text=f"Added to cart: {build_ppv_item_label(item_key, item)}",
-                protect_content=True,
-            )
-            return
-
-        if ppv_action == "cart":
-            if query.message is not None:
-                await query.edit_message_text(
-                    build_ppv_menu_text(record, state),
-                    reply_markup=build_ppv_cart_keyboard(query.from_user.id, record),
-                )
-            await query.answer("Cart opened.")
-            return
-
-        if ppv_action == "checkout":
-            cart = get_ppv_cart(record)
-            if not cart:
-                await query.answer("Your cart is empty.", show_alert=True)
-                return
-            total = 0
-            for item_key in cart:
-                item = get_ppv_items(state).get(item_key)
-                if item is not None and isinstance(item.get("price"), int):
-                    total += int(item["price"])
-            currency = str(record.get("payment_currency") or "USD").upper()
-            record["ppv_selected_item_key"] = cart[0]
-            first_item = get_ppv_items(state).get(cart[0])
-            record["ppv_selected_item_title"] = first_item.get("title") if first_item else None
-            record["ppv_selected_item_price"] = first_item.get("price") if first_item else None
-            try:
-                await send_paypal_checkout_message(
-                    context.bot,
-                    state,
-                    user_id,
-                    record,
-                    amount=total,
-                    currency=currency,
-                    description="PPV cart checkout",
-                    text=(
-                        f"Payment ready\n\nAmount due: {format_currency_amount(total, currency)}\n\n"
-                        "Tap PayPal below to complete the purchase."
-                    ),
-                    target_chat_id=buyer_chat_id,
-                    payment_context="ppv",
-                    payment_item_keys=cart,
-                )
-                await query.answer("PayPal checkout sent.")
-                if query.message.chat.type == "supergroup":
-                    await context.bot.send_message(
-                        chat_id=query.message.chat.id,
-                        message_thread_id=query.message.message_thread_id,
-                        text="PayPal checkout sent.",
-                    )
-                return
-            except Exception:
-                LOGGER.exception("PayPal checkout creation failed for user %s.", user_id)
-        await send_and_pin_payment_message(
-            context.bot,
-            user_id,
-            record,
-            target_chat_id=buyer_chat_id,
-            callback_user_id=user_id,
-            payment_context="ppv",
-            payment_item_keys=cart,
-        )
-        save_state(state)
-        await query.answer("Payment link sent.")
-        if query.message.chat.type == "supergroup":
-            await context.bot.send_message(
-                chat_id=query.message.chat.id,
-                message_thread_id=query.message.message_thread_id,
-                text="Payment link sent.",
-            )
+        await query.answer("PPVs are admin-only for now.", show_alert=True)
         return
 
     if data.startswith("adm:"):
@@ -4857,14 +4774,136 @@ async def requestpay_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             )
     except Exception as exc:
         LOGGER.exception("Could not send payment request for user %s.", user_id)
+        try:
+            await send_and_pin_payment_message(
+                context.bot,
+                user_id,
+                record,
+                target_chat_id=buyer_chat_id,
+                callback_user_id=user_id,
+            )
+        except Exception:
+            await update.message.reply_text(
+                f"Set payment request for {user_id} to {amount_text}, but I couldn't send the payment card: {exc}"
+            )
+            return
         await update.message.reply_text(
-            f"Set payment request for {user_id} to {amount_text}, but I couldn't send the payment card: {exc}"
+            f"Set payment request for {user_id} to {amount_text}. PayPal was blocked, so I sent the manual payment card instead."
         )
         return
 
     await update.message.reply_text(
         f"Set payment request for {user_id} to {amount_text} and sent the payment card."
     )
+
+
+async def ppvsend_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.effective_chat or not update.message:
+        return
+    if update.effective_chat.type != "private":
+        return
+
+    state, gate_message = get_admin_private_command_state(update)
+    if state is None:
+        if gate_message:
+            await update.message.reply_text(gate_message)
+        return
+
+    if len(context.args) < 2 or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: /ppvsend <user_id> <item_key>")
+        return
+
+    user_id = int(context.args[0])
+    item_key = normalize_ppv_key(context.args[1])
+    if not item_key:
+        await update.message.reply_text("Usage: /ppvsend <user_id> <item_key>")
+        return
+
+    item = get_ppv_items(state).get(item_key)
+    if item is None:
+        await update.message.reply_text("That PPV item is not registered.")
+        return
+
+    record = get_user_record(state, user_id)
+    if record.get("status") != "approved":
+        await update.message.reply_text("That buyer must be approved first.")
+        return
+
+    ppv_request_record_update(record, item_key, item)
+    record["payment_status"] = "requested"
+    record["payment_requested_at"] = to_iso(utc_now())
+    record["payment_confirmed_at"] = None
+    record["payment_fulfilled_at"] = None
+    record["payment_fulfilled_order_id"] = None
+    save_state(state)
+
+    buyer_chat_id = get_buyer_chat_id(record, user_id)
+    amount_text = format_currency_amount(record["payment_due_amount"], record["payment_currency"])
+    try:
+        await send_and_pin_payment_message(
+            context.bot,
+            user_id,
+            record,
+            target_chat_id=buyer_chat_id,
+            callback_user_id=user_id,
+            payment_context="ppv",
+            payment_item_keys=[item_key],
+        )
+    except Exception as exc:
+        LOGGER.exception("Could not send PPV request for user %s.", user_id)
+        await update.message.reply_text(
+            f"Set PPV request for {user_id} to {amount_text}, but I couldn't send the payment card: {exc}"
+        )
+        return
+
+    await update.message.reply_text(
+        f"Set PPV request for {user_id} to {amount_text} and sent the payment card."
+    )
+
+
+async def ppvrelease_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.effective_chat or not update.message:
+        return
+    if update.effective_chat.type != "private":
+        return
+
+    state, gate_message = get_admin_private_command_state(update)
+    if state is None:
+        if gate_message:
+            await update.message.reply_text(gate_message)
+        return
+
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: /ppvrelease <user_id>")
+        return
+
+    user_id = int(context.args[0])
+    record = get_user_record(state, user_id)
+    if record.get("payment_status") != "paid":
+        await update.message.reply_text("That buyer is not marked paid yet.")
+        return
+
+    try:
+        delivered_labels = await fulfill_paid_content(
+            context.bot,
+            state,
+            user_id,
+            record,
+            order_id=str(record.get("paypal_order_id") or "").strip() or None,
+            target_chat_id=get_buyer_chat_id(record, user_id),
+        )
+    except Exception as exc:
+        LOGGER.exception("PPV release retry failed for user %s.", user_id)
+        await update.message.reply_text(f"PPV release retry failed: {exc}")
+        return
+
+    if delivered_labels:
+        await update.message.reply_text(
+            "PPV released.\n\n" + "\n".join(f"- {label}" for label in delivered_labels)
+        )
+        return
+
+    await update.message.reply_text("Nothing was released. I sent a manual review request instead.")
 
 
 async def ofdiag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5471,6 +5510,8 @@ def main() -> None:
     app.add_handler(CommandHandler("renew", renew_manual))
     app.add_handler(CommandHandler("senddirect", senddirect_manual))
     app.add_handler(CommandHandler("requestpay", requestpay_manual))
+    app.add_handler(CommandHandler("ppvsend", ppvsend_manual))
+    app.add_handler(CommandHandler("ppvrelease", ppvrelease_manual))
     app.add_handler(CommandHandler("revoke", revoke_manual))
     app.add_handler(CommandHandler("removeuser", removeuser_manual))
     app.add_handler(CommandHandler("vaultregister", vaultregister_manual))
