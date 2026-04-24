@@ -4797,6 +4797,7 @@ async def testmode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = load_state()
     admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
     if admin_chat_id != update.effective_chat.id:
+        await update.message.reply_text("Open the admin private chat first, then use /testmode there.")
         return
 
     begin_test_mode_session(state, update.effective_user, mode="buyer")
@@ -4823,6 +4824,7 @@ async def testmodefull(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     state = load_state()
     admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
     if admin_chat_id != update.effective_chat.id:
+        await update.message.reply_text("Open the admin private chat first, then use /testmodefull there.")
         return
 
     begin_test_mode_session(state, update.effective_user, mode="full")
@@ -4840,6 +4842,7 @@ async def testreset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = load_state()
     admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
     if admin_chat_id != update.effective_chat.id:
+        await update.message.reply_text("Open the admin private chat first, then use /testreset there.")
         return
 
     mode = get_test_mode_flow(state, update.effective_user)
