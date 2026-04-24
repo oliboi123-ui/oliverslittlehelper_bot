@@ -920,16 +920,16 @@ def payment_message(record: dict[str, Any] | None = None) -> str:
     ppv_price = record.get("ppv_selected_item_price")
     due_amount = record.get("payment_due_amount")
     due_currency = str(record.get("payment_currency") or "USD")
-    lines = ["Payment request"]
+    lines = ["Checkout ready"]
     if due_amount is not None:
         lines.append(f"Amount due: {format_currency_amount(due_amount, due_currency)}")
     if ppv_title:
         ppv_line = f"PPV selected: {ppv_title}"
         if ppv_price is not None:
             ppv_line += f" ({format_currency_amount(ppv_price, due_currency)})"
-        lines.append("")
         lines.append(ppv_line)
-    lines.extend(["", "Tap Pay with PayPal to continue."])
+    lines.append("")
+    lines.append("Tap the button below to continue.")
     return "\n".join(lines)
 
 
@@ -940,14 +940,10 @@ def build_payment_keyboard(
     payment_url: str | None = None,
 ) -> InlineKeyboardMarkup:
     callback_ref = ensure_callback_ref(record or {}, user_id) if user_id is not None else None
-    if payment_url:
-        rows = [[InlineKeyboardButton("Pay with PayPal", url=payment_url)]]
-    elif callback_ref is not None:
-        rows = [[InlineKeyboardButton("Pay with PayPal", callback_data=f"pay:{callback_ref}")]]
-    else:
-        rows = [[InlineKeyboardButton("Pay with PayPal", url=get_payment_url())]]
+    pay_target_url = payment_url or get_payment_url()
+    rows = [[InlineKeyboardButton("Open PayPal", url=pay_target_url)]]
     if record is not None and record.get("test_mode") and record.get("status") == "approved" and callback_ref is not None:
-        rows.append([InlineKeyboardButton("Browse PPVs", callback_data=f"ppv:menu:{callback_ref}")])
+        rows.append([InlineKeyboardButton("PPV catalog", callback_data=f"ppv:menu:{callback_ref}")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1683,6 +1679,7 @@ async def send_paypal_checkout_message(
                 callback_user_id=user_id,
                 payment_context=payment_context,
                 payment_item_keys=payment_item_keys,
+                payment_url=get_payment_url(),
             )
             return
         raise
@@ -3456,6 +3453,7 @@ async def send_and_pin_payment_message(
     callback_user_id: int | None = None,
     payment_context: str = "manual",
     payment_item_keys: list[str] | None = None,
+    payment_url: str | None = None,
 ) -> None:
     current_time = utc_now()
     record["payment_status"] = "pending"
@@ -3468,7 +3466,7 @@ async def send_and_pin_payment_message(
     message = await bot.send_message(
         chat_id=target_chat_id if target_chat_id is not None else user_id,
         text=payment_message(record),
-        reply_markup=build_payment_keyboard(callback_target_id, record),
+        reply_markup=build_payment_keyboard(callback_target_id, record, payment_url=payment_url),
         protect_content=True,
     )
     record["payment_message_id"] = message.message_id
@@ -4354,6 +4352,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     record,
                     target_chat_id=payment_target_chat_id,
                     callback_user_id=user_id,
+                    payment_url=get_payment_url(),
                 )
                 await query.answer("Payment link sent.")
         except Exception as exc:
