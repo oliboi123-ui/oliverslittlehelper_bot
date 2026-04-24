@@ -121,7 +121,7 @@ TEST_SESSION_ID_OFFSET = 9_000_000_000_000_000
 QUICK_PHRASES = [
     {
         "key": "bought_before",
-        "label": "? Bought before?",
+        "label": "Bought before?",
         "text": "Have you purchased content from me before?",
     },
     {
@@ -1501,24 +1501,24 @@ def build_admin_review_keyboard(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("? Approve", callback_data=f"ar:{user_id}"),
+            InlineKeyboardButton("Approve", callback_data=f"ar:{user_id}"),
                 InlineKeyboardButton("Direct", callback_data=f"ad:{user_id}"),
             ],
             [
-                InlineKeyboardButton("? Reject", callback_data=f"r:{user_id}"),
+            InlineKeyboardButton("Reject", callback_data=f"r:{user_id}"),
             ],
             [
                 InlineKeyboardButton("Clarify", callback_data=f"clar:{user_id}"),
-                InlineKeyboardButton("? Retry Username", callback_data=f"retryof:{user_id}"),
+            InlineKeyboardButton("Retry username", callback_data=f"retryof:{user_id}"),
             ],
             [
-                InlineKeyboardButton("? Promising", callback_data=f"label_promising:{user_id}"),
+            InlineKeyboardButton("Promising", callback_data=f"label_promising:{user_id}"),
                 InlineKeyboardButton("Skip", callback_data=f"label_skip:{user_id}"),
-                InlineKeyboardButton("? Dangerous", callback_data=f"label_dangerous:{user_id}"),
+            InlineKeyboardButton("Dangerous", callback_data=f"label_dangerous:{user_id}"),
             ],
             [
-                InlineKeyboardButton("? Move Up", callback_data=f"p:{user_id}"),
-                InlineKeyboardButton("? Slow Queue", callback_data=f"l:{user_id}"),
+            InlineKeyboardButton("Move up", callback_data=f"p:{user_id}"),
+            InlineKeyboardButton("Slow queue", callback_data=f"l:{user_id}"),
             ],
             [
                 InlineKeyboardButton("Ban", callback_data=f"ban:{user_id}"),
@@ -1531,7 +1531,7 @@ def build_admin_review_keyboard(user_id: int) -> InlineKeyboardMarkup:
 def build_post_approval_keyboard(user_id: int, record: dict[str, Any] | None = None) -> InlineKeyboardMarkup:
     rows = [
         [
-            InlineKeyboardButton("? Paid", callback_data=f"paid:{user_id}"),
+            InlineKeyboardButton("Paid", callback_data=f"paid:{user_id}"),
             InlineKeyboardButton("Remind Pay", callback_data=f"rp:{user_id}"),
         ]
     ]
@@ -1655,7 +1655,7 @@ def build_ppv_cart_keyboard(user_id: int) -> InlineKeyboardMarkup:
         [
             [
                 InlineKeyboardButton("Checkout", callback_data=f"ppv:checkout:{user_id}"),
-                InlineKeyboardButton("? Back", callback_data=f"ppv:menu:{user_id}"),
+            InlineKeyboardButton("Back", callback_data=f"ppv:menu:{user_id}"),
             ]
         ]
     )
@@ -1729,7 +1729,7 @@ def build_admin_home_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("Hot Leads", callback_data="adm:pending:priority"),
             ],
             [
-                InlineKeyboardButton("? Slow Queue", callback_data="adm:pending:low"),
+        InlineKeyboardButton("Slow queue", callback_data="adm:pending:low"),
                 InlineKeyboardButton("Access Watch", callback_data="adm:expiring"),
             ],
             [
@@ -1737,7 +1737,7 @@ def build_admin_home_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("Sync OFAuth", callback_data="adm:sync"),
             ],
             [
-                InlineKeyboardButton("? Help Unverified", callback_data="adm:notify_unverified"),
+        InlineKeyboardButton("Help unverified", callback_data="adm:notify_unverified"),
             ],
             [
                 InlineKeyboardButton("Refresh", callback_data="adm:home"),
