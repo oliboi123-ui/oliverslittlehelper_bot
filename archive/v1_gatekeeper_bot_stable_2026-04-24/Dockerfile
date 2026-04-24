@@ -8,6 +8,8 @@ ENV PYTHONUNBUFFERED=1
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY tiered_shop_bot_v2.py ./
+COPY gatekeeper_bot.py ./
+COPY sync_onlyfans.py ./
+COPY weekly_low_priority_review.py ./
 
-CMD ["python", "-u", "tiered_shop_bot_v2.py"]
+CMD ["python", "-u", "gatekeeper_bot.py"]
