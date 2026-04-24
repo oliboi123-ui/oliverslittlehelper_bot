@@ -1368,7 +1368,7 @@ def format_admin_help() -> str:
         "/vaultregister\n"
         "/vaultadd <key> [title] (reply to a vault post)\n"
         "/vaultlist\n"
-        "/ppvadd <key> <price> [title] (reply to a media post; same key overwrites)\n"
+        "/ppvadd <key> <price> [line:<group>] [title] (reply to a media post; same key overwrites)\n"
         "/ppvlist\n"
         "/status <user_id>\n"
         "/expiring\n"
@@ -1386,7 +1386,7 @@ def format_operator_help() -> str:
         "Command guide\n\n"
         "PPVs:\n"
         "/ppvlist\n"
-        "/ppvadd <key> <price> [title] (reply to media)\n\n"
+        "/ppvadd <key> <price> [line:<group>] [title] (reply to media)\n\n"
         "Queue actions:\n"
         "/pending [all|low|normal|priority|expired]\n"
         "/trash <user_id>\n"
@@ -1399,6 +1399,8 @@ def format_operator_help() -> str:
         "PPV notes:\n"
         "Add the same PPV key again to replace the media, title, or price.\n"
         "Use a sequence key if you want repeat purchases to move to the next item in line.\n\n"
+        "PPV add example:\n"
+        "/ppvadd dickpic_01 250 line:dickpic Dickpic 01\n\n"
         "PayPal:\n"
         "The current setup is a payment link button. Full PayPal automation needs a checkout app or webhook that confirms payment back into the bot."
     )
@@ -2302,7 +2304,7 @@ def format_ppv_items(state: dict[str, Any]) -> str:
         return "No PPV items registered yet."
     lines = ["PPV items", ""]
     for key, item in items[:50]:
-        lines.append(f"{key} | {build_ppv_item_label(key, item)}")
+        lines.append(f"{key} | {build_ppv_item_label(key, item)} | line: {clean_text(item.get('sequence_key'), empty=key)}")
     return "\n".join(lines)
 
 
@@ -4145,12 +4147,12 @@ async def ppvadd_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     if len(context.args) < 2:
-        await update.message.reply_text("Usage: /ppvadd <key> <price> [title]")
+        await update.message.reply_text("Usage: /ppvadd <key> <price> [line:<group>] [title]")
         return
 
     key = normalize_ppv_key(context.args[0])
     if not key:
-        await update.message.reply_text("Usage: /ppvadd <key> <price> [title]")
+        await update.message.reply_text("Usage: /ppvadd <key> <price> [line:<group>] [title]")
         return
 
     try:
@@ -4159,7 +4161,22 @@ async def ppvadd_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("Price must be a whole number.")
         return
 
-    title = " ".join(context.args[2:]).strip()
+    sequence_key = key
+    title_start_index = 2
+    if len(context.args) >= 3:
+        line_arg = str(context.args[2]).strip()
+        line_value = None
+        for prefix in ("line:", "sequence:", "seq:"):
+            if line_arg.lower().startswith(prefix):
+                line_value = line_arg.split(":", 1)[1].strip()
+                break
+        if line_value:
+            normalized_line = normalize_ppv_key(line_value)
+            if normalized_line:
+                sequence_key = normalized_line
+                title_start_index = 3
+
+    title = " ".join(context.args[title_start_index:]).strip()
     if not title:
         title = clean_text(update.message.reply_to_message.caption or update.message.reply_to_message.text, empty=key)
 
@@ -4168,6 +4185,7 @@ async def ppvadd_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         key=key,
         title=title,
         price=price,
+        sequence_key=sequence_key,
         source_chat_id=update.effective_chat.id,
         source_message_id=update.message.reply_to_message.message_id,
         registered_by=update.effective_user.id,
