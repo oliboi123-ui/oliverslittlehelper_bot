@@ -1455,6 +1455,11 @@ def normalize_ppv_key(value: str) -> str:
     return normalize_vault_key(value)
 
 
+def extract_callback_user_id(data: str) -> int | None:
+    tail = data.rsplit(":", 1)[-1]
+    return int(tail) if tail.isdigit() else None
+
+
 def build_ppv_item_label(item_key: str, item: dict[str, Any]) -> str:
     title = clean_text(item.get("title"), empty=item_key)
     price = item.get("price")
@@ -3444,6 +3449,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     state = load_state()
     data = query.data or ""
     action = data.partition(":")[0]
+    callback_user_id = extract_callback_user_id(data)
 
     if data.startswith("budget:"):
         record = get_active_private_record(state, query.from_user)
@@ -3481,12 +3487,12 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     if data.startswith("test:"):
-        _, _, rest = data.partition(":")
-        test_action, _, user_id_text = rest.partition(":")
-        if not user_id_text.isdigit():
+        if callback_user_id is None:
             await query.answer("Invalid test action.", show_alert=True)
             return
-        user_id = int(user_id_text)
+        _, _, rest = data.partition(":")
+        test_action, _, _ = rest.partition(":")
+        user_id = callback_user_id
         record = get_user_record(state, user_id)
         if not record.get("test_mode"):
             await query.answer("That session is no longer active.", show_alert=True)
@@ -3529,6 +3535,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await query.answer("PPVs are available after approval.", show_alert=True)
             return
 
+        user_id = callback_user_id if callback_user_id is not None else query.from_user.id
         buyer_chat_id = query.message.chat.id
 
         if ppv_action == "menu":
@@ -3633,6 +3640,203 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 text="Payment link sent.",
             )
         return
+
+    if data.startswith("adm:"):
+        _, _, rest = data.partition(":")
+        adm_action, _, adm_arg = rest.partition(":")
+        admin_chat_id = query.message.chat.id if query.message is not None else query.from_user.id
+
+        if adm_action == "home":
+            if query.message is not None:
+                await query.edit_message_text(
+                    format_admin_home(state),
+                    reply_markup=build_admin_home_keyboard(),
+                )
+            await query.answer("Control room opened.")
+            return
+
+        if adm_action == "help":
+            if query.message is not None:
+                await query.edit_message_text(
+                    format_admin_help(),
+                    reply_markup=build_admin_home_keyboard(),
+                )
+            await query.answer("Command menu opened.")
+            return
+
+        if adm_action == "pending":
+            mode = adm_arg or "all"
+            await send_queue_cards(context.bot, admin_chat_id, state, mode)
+            await query.answer("Review inbox opened.")
+            return
+
+        if adm_action == "expiring":
+            await send_expiring_cards(context.bot, admin_chat_id, state)
+            await query.answer("Access watch opened.")
+            return
+
+        if adm_action == "digest":
+            await context.bot.send_message(
+                chat_id=admin_chat_id,
+                text=format_admin_digest(state),
+                reply_markup=build_admin_home_keyboard(),
+            )
+            await query.answer("Digest sent.")
+            return
+
+        if adm_action == "sync":
+            summary = await asyncio.to_thread(sync_subscribers, state)
+            save_state(state)
+            log_event(
+                "subs_synced",
+                trigger="button",
+                synced=summary.get("matched"),
+                renewed=summary.get("renewed"),
+                expired=summary.get("expired"),
+                inactive=summary.get("inactive"),
+            )
+            await context.bot.send_message(
+                chat_id=admin_chat_id,
+                text=format_sync_summary(summary),
+                reply_markup=build_admin_home_keyboard(),
+            )
+            await query.answer("Sync finished.")
+            return
+
+        if adm_action == "notify_unverified":
+            summary = await notify_unverified_low_priority_users(context.bot, state)
+            save_state(state)
+            log_event(
+                "unverified_users_notified",
+                trigger="button",
+                notified=summary["notified"],
+                failed=summary["failed"],
+                skipped=summary["skipped"],
+            )
+            await context.bot.send_message(
+                chat_id=admin_chat_id,
+                text=(
+                    "Unverified low-priority users notified.\n\n"
+                    f"Sent: {summary['notified']}\n"
+                    f"Failed: {summary['failed']}"
+                ),
+                reply_markup=build_admin_home_keyboard(),
+            )
+            await query.answer("Unverified users notified.")
+            return
+
+        await query.answer("Unknown admin action.", show_alert=True)
+        return
+
+    if data.startswith("q:"):
+        _, _, rest = data.partition(":")
+        quick_key, _, _ = rest.partition(":")
+        if callback_user_id is None:
+            await query.answer("Invalid callback data.", show_alert=True)
+            return
+
+        user_id = callback_user_id
+        record = get_user_record(state, user_id)
+        if not relay_mode_enabled(record):
+            await query.answer("That relay is no longer active.", show_alert=True)
+            return
+
+        quick_phrase = get_quick_phrase(quick_key)
+        if quick_key == "price_reply":
+            reply_text = build_budget_reply_message(record)
+        elif quick_phrase is not None and quick_phrase.get("text"):
+            reply_text = str(quick_phrase["text"])
+        else:
+            await query.answer("Unknown quick reply.", show_alert=True)
+            return
+
+        target_chat_id = get_buyer_chat_id(record, user_id)
+        try:
+            await context.bot.send_message(
+                chat_id=target_chat_id,
+                text=reply_text,
+                protect_content=True,
+            )
+            if query.message is not None:
+                confirmation = f"Sent quick reply: {reply_text}"
+                if query.message.chat.type == "supergroup" and query.message.message_thread_id is not None:
+                    await context.bot.send_message(
+                        chat_id=query.message.chat.id,
+                        message_thread_id=query.message.message_thread_id,
+                        text=confirmation,
+                    )
+                else:
+                    await context.bot.send_message(
+                        chat_id=query.message.chat.id,
+                        text=confirmation,
+                    )
+            await query.answer("Quick reply sent.")
+        except Exception as exc:
+            LOGGER.exception("Quick reply failed for user %s.", user_id)
+            await query.answer("Could not send quick reply.", show_alert=True)
+            if query.message is not None:
+                await context.bot.send_message(
+                    chat_id=query.message.chat.id,
+                    text=f"Quick reply failed for {user_id}: {exc}",
+                )
+        return
+
+    if data.startswith("noop:"):
+        await query.answer("Nothing to act on.")
+        return
+
+    if data.startswith("vk:"):
+        _, _, rest = data.partition(":")
+        item_key, _, _ = rest.partition(":")
+        if callback_user_id is None:
+            await query.answer("Invalid callback data.", show_alert=True)
+            return
+
+        user_id = callback_user_id
+        record = get_user_record(state, user_id)
+        if record.get("status") != "approved":
+            await query.answer("Only approved buyers can receive content.", show_alert=True)
+            return
+        if record.get("payment_status") != "paid":
+            await query.answer("Mark this buyer paid first.", show_alert=True)
+            return
+
+        item = get_vault_items(state).get(item_key)
+        if item is None:
+            await query.answer("That vault item is no longer registered.", show_alert=True)
+            return
+
+        try:
+            await deliver_vault_item(
+                context.bot,
+                state,
+                user_id,
+                item_key,
+                target_chat_id=get_buyer_chat_id(record, user_id),
+            )
+            save_state(state)
+            await query.answer("Vault content sent.")
+            if query.message is not None:
+                await context.bot.send_message(
+                    chat_id=query.message.chat.id,
+                    text=f"Delivered {build_vault_item_label(item_key, item)}",
+                )
+        except Exception as exc:
+            LOGGER.exception("Vault delivery failed for user %s.", user_id)
+            await query.answer("Could not deliver vault content.", show_alert=True)
+            if query.message is not None:
+                await context.bot.send_message(
+                    chat_id=query.message.chat.id,
+                    text=f"Vault delivery failed for {user_id}: {exc}",
+                )
+        return
+
+    if callback_user_id is None:
+        await query.answer("Invalid callback data.", show_alert=True)
+        return
+
+    user_id = callback_user_id
+    record = get_user_record(state, user_id)
 
     if action == "pay":
         payment_target_chat_id = get_buyer_chat_id(record, user_id)
