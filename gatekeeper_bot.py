@@ -429,6 +429,7 @@ def load_state() -> dict[str, Any]:
             "relay_topics": {},
             "content_vault_chat_id": None,
             "vault_items": {},
+            "ppv_items": {},
             "test_sessions": {},
         }
     try:
@@ -441,6 +442,7 @@ def load_state() -> dict[str, Any]:
             "relay_topics": {},
             "content_vault_chat_id": None,
             "vault_items": {},
+            "ppv_items": {},
             "test_sessions": {},
         }
     state.setdefault("admin_chat_id", None)
@@ -448,6 +450,7 @@ def load_state() -> dict[str, Any]:
     state.setdefault("relay_topics", {})
     state.setdefault("content_vault_chat_id", None)
     state.setdefault("vault_items", {})
+    state.setdefault("ppv_items", {})
     state.setdefault("test_sessions", {})
     return state
 
@@ -522,6 +525,9 @@ def default_user_record() -> dict[str, Any]:
         "payment_requested_at": None,
         "payment_confirmed_at": None,
         "payment_reminded_at": None,
+        "ppv_selected_item_key": None,
+        "ppv_selected_item_title": None,
+        "ppv_selected_item_price": None,
         "content_unlocks": [],
         "not_fit_at": None,
         "banned_at": None,
@@ -616,6 +622,9 @@ def begin_test_mode_session(state: dict[str, Any], user: Any) -> dict[str, Any]:
     record["payment_requested_at"] = None
     record["payment_confirmed_at"] = None
     record["payment_reminded_at"] = None
+    record["ppv_selected_item_key"] = None
+    record["ppv_selected_item_title"] = None
+    record["ppv_selected_item_price"] = None
     record["content_unlocks"] = []
     record["not_fit_at"] = None
     record["banned_at"] = None
@@ -732,17 +741,28 @@ def direct_access_message(private_username: str, record: dict[str, Any]) -> str:
 
 
 def payment_message(record: dict[str, Any] | None = None) -> str:
+    ppv_title = clean_text((record or {}).get("ppv_selected_item_title"), empty="")
+    ppv_price = (record or {}).get("ppv_selected_item_price")
+    ppv_block = ""
+    if ppv_title:
+        ppv_block = (
+            "\n\nPPV selected: "
+            f"{ppv_title}"
+            + (f" (${ppv_price})" if ppv_price is not None else "")
+        )
     return (
         "Payment link\n"
         f"{get_payment_url()}\n\n"
         "Use the PayPal button below for purchases so payment info stays easy to find."
+        f"{ppv_block}"
     )
 
 
 def build_payment_keyboard(user_id: int | None = None, record: dict[str, Any] | None = None) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("💸 PayPal", url=get_payment_url())]]
-    )
+    rows = [[InlineKeyboardButton("💸 PayPal", url=get_payment_url())]]
+    if user_id is not None:
+        rows.append([InlineKeyboardButton("📦 PPVs", callback_data=f"ppv:menu:{user_id}")])
+    return InlineKeyboardMarkup(rows)
 
 
 def build_relay_topic_keyboard(user_id: int, record: dict[str, Any] | None = None) -> InlineKeyboardMarkup:
@@ -881,6 +901,10 @@ def get_vault_items(state: dict[str, Any]) -> dict[str, Any]:
     return state.setdefault("vault_items", {})
 
 
+def get_ppv_items(state: dict[str, Any]) -> dict[str, Any]:
+    return state.setdefault("ppv_items", {})
+
+
 def vault_item_sort_key(item: dict[str, Any]) -> str:
     return str(item.get("created_at") or "")
 
@@ -901,6 +925,33 @@ def build_vault_item_picker_keyboard(state: dict[str, Any], user_id: int) -> Inl
     ]
     if not rows:
         rows = [[InlineKeyboardButton("No vault items", callback_data=f"noop:{user_id}")]]
+    return InlineKeyboardMarkup(rows)
+
+
+def ppv_item_sort_key(item: dict[str, Any]) -> str:
+    return str(item.get("created_at") or "")
+
+
+def normalize_ppv_key(value: str) -> str:
+    return normalize_vault_key(value)
+
+
+def build_ppv_item_label(item_key: str, item: dict[str, Any]) -> str:
+    title = clean_text(item.get("title"), empty=item_key)
+    price = item.get("price")
+    if price is not None:
+        return f"{title} (${price})"
+    return title
+
+
+def build_ppv_picker_keyboard(state: dict[str, Any], user_id: int) -> InlineKeyboardMarkup:
+    items = sorted(get_ppv_items(state).items(), key=lambda pair: ppv_item_sort_key(pair[1]))
+    rows = [
+        [InlineKeyboardButton(build_ppv_item_label(item_key, item), callback_data=f"ppv:pick:{item_key}:{user_id}")]
+        for item_key, item in items[:20]
+    ]
+    if not rows:
+        rows = [[InlineKeyboardButton("No PPVs yet", callback_data=f"noop:{user_id}")]]
     return InlineKeyboardMarkup(rows)
 
 
@@ -978,6 +1029,49 @@ def build_post_approval_keyboard(user_id: int, record: dict[str, Any] | None = N
     return InlineKeyboardMarkup(rows)
 
 
+async def send_ppv_picker(
+    bot: Any,
+    chat_id: int,
+    state: dict[str, Any],
+    user_id: int,
+    *,
+    record: dict[str, Any] | None = None,
+    message_thread_id: int | None = None,
+) -> None:
+    record = record or get_user_record(state, user_id)
+    kwargs: dict[str, Any] = {}
+    if message_thread_id is not None:
+        kwargs["message_thread_id"] = message_thread_id
+    await bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"PPVs for {format_person_label(record)}\n"
+            f"Payment: {payment_status_line(record)}"
+        ),
+        reply_markup=build_ppv_picker_keyboard(state, user_id),
+        **kwargs,
+    )
+
+
+async def deliver_ppv_item(
+    bot: Any,
+    state: dict[str, Any],
+    user_id: int,
+    item_key: str,
+    *,
+    target_chat_id: int | None = None,
+) -> None:
+    item = get_ppv_items(state).get(item_key)
+    if item is None:
+        raise RuntimeError("That PPV item is no longer registered.")
+    await bot.copy_message(
+        chat_id=target_chat_id if target_chat_id is not None else user_id,
+        from_chat_id=int(item["source_chat_id"]),
+        message_id=int(item["source_message_id"]),
+        protect_content=True,
+    )
+
+
 def build_closed_record_keyboard(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -1033,6 +1127,11 @@ def format_review_card(user_id: int, record: dict[str, Any], heading: str) -> st
         f"Budget: {budget_line(record)}",
         f"Looking for: {clean_text(record.get('purchase_intent'))}",
     ]
+    if record.get("ppv_selected_item_title"):
+        ppv_line = clean_text(record.get("ppv_selected_item_title"))
+        if record.get("ppv_selected_item_price") is not None:
+            ppv_line = f"{ppv_line} (${record.get('ppv_selected_item_price')})"
+        lines.append(f"PPV: {ppv_line}")
     if record.get("clarification_response"):
         lines.append(f"Clarified: {clean_text(record.get('clarification_response'))}")
     if record.get("internal_label"):
@@ -1058,6 +1157,8 @@ def format_detailed_status_message(user_id: int, record: dict[str, Any]) -> str:
         f"Budget: {budget_line(record)}",
         f"Budget floor: {clean_text(record.get('budget_floor'))}",
         f"Looking for: {clean_text(record.get('purchase_intent'))}",
+        f"PPV: {clean_text(record.get('ppv_selected_item_title'))}",
+        f"PPV price: {clean_text(record.get('ppv_selected_item_price'))}",
         f"Clarification: {clean_text(record.get('clarification_response'))}",
         f"Queue: {priority_label(record)}",
         f"Internal label: {clean_text(record.get('internal_label'))}",
@@ -1144,6 +1245,8 @@ def format_admin_help() -> str:
         "/vaultregister\n"
         "/vaultadd <key> [title] (reply to a vault post)\n"
         "/vaultlist\n"
+        "/ppvadd <key> <price> [title] (reply to a media post; same key overwrites)\n"
+        "/ppvlist\n"
         "/status <user_id>\n"
         "/expiring\n"
         "/notifyunverified\n"
@@ -2013,6 +2116,27 @@ def register_vault_item(
     }
 
 
+def register_ppv_item(
+    state: dict[str, Any],
+    *,
+    key: str,
+    title: str,
+    price: int,
+    source_chat_id: int,
+    source_message_id: int,
+    registered_by: int | None = None,
+) -> None:
+    ppv_items = get_ppv_items(state)
+    ppv_items[key] = {
+        "title": title,
+        "price": price,
+        "source_chat_id": source_chat_id,
+        "source_message_id": source_message_id,
+        "registered_by": registered_by,
+        "created_at": to_iso(utc_now()),
+    }
+
+
 def format_vault_items(state: dict[str, Any]) -> str:
     items = sorted(get_vault_items(state).items(), key=lambda pair: vault_item_sort_key(pair[1]))
     if not items:
@@ -2020,6 +2144,16 @@ def format_vault_items(state: dict[str, Any]) -> str:
     lines = ["Vault items", ""]
     for key, item in items[:50]:
         lines.append(f"{key} | {build_vault_item_label(key, item)}")
+    return "\n".join(lines)
+
+
+def format_ppv_items(state: dict[str, Any]) -> str:
+    items = sorted(get_ppv_items(state).items(), key=lambda pair: ppv_item_sort_key(pair[1]))
+    if not items:
+        return "No PPV items registered yet."
+    lines = ["PPV items", ""]
+    for key, item in items[:50]:
+        lines.append(f"{key} | {build_ppv_item_label(key, item)}")
     return "\n".join(lines)
 
 
@@ -2075,6 +2209,9 @@ def begin_application(record: dict[str, Any]) -> None:
     record["budget_range_label"] = None
     record["budget_floor"] = None
     record["purchase_intent"] = None
+    record["ppv_selected_item_key"] = None
+    record["ppv_selected_item_title"] = None
+    record["ppv_selected_item_price"] = None
     record["clarification_requested_at"] = None
     record["clarification_response"] = None
     record["review_priority"] = "normal"
@@ -2624,6 +2761,68 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await query.answer("Unknown test action.", show_alert=True)
         return
 
+    if data.startswith("ppv:"):
+        _, _, rest = data.partition(":")
+        ppv_action, _, tail = rest.partition(":")
+        record = get_active_private_record(state, query.from_user)
+        mark_expired_if_needed(record)
+        if query.message is None or query.message.chat.type != "private":
+            await query.answer("Not allowed.", show_alert=True)
+            return
+        if not is_access_active(record):
+            await query.answer("PPVs are available after approval.", show_alert=True)
+            return
+
+        buyer_chat_id = query.message.chat.id
+
+        if ppv_action == "menu":
+            await send_ppv_picker(
+                context.bot,
+                buyer_chat_id,
+                state,
+                query.from_user.id,
+                record=record,
+            )
+            await query.answer("PPVs opened.")
+            return
+
+        if ppv_action == "pick":
+            item_key, _, _ = tail.partition(":")
+            if not item_key:
+                await query.answer("Invalid PPV item.", show_alert=True)
+                return
+            item = get_ppv_items(state).get(item_key)
+            if item is None:
+                await query.answer("That PPV item is no longer registered.", show_alert=True)
+                return
+
+            record["ppv_selected_item_key"] = item_key
+            record["ppv_selected_item_title"] = item.get("title")
+            record["ppv_selected_item_price"] = item.get("price")
+            save_state(state)
+            await send_and_pin_payment_message(
+                context.bot,
+                query.from_user.id,
+                record,
+                target_chat_id=buyer_chat_id,
+                callback_user_id=query.from_user.id,
+            )
+            if query.message is not None:
+                await query.edit_message_text(
+                    f"PPV selected: {build_ppv_item_label(item_key, item)}\n\nPayment link sent."
+                )
+            await query.answer("PPV selected.")
+            return
+
+        if ppv_action == "back":
+            await query.answer("Returning to PPVs.")
+            if query.message is not None:
+                await query.edit_message_text("PPV menu closed.")
+            return
+
+        await query.answer("Unknown PPV action.", show_alert=True)
+        return
+
     if not callback_is_from_admin_surface(state, query):
         await query.answer("Not allowed.", show_alert=True)
         return
@@ -2787,6 +2986,36 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if action == "ul":
         if record.get("status") != "approved" or str(record.get("payment_status") or "").strip().lower() != "paid":
             await query.answer("Mark payment as paid first.", show_alert=True)
+            return
+        selected_ppv_key = str(record.get("ppv_selected_item_key") or "").strip()
+        if selected_ppv_key:
+            item = get_ppv_items(state).get(selected_ppv_key)
+            if item is None:
+                await query.answer("That PPV item is no longer registered.", show_alert=True)
+                return
+            await deliver_ppv_item(
+                context.bot,
+                state,
+                user_id,
+                selected_ppv_key,
+                target_chat_id=get_buyer_chat_id(record, user_id),
+            )
+            record.setdefault("content_unlocks", []).append(
+                {
+                    "item_key": selected_ppv_key,
+                    "delivered_at": to_iso(utc_now()),
+                }
+            )
+            save_state(state)
+            await query.answer("PPV unlocked.")
+            message_kwargs: dict[str, Any] = {}
+            if query.message.chat.type == "supergroup":
+                message_kwargs["message_thread_id"] = query.message.message_thread_id
+            await context.bot.send_message(
+                chat_id=query.message.chat.id,
+                text=f"Unlocked PPV: {build_ppv_item_label(selected_ppv_key, item)}",
+                **message_kwargs,
+            )
             return
         if not get_vault_items(state):
             await query.answer("No vault items are registered yet.", show_alert=True)
@@ -3632,6 +3861,74 @@ async def vaultlist_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await update.message.reply_text(format_vault_items(state))
 
 
+async def ppvadd_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.effective_chat or not update.message:
+        return
+    if update.effective_chat.type != "supergroup":
+        return
+
+    state = load_state()
+    if is_private_buyer_test_context(state, update):
+        return
+    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
+    if admin_chat_id is None:
+        await update.message.reply_text("Not allowed.")
+        return
+
+    if update.message.reply_to_message is None:
+        await update.message.reply_text("Reply to the PPV post with /ppvadd <key> <price> [title]")
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /ppvadd <key> <price> [title]")
+        return
+
+    key = normalize_ppv_key(context.args[0])
+    if not key:
+        await update.message.reply_text("Usage: /ppvadd <key> <price> [title]")
+        return
+
+    try:
+        price = int(str(context.args[1]).strip())
+    except ValueError:
+        await update.message.reply_text("Price must be a whole number.")
+        return
+
+    title = " ".join(context.args[2:]).strip()
+    if not title:
+        title = clean_text(update.message.reply_to_message.caption or update.message.reply_to_message.text, empty=key)
+
+    register_ppv_item(
+        state,
+        key=key,
+        title=title,
+        price=price,
+        source_chat_id=update.effective_chat.id,
+        source_message_id=update.message.reply_to_message.message_id,
+        registered_by=update.effective_user.id,
+    )
+    state["content_vault_chat_id"] = update.effective_chat.id
+    save_state(state)
+    await update.message.reply_text(f"Saved PPV item {key}.")
+
+
+async def ppvlist_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.effective_chat or not update.message:
+        return
+    if update.effective_chat.type != "private" and update.effective_chat.type != "supergroup":
+        return
+
+    state = load_state()
+    if is_private_buyer_test_context(state, update):
+        return
+    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
+    if admin_chat_id is None and update.effective_chat.id != state.get("content_vault_chat_id"):
+        await update.message.reply_text("Not allowed.")
+        return
+
+    await update.message.reply_text(format_ppv_items(state))
+
+
 async def revoke_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.effective_chat or not update.message:
         return
@@ -3821,6 +4118,8 @@ def main() -> None:
     app.add_handler(CommandHandler("vaultregister", vaultregister_manual))
     app.add_handler(CommandHandler("vaultadd", vaultadd_manual))
     app.add_handler(CommandHandler("vaultlist", vaultlist_manual))
+    app.add_handler(CommandHandler("ppvadd", ppvadd_manual))
+    app.add_handler(CommandHandler("ppvlist", ppvlist_manual))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("details", details_command))
     app.add_handler(CommandHandler("expiring", expiring))
