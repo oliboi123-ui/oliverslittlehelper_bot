@@ -2680,6 +2680,25 @@ def resolve_admin_chat_id(state: dict[str, Any], user: Any) -> int | None:
     return None
 
 
+def get_admin_private_command_state(
+    update: Any,
+    *,
+    test_mode_message: str = "Exit /testmode first to use this command.",
+    chat_message: str = "Open the admin chat first, then use this command there.",
+) -> tuple[dict[str, Any] | None, str | None]:
+    if not getattr(update, "effective_user", None) or not getattr(update, "effective_chat", None) or not getattr(update, "message", None):
+        return None, None
+    if update.effective_chat.type != "private":
+        return None, None
+    state = load_state()
+    if is_private_buyer_test_context(state, update):
+        return None, test_mode_message
+    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
+    if admin_chat_id != update.effective_chat.id:
+        return None, chat_message
+    return state, None
+
+
 def callback_is_from_admin_surface(state: dict[str, Any], query: Any) -> bool:
     if query.message is None:
         return False
@@ -3792,11 +3811,10 @@ async def pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.type != "private":
         return
 
-    state = load_state()
-    if is_private_buyer_test_context(state, update):
-        return
-    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
-    if admin_chat_id != update.effective_chat.id:
+    state, gate_message = get_admin_private_command_state(update)
+    if state is None:
+        if gate_message:
+            await update.message.reply_text(gate_message)
         return
 
     mode = normalize_username(context.args[0]) if context.args else "all"
@@ -3809,11 +3827,10 @@ async def expiring(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.type != "private":
         return
 
-    state = load_state()
-    if is_private_buyer_test_context(state, update):
-        return
-    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
-    if admin_chat_id != update.effective_chat.id:
+    state, gate_message = get_admin_private_command_state(update)
+    if state is None:
+        if gate_message:
+            await update.message.reply_text(gate_message)
         return
 
     await send_expiring_cards(context.bot, update.effective_chat.id, state)
@@ -3825,11 +3842,10 @@ async def notify_unverified_manual(update: Update, context: ContextTypes.DEFAULT
     if update.effective_chat.type != "private":
         return
 
-    state = load_state()
-    if is_private_buyer_test_context(state, update):
-        return
-    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
-    if admin_chat_id != update.effective_chat.id:
+    state, gate_message = get_admin_private_command_state(update)
+    if state is None:
+        if gate_message:
+            await update.message.reply_text(gate_message)
         return
 
     summary = await notify_unverified_low_priority_users(context.bot, state)
@@ -3855,11 +3871,10 @@ async def sync_subs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.type != "private":
         return
 
-    state = load_state()
-    if is_private_buyer_test_context(state, update):
-        return
-    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
-    if admin_chat_id != update.effective_chat.id:
+    state, gate_message = get_admin_private_command_state(update)
+    if state is None:
+        if gate_message:
+            await update.message.reply_text(gate_message)
         return
 
     if not ofauth_is_configured():
@@ -3941,11 +3956,10 @@ async def verifyof(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.type != "private":
         return
 
-    state = load_state()
-    if is_private_buyer_test_context(state, update):
-        return
-    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
-    if admin_chat_id != update.effective_chat.id:
+    state, gate_message = get_admin_private_command_state(update)
+    if state is None:
+        if gate_message:
+            await update.message.reply_text(gate_message)
         return
 
     if not ofauth_is_configured():
@@ -4012,11 +4026,10 @@ async def setof_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if update.effective_chat.type != "private":
         return
 
-    state = load_state()
-    if is_private_buyer_test_context(state, update):
-        return
-    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
-    if admin_chat_id != update.effective_chat.id:
+    state, gate_message = get_admin_private_command_state(update)
+    if state is None:
+        if gate_message:
+            await update.message.reply_text(gate_message)
         return
 
     if len(context.args) < 2 or not context.args[0].isdigit():
@@ -4125,11 +4138,10 @@ async def ofdiag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.type != "private":
         return
 
-    state = load_state()
-    if is_private_buyer_test_context(state, update):
-        return
-    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
-    if admin_chat_id != update.effective_chat.id:
+    state, gate_message = get_admin_private_command_state(update)
+    if state is None:
+        if gate_message:
+            await update.message.reply_text(gate_message)
         return
 
     if not ofauth_is_configured():
@@ -4191,11 +4203,10 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if update.effective_chat.type != "private":
         return
 
-    state = load_state()
-    if is_private_buyer_test_context(state, update):
-        return
-    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
-    if admin_chat_id != update.effective_chat.id:
+    state, gate_message = get_admin_private_command_state(update)
+    if state is None:
+        if gate_message:
+            await update.message.reply_text(gate_message)
         return
 
     if not context.args or not context.args[0].isdigit():
@@ -4216,11 +4227,10 @@ async def details_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if update.effective_chat.type != "private":
         return
 
-    state = load_state()
-    if is_private_buyer_test_context(state, update):
-        return
-    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
-    if admin_chat_id != update.effective_chat.id:
+    state, gate_message = get_admin_private_command_state(update)
+    if state is None:
+        if gate_message:
+            await update.message.reply_text(gate_message)
         return
 
     if not context.args or not context.args[0].isdigit():
@@ -4261,11 +4271,10 @@ async def trash_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if update.effective_chat.type != "private":
         return
 
-    state = load_state()
-    if is_private_buyer_test_context(state, update):
-        return
-    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
-    if admin_chat_id != update.effective_chat.id:
+    state, gate_message = get_admin_private_command_state(update)
+    if state is None:
+        if gate_message:
+            await update.message.reply_text(gate_message)
         return
 
     if not context.args or not context.args[0].isdigit():
@@ -4288,11 +4297,10 @@ async def ppvhelp_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if update.effective_chat.type != "private":
         return
 
-    state = load_state()
-    if is_private_buyer_test_context(state, update):
-        return
-    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
-    if admin_chat_id != update.effective_chat.id:
+    state, gate_message = get_admin_private_command_state(update)
+    if state is None:
+        if gate_message:
+            await update.message.reply_text(gate_message)
         return
 
     await update.message.reply_text(format_operator_help())
@@ -4304,11 +4312,10 @@ async def reprioritize(update: Update, context: ContextTypes.DEFAULT_TYPE, new_p
     if update.effective_chat.type != "private":
         return
 
-    state = load_state()
-    if is_private_buyer_test_context(state, update):
-        return
-    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
-    if admin_chat_id != update.effective_chat.id:
+    state, gate_message = get_admin_private_command_state(update)
+    if state is None:
+        if gate_message:
+            await update.message.reply_text(gate_message)
         return
 
     if not context.args or not context.args[0].isdigit():
@@ -4338,11 +4345,10 @@ async def renew_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if update.effective_chat.type != "private":
         return
 
-    state = load_state()
-    if is_private_buyer_test_context(state, update):
-        return
-    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
-    if admin_chat_id != update.effective_chat.id:
+    state, gate_message = get_admin_private_command_state(update)
+    if state is None:
+        if gate_message:
+            await update.message.reply_text(gate_message)
         return
 
     if not context.args or not context.args[0].isdigit():
@@ -4365,11 +4371,10 @@ async def senddirect_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if update.effective_chat.type != "private":
         return
 
-    state = load_state()
-    if is_private_buyer_test_context(state, update):
-        return
-    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
-    if admin_chat_id != update.effective_chat.id:
+    state, gate_message = get_admin_private_command_state(update)
+    if state is None:
+        if gate_message:
+            await update.message.reply_text(gate_message)
         return
 
     if not context.args or not context.args[0].isdigit():
@@ -4554,11 +4559,10 @@ async def revoke_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if update.effective_chat.type != "private":
         return
 
-    state = load_state()
-    if is_private_buyer_test_context(state, update):
-        return
-    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
-    if admin_chat_id != update.effective_chat.id:
+    state, gate_message = get_admin_private_command_state(update)
+    if state is None:
+        if gate_message:
+            await update.message.reply_text(gate_message)
         return
 
     if not context.args or not context.args[0].isdigit():
@@ -4585,11 +4589,10 @@ async def removeuser_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if update.effective_chat.type != "private":
         return
 
-    state = load_state()
-    if is_private_buyer_test_context(state, update):
-        return
-    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
-    if admin_chat_id != update.effective_chat.id:
+    state, gate_message = get_admin_private_command_state(update)
+    if state is None:
+        if gate_message:
+            await update.message.reply_text(gate_message)
         return
 
     if not context.args or not context.args[0].isdigit():
@@ -4619,11 +4622,10 @@ async def manual_decision(
     if update.effective_chat.type != "private":
         return
 
-    state = load_state()
-    if is_private_buyer_test_context(state, update):
-        return
-    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
-    if admin_chat_id != update.effective_chat.id:
+    state, gate_message = get_admin_private_command_state(update)
+    if state is None:
+        if gate_message:
+            await update.message.reply_text(gate_message)
         return
 
     if not context.args or not context.args[0].isdigit():
