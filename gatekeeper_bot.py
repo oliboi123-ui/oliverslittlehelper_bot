@@ -958,7 +958,7 @@ def build_ppv_item_label(item_key: str, item: dict[str, Any]) -> str:
 def build_ppv_item_detail(item_key: str, item: dict[str, Any]) -> str:
     title = build_ppv_item_label(item_key, item)
     sequence_key = clean_text(item.get("sequence_key"), empty=item_key)
-    return f"{title} | Next in line: {sequence_key}"
+    return f"{title} | Line: {sequence_key}"
 
 
 def build_ppv_picker_keyboard(state: dict[str, Any], user_id: int) -> InlineKeyboardMarkup:
@@ -1012,7 +1012,6 @@ def build_admin_review_keyboard(user_id: int) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton("⬆ Move Up", callback_data=f"p:{user_id}"),
                 InlineKeyboardButton("⏳ Slow Queue", callback_data=f"l:{user_id}"),
-                InlineKeyboardButton("🗑 Trash", callback_data=f"trash:{user_id}"),
             ],
             [
                 InlineKeyboardButton("🚫 Ban", callback_data=f"ban:{user_id}"),
@@ -1069,9 +1068,11 @@ async def send_ppv_picker(
     await bot.send_message(
         chat_id=chat_id,
         text=(
-            f"PPVs for {format_person_label(record)}\n"
+            f"PPV shop for {format_person_label(record)}\n"
             f"Payment: {payment_status_line(record)}\n"
-            "Buying the same PPV again will move to the next item in that line if one exists."
+            f"Cart: {len(get_ppv_cart(record))} item{'s' if len(get_ppv_cart(record)) != 1 else ''}\n"
+            "Tap an item to add it to your cart.\n"
+            "Buying the same PPV line again can move to the next item in that line."
         ),
         reply_markup=build_ppv_picker_keyboard(state, user_id),
         **kwargs,
@@ -1116,14 +1117,25 @@ def resolve_ppv_sequence_item_key(state: dict[str, Any], base_key: str, delivery
 
 def build_ppv_menu_text(record: dict[str, Any], state: dict[str, Any]) -> str:
     items = sorted(get_ppv_items(state).items(), key=lambda pair: ppv_item_sort_key(pair[1]))
+    cart = get_ppv_cart(record)
     lines = [
-        "PPV menu",
+        "PPV shop",
         "",
-        "Tap to add items to your cart.",
+        "Tap any item below to add it to your cart.",
         "If you buy the same PPV line again, the next item in that line can unlock instead.",
         "",
-        f"Cart: {len(get_ppv_cart(record))} item{'s' if len(get_ppv_cart(record)) != 1 else ''}",
+        f"Cart: {len(cart)} item{'s' if len(cart) != 1 else ''}",
     ]
+    if cart:
+        preview = []
+        for item_key in cart[:3]:
+            item = get_ppv_items(state).get(item_key)
+            if item is None:
+                continue
+            preview.append(build_ppv_item_label(item_key, item))
+        if preview:
+            lines.append(f"Cart preview: {', '.join(preview)}")
+            lines.append("")
     for item_key, item in items[:10]:
         lines.append(f"- {build_ppv_item_detail(item_key, item)}")
     if not items:
@@ -1147,16 +1159,16 @@ def build_ppv_checkout_summary(record: dict[str, Any], state: dict[str, Any]) ->
     if not cart:
         return "Your cart is empty."
     lines = [
-        "Checkout",
+        "Checkout summary",
         "",
         f"Items: {len(cart)}",
     ]
     total = 0
-    for item_key in cart:
+    for index, item_key in enumerate(cart, start=1):
         item = get_ppv_items(state).get(item_key)
         if item is None:
             continue
-        lines.append(f"- {build_ppv_item_label(item_key, item)}")
+        lines.append(f"{index}. {build_ppv_item_label(item_key, item)}")
         if isinstance(item.get("price"), int):
             total += int(item["price"])
     lines.extend(["", f"Total: ${total}"])
@@ -1386,7 +1398,9 @@ def format_operator_help() -> str:
         "/testreset\n\n"
         "PPV notes:\n"
         "Add the same PPV key again to replace the media, title, or price.\n"
-        "Use a sequence key if you want repeat purchases to move to the next item in line."
+        "Use a sequence key if you want repeat purchases to move to the next item in line.\n\n"
+        "PayPal:\n"
+        "The current setup is a payment link button. Full PayPal automation needs a checkout app or webhook that confirms payment back into the bot."
     )
 
 
