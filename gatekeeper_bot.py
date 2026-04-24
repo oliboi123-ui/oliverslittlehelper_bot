@@ -2880,6 +2880,66 @@ async def deliver_vault_item(
     )
 
 
+def resolve_next_ppv_item_key(state: dict[str, Any], record: dict[str, Any]) -> str | None:
+    base_key = clean_text(record.get("ppv_selected_item_key"), empty="")
+    if not base_key:
+        cart = get_ppv_cart(record)
+        if cart:
+            base_key = clean_text(cart[0], empty="")
+    if not base_key:
+        return None
+
+    items = get_ppv_items(state)
+    base_item = items.get(base_key)
+    if base_item is None:
+        return None
+
+    sequence_key = str(base_item.get("sequence_key") or base_key).strip()
+    sequence_items = [
+        (item_key, item)
+        for item_key, item in items.items()
+        if str(item.get("sequence_key") or item_key).strip() == sequence_key
+    ]
+    sequence_items.sort(key=lambda pair: ppv_item_sort_key(pair[1]))
+    if not sequence_items:
+        return base_key
+
+    history = get_ppv_delivery_history(record)
+    delivered_count = int(history.get(sequence_key) or 0)
+    index = min(delivered_count, len(sequence_items) - 1)
+    history[sequence_key] = delivered_count + 1
+    return sequence_items[index][0]
+
+
+async def deliver_unlock_content(
+    bot: Any,
+    state: dict[str, Any],
+    user_id: int,
+    record: dict[str, Any],
+    *,
+    target_chat_id: int | None = None,
+) -> str:
+    ppv_key = resolve_next_ppv_item_key(state, record)
+    if ppv_key is not None:
+        await deliver_ppv_item(bot, state, user_id, ppv_key, target_chat_id=target_chat_id)
+        delivered_label = build_ppv_item_label(ppv_key, get_ppv_items(state)[ppv_key])
+        unlocks = record.setdefault("content_unlocks", [])
+        if isinstance(unlocks, list):
+            unlocks.append(ppv_key)
+        return f"Delivered {delivered_label}"
+
+    vault_items = sorted(get_vault_items(state).items(), key=lambda pair: vault_item_sort_key(pair[1]))
+    if vault_items:
+        item_key, item = vault_items[0]
+        await deliver_vault_item(bot, state, user_id, item_key, target_chat_id=target_chat_id)
+        unlocks = record.setdefault("content_unlocks", [])
+        if isinstance(unlocks, list):
+            unlocks.append(item_key)
+        return f"Delivered {build_vault_item_label(item_key, item)}"
+
+    raise RuntimeError("No unlockable content is registered yet.")
+
+
 def begin_application(record: dict[str, Any]) -> None:
     record["status"] = "awaiting_of_username"
     record["of_username"] = None
@@ -3571,6 +3631,98 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 message_thread_id=query.message.message_thread_id,
                 text="Payment link sent.",
             )
+        return
+
+    if action == "pay":
+        payment_target_chat_id = get_buyer_chat_id(record, user_id)
+        due_amount = paypal_checkout_amount_from_record(record)
+        if due_amount is None:
+            if record.get("ppv_selected_item_price") is not None:
+                try:
+                    due_amount = int(float(record.get("ppv_selected_item_price")))
+                except (TypeError, ValueError):
+                    due_amount = None
+        due_currency = str(record.get("payment_currency") or "USD").upper()
+        if due_amount is None:
+            await query.answer("Set a payment amount first.", show_alert=True)
+            return
+        try:
+            if paypal_is_configured():
+                await send_paypal_checkout_message(
+                    context.bot,
+                    state,
+                    user_id,
+                    record,
+                    amount=due_amount,
+                    currency=due_currency,
+                    description="Payment request",
+                    text=(
+                        f"Payment request\n\n"
+                        f"Amount due: {format_currency_amount(due_amount, due_currency)}\n\n"
+                        "Tap Pay with PayPal to continue."
+                    ),
+                    target_chat_id=payment_target_chat_id,
+                )
+                await query.answer("PayPal checkout sent.")
+            else:
+                await send_and_pin_payment_message(
+                    context.bot,
+                    user_id,
+                    record,
+                    target_chat_id=payment_target_chat_id,
+                    callback_user_id=user_id,
+                )
+                await query.answer("Payment link sent.")
+        except Exception as exc:
+            LOGGER.exception("Payment button failed for user %s.", user_id)
+            await query.answer("Could not open payment.", show_alert=True)
+            if query.message is not None:
+                await context.bot.send_message(
+                    chat_id=query.message.chat.id,
+                    text=f"Payment button failed for {user_id}: {exc}",
+                )
+        return
+
+    if action == "ul":
+        if record.get("status") != "approved":
+            await query.answer("Only approved buyers can receive content.", show_alert=True)
+            return
+        if record.get("payment_status") != "paid":
+            await query.answer("Mark this buyer paid first.", show_alert=True)
+            return
+        try:
+            delivered_label = await deliver_unlock_content(
+                context.bot,
+                state,
+                user_id,
+                record,
+                target_chat_id=get_buyer_chat_id(record, user_id),
+            )
+            save_state(state)
+            await query.answer("Content sent.")
+            if query.message is not None:
+                await context.bot.send_message(
+                    chat_id=query.message.chat.id,
+                    text=delivered_label,
+                )
+        except Exception as exc:
+            LOGGER.exception("Unlock content failed for user %s.", user_id)
+            await query.answer("Could not unlock content.", show_alert=True)
+            if query.message is not None:
+                await context.bot.send_message(
+                    chat_id=query.message.chat.id,
+                    text=f"Unlock failed for {user_id}: {exc}",
+                )
+        return
+
+    if action == "st":
+        await query.edit_message_text(
+            format_detailed_status_message(user_id, record),
+            reply_markup=build_post_approval_keyboard(user_id, record)
+            if record.get("status") == "approved"
+            else build_admin_review_keyboard(user_id),
+        )
+        await query.answer("Details opened.")
         return
 
     if action == "rv":
