@@ -1,5 +1,7 @@
 import asyncio
 import base64
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -584,6 +586,7 @@ def default_user_record() -> dict[str, Any]:
         "relay_topic_name": None,
         "relay_enabled_at": None,
         "relay_closed_at": None,
+        "callback_ref": None,
         "direct_shared_at": None,
         "identity_proof_requested_at": None,
         "identity_proof_sent_at": None,
@@ -619,6 +622,23 @@ def get_user_record(state: dict[str, Any], user_id: int) -> dict[str, Any]:
     for key, value in default_user_record().items():
         record.setdefault(key, value)
     return record
+
+
+def ensure_callback_ref(record: dict[str, Any], user_id: int) -> str:
+    secret = get_required_env("BOT_TOKEN")
+    digest = hmac.new(secret.encode("utf-8"), str(user_id).encode("utf-8"), hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(digest[:12]).decode("ascii").rstrip("=")
+
+
+def resolve_callback_user_id(state: dict[str, Any], callback_ref: str | None) -> int | None:
+    if not callback_ref:
+        return None
+    if callback_ref.isdigit():
+        return int(callback_ref)
+    for user_id_text, record in state.get("users", {}).items():
+        if ensure_callback_ref(record, int(user_id_text)) == callback_ref:
+            return int(user_id_text)
+    return None
 
 
 def get_test_session_user_id(user_id: int) -> int:
@@ -872,14 +892,15 @@ def build_payment_keyboard(
     *,
     payment_url: str | None = None,
 ) -> InlineKeyboardMarkup:
+    callback_ref = ensure_callback_ref(record or {}, user_id) if user_id is not None else None
     if payment_url:
         rows = [[InlineKeyboardButton("Pay with PayPal", url=payment_url)]]
-    elif user_id is not None:
-        rows = [[InlineKeyboardButton("Pay with PayPal", callback_data=f"pay:{user_id}")]]
+    elif callback_ref is not None:
+        rows = [[InlineKeyboardButton("Pay with PayPal", callback_data=f"pay:{callback_ref}")]]
     else:
         rows = [[InlineKeyboardButton("Pay with PayPal", url=get_payment_url())]]
-    if user_id is not None:
-        rows.append([InlineKeyboardButton("Browse PPVs", callback_data=f"ppv:menu:{user_id}")])
+    if callback_ref is not None:
+        rows.append([InlineKeyboardButton("Browse PPVs", callback_data=f"ppv:menu:{callback_ref}")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1280,24 +1301,25 @@ async def send_paypal_checkout_message(
 
 
 def build_relay_topic_keyboard(user_id: int, record: dict[str, Any] | None = None) -> InlineKeyboardMarkup:
+    callback_ref = ensure_callback_ref(record or {}, user_id)
     rows = [
-        [InlineKeyboardButton(item["label"], callback_data=f"q:{item['key']}:{user_id}")]
+        [InlineKeyboardButton(item["label"], callback_data=f"q:{item['key']}:{callback_ref}")]
         for item in QUICK_PHRASES
         if item["text"] is not None
     ]
     rows.extend(
         [
             [
-                InlineKeyboardButton("\U0001F4B0 Budget reply", callback_data=f"q:price_reply:{user_id}"),
-                InlineKeyboardButton("\U0001F4B3 Pay with PayPal", callback_data=f"pay:{user_id}"),
+                InlineKeyboardButton("\U0001F4B0 Budget reply", callback_data=f"q:price_reply:{callback_ref}"),
+                InlineKeyboardButton("\U0001F4B3 Pay with PayPal", callback_data=f"pay:{callback_ref}"),
             ],
             [
-                InlineKeyboardButton("\U0001F381 Unlock content", callback_data=f"ul:{user_id}"),
-                InlineKeyboardButton("\U0001F4CA Status", callback_data=f"st:{user_id}"),
+                InlineKeyboardButton("\U0001F381 Unlock content", callback_data=f"ul:{callback_ref}"),
+                InlineKeyboardButton("\U0001F4CA Status", callback_data=f"st:{callback_ref}"),
             ],
             [
-                InlineKeyboardButton("\u26A0 Revoke", callback_data=f"rv:{user_id}"),
-                InlineKeyboardButton("\U0001F5D1 Remove", callback_data=f"rm:{user_id}"),
+                InlineKeyboardButton("\u26A0 Revoke", callback_data=f"rv:{callback_ref}"),
+                InlineKeyboardButton("\U0001F5D1 Remove", callback_data=f"rm:{callback_ref}"),
             ],
         ]
     )
@@ -1436,14 +1458,16 @@ def build_vault_item_label(item_key: str, item: dict[str, Any]) -> str:
     return title
 
 
-def build_vault_item_picker_keyboard(state: dict[str, Any], user_id: int) -> InlineKeyboardMarkup:
+def build_vault_item_picker_keyboard(state: dict[str, Any], user_id: int, record: dict[str, Any] | None = None) -> InlineKeyboardMarkup:
+    record = record or get_user_record(state, user_id)
+    callback_ref = ensure_callback_ref(record, user_id)
     items = sorted(get_vault_items(state).items(), key=lambda pair: vault_item_sort_key(pair[1]))
     rows = [
-        [InlineKeyboardButton(build_vault_item_label(item_key, item), callback_data=f"vk:{item_key}:{user_id}")]
+        [InlineKeyboardButton(build_vault_item_label(item_key, item), callback_data=f"vk:{item_key}:{callback_ref}")]
         for item_key, item in items[:20]
     ]
     if not rows:
-        rows = [[InlineKeyboardButton("No vault items", callback_data=f"noop:{user_id}")]]
+        rows = [[InlineKeyboardButton("No vault items", callback_data=f"noop:{callback_ref}")]]
     return InlineKeyboardMarkup(rows)
 
 
@@ -1453,11 +1477,6 @@ def ppv_item_sort_key(item: dict[str, Any]) -> str:
 
 def normalize_ppv_key(value: str) -> str:
     return normalize_vault_key(value)
-
-
-def extract_callback_user_id(data: str) -> int | None:
-    tail = data.rsplit(":", 1)[-1]
-    return int(tail) if tail.isdigit() else None
 
 
 def build_ppv_item_label(item_key: str, item: dict[str, Any]) -> str:
@@ -1474,20 +1493,22 @@ def build_ppv_item_detail(item_key: str, item: dict[str, Any]) -> str:
     return f"{title} | Line: {sequence_key}"
 
 
-def build_ppv_picker_keyboard(state: dict[str, Any], user_id: int) -> InlineKeyboardMarkup:
+def build_ppv_picker_keyboard(state: dict[str, Any], user_id: int, record: dict[str, Any] | None = None) -> InlineKeyboardMarkup:
+    record = record or get_user_record(state, user_id)
+    callback_ref = ensure_callback_ref(record, user_id)
     items = sorted(get_ppv_items(state).items(), key=lambda pair: ppv_item_sort_key(pair[1]))
     rows = [
-        [InlineKeyboardButton(build_ppv_item_label(item_key, item), callback_data=f"ppv:pick:{item_key}:{user_id}")]
+        [InlineKeyboardButton(build_ppv_item_label(item_key, item), callback_data=f"ppv:pick:{item_key}:{callback_ref}")]
         for item_key, item in items[:20]
     ]
     rows.append(
         [
-            InlineKeyboardButton("\U0001F9F3 View cart", callback_data=f"ppv:cart:{user_id}"),
-            InlineKeyboardButton("\U0001F6D2 Checkout", callback_data=f"ppv:checkout:{user_id}"),
+            InlineKeyboardButton("\U0001F9F3 View cart", callback_data=f"ppv:cart:{callback_ref}"),
+            InlineKeyboardButton("\U0001F6D2 Checkout", callback_data=f"ppv:checkout:{callback_ref}"),
         ]
     )
     if not rows[:-1]:
-        rows = [[InlineKeyboardButton("No PPVs yet", callback_data=f"noop:{user_id}")], rows[-1]]
+        rows = [[InlineKeyboardButton("No PPVs yet", callback_data=f"noop:{callback_ref}")], rows[-1]]
     return InlineKeyboardMarkup(rows)
 
 
@@ -1502,63 +1523,65 @@ def build_budget_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def build_admin_review_keyboard(user_id: int) -> InlineKeyboardMarkup:
+def build_admin_review_keyboard(user_id: int, record: dict[str, Any] | None = None) -> InlineKeyboardMarkup:
+    callback_ref = ensure_callback_ref(record or {}, user_id)
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("\U0001F197 Approve", callback_data=f"ar:{user_id}"),
-                InlineKeyboardButton("\U0001F4E8 Direct", callback_data=f"ad:{user_id}"),
+                InlineKeyboardButton("\U0001F197 Approve", callback_data=f"ar:{callback_ref}"),
+                InlineKeyboardButton("\U0001F4E8 Direct", callback_data=f"ad:{callback_ref}"),
             ],
             [
-                InlineKeyboardButton("\u274C Reject", callback_data=f"r:{user_id}"),
+                InlineKeyboardButton("\u274C Reject", callback_data=f"r:{callback_ref}"),
             ],
             [
-                InlineKeyboardButton("\u2753 Clarify", callback_data=f"clar:{user_id}"),
-                InlineKeyboardButton("\U0001F501 Retry username", callback_data=f"retryof:{user_id}"),
+                InlineKeyboardButton("\u2753 Clarify", callback_data=f"clar:{callback_ref}"),
+                InlineKeyboardButton("\U0001F501 Retry username", callback_data=f"retryof:{callback_ref}"),
             ],
             [
-                InlineKeyboardButton("\u2728 Promising", callback_data=f"label_promising:{user_id}"),
-                InlineKeyboardButton("Skip", callback_data=f"label_skip:{user_id}"),
-                InlineKeyboardButton("\u26A0 Dangerous", callback_data=f"label_dangerous:{user_id}"),
+                InlineKeyboardButton("\u2728 Promising", callback_data=f"label_promising:{callback_ref}"),
+                InlineKeyboardButton("Skip", callback_data=f"label_skip:{callback_ref}"),
+                InlineKeyboardButton("\u26A0 Dangerous", callback_data=f"label_dangerous:{callback_ref}"),
             ],
             [
-                InlineKeyboardButton("\u2B06 Move up", callback_data=f"p:{user_id}"),
-                InlineKeyboardButton("\U0001F422 Slow queue", callback_data=f"l:{user_id}"),
+                InlineKeyboardButton("\u2B06 Move up", callback_data=f"p:{callback_ref}"),
+                InlineKeyboardButton("\U0001F422 Slow queue", callback_data=f"l:{callback_ref}"),
             ],
             [
-                InlineKeyboardButton("\u26D4 Ban", callback_data=f"ban:{user_id}"),
-                InlineKeyboardButton("\U0001F4CB Details", callback_data=f"st:{user_id}"),
+                InlineKeyboardButton("\u26D4 Ban", callback_data=f"ban:{callback_ref}"),
+                InlineKeyboardButton("\U0001F4CB Details", callback_data=f"st:{callback_ref}"),
             ],
         ]
     )
 
 
 def build_post_approval_keyboard(user_id: int, record: dict[str, Any] | None = None) -> InlineKeyboardMarkup:
+    callback_ref = ensure_callback_ref(record or {}, user_id)
     rows = [
         [
-            InlineKeyboardButton("\U0001F4B5 Paid", callback_data=f"paid:{user_id}"),
-            InlineKeyboardButton("\U0001F514 Remind Pay", callback_data=f"rp:{user_id}"),
+            InlineKeyboardButton("\U0001F4B5 Paid", callback_data=f"paid:{callback_ref}"),
+            InlineKeyboardButton("\U0001F514 Remind Pay", callback_data=f"rp:{callback_ref}"),
         ]
     ]
     payment_status = str((record or {}).get("payment_status") or "").strip().lower()
     if record is None or payment_status == "paid":
         rows.append(
             [
-                InlineKeyboardButton("\U0001F381 Unlock content", callback_data=f"ul:{user_id}"),
-                InlineKeyboardButton("\U0001F4CA Status", callback_data=f"st:{user_id}"),
+                InlineKeyboardButton("\U0001F381 Unlock content", callback_data=f"ul:{callback_ref}"),
+                InlineKeyboardButton("\U0001F4CA Status", callback_data=f"st:{callback_ref}"),
             ]
         )
     else:
         rows.append(
             [
-                InlineKeyboardButton("\U0001F4CA Status", callback_data=f"st:{user_id}"),
-                InlineKeyboardButton("\u26A0 Revoke", callback_data=f"rv:{user_id}"),
+                InlineKeyboardButton("\U0001F4CA Status", callback_data=f"st:{callback_ref}"),
+                InlineKeyboardButton("\u26A0 Revoke", callback_data=f"rv:{callback_ref}"),
             ]
         )
     rows.append(
         [
-            InlineKeyboardButton("\U0001F5D1 Remove", callback_data=f"rm:{user_id}"),
-            InlineKeyboardButton("\u26D4 Ban", callback_data=f"ban:{user_id}"),
+            InlineKeyboardButton("\U0001F5D1 Remove", callback_data=f"rm:{callback_ref}"),
+            InlineKeyboardButton("\u26D4 Ban", callback_data=f"ban:{callback_ref}"),
         ]
     )
     return InlineKeyboardMarkup(rows)
@@ -1586,7 +1609,7 @@ async def send_ppv_picker(
             "Tap an item to add it to your cart.\n"
             "Buying the same PPV line again can move to the next item in that line."
         ),
-        reply_markup=build_ppv_picker_keyboard(state, user_id),
+        reply_markup=build_ppv_picker_keyboard(state, user_id, record),
         **kwargs,
     )
 
@@ -1655,15 +1678,23 @@ def build_ppv_menu_text(record: dict[str, Any], state: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def build_ppv_cart_keyboard(user_id: int) -> InlineKeyboardMarkup:
+def build_ppv_cart_keyboard(user_id: int, record: dict[str, Any] | None = None) -> InlineKeyboardMarkup:
+    callback_ref = ensure_callback_ref(record or {}, user_id)
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("Checkout", callback_data=f"ppv:checkout:{user_id}"),
-            InlineKeyboardButton("Back", callback_data=f"ppv:menu:{user_id}"),
+                InlineKeyboardButton("Checkout", callback_data=f"ppv:checkout:{callback_ref}"),
+            InlineKeyboardButton("Back", callback_data=f"ppv:menu:{callback_ref}"),
             ]
         ]
     )
+
+
+def ensure_content_delivery_allowed(record: dict[str, Any]) -> None:
+    if record.get("status") != "approved":
+        raise PermissionError("Only approved buyers can receive content.")
+    if record.get("payment_status") != "paid":
+        raise PermissionError("Mark this buyer paid first.")
 
 
 def build_ppv_checkout_summary(record: dict[str, Any], state: dict[str, Any]) -> str:
@@ -1693,8 +1724,11 @@ async def deliver_ppv_item(
     user_id: int,
     item_key: str,
     *,
+    record: dict[str, Any] | None = None,
     target_chat_id: int | None = None,
 ) -> None:
+    record = record or get_user_record(state, user_id)
+    ensure_content_delivery_allowed(record)
     item = get_ppv_items(state).get(item_key)
     if item is None:
         raise RuntimeError("That PPV item is no longer registered.")
@@ -1706,12 +1740,13 @@ async def deliver_ppv_item(
     )
 
 
-def build_closed_record_keyboard(user_id: int) -> InlineKeyboardMarkup:
+def build_closed_record_keyboard(user_id: int, record: dict[str, Any] | None = None) -> InlineKeyboardMarkup:
+    callback_ref = ensure_callback_ref(record, user_id) if record is not None else str(user_id)
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("Status", callback_data=f"st:{user_id}"),
-                InlineKeyboardButton("Remove", callback_data=f"rm:{user_id}"),
+                InlineKeyboardButton("Status", callback_data=f"st:{callback_ref}"),
+                InlineKeyboardButton("Remove", callback_data=f"rm:{callback_ref}"),
             ],
         ]
     )
@@ -1720,10 +1755,10 @@ def build_closed_record_keyboard(user_id: int) -> InlineKeyboardMarkup:
 def build_user_action_keyboard(user_id: int, record: dict[str, Any]) -> InlineKeyboardMarkup:
     status = record.get("status")
     if status in {"pending", "low_priority"}:
-        return build_admin_review_keyboard(user_id)
+        return build_admin_review_keyboard(user_id, record)
     if status == "approved":
         return build_post_approval_keyboard(user_id, record)
-    return build_closed_record_keyboard(user_id)
+    return build_closed_record_keyboard(user_id, record)
 
 
 def build_admin_home_keyboard() -> InlineKeyboardMarkup:
@@ -2861,7 +2896,7 @@ async def send_vault_picker(
             f"Unlock content for {format_person_label(record)}\n"
             f"Payment: {payment_status_line(record)}"
         ),
-        reply_markup=build_vault_item_picker_keyboard(state, user_id),
+        reply_markup=build_vault_item_picker_keyboard(state, user_id, record),
         **kwargs,
     )
 
@@ -2872,8 +2907,11 @@ async def deliver_vault_item(
     user_id: int,
     item_key: str,
     *,
+    record: dict[str, Any] | None = None,
     target_chat_id: int | None = None,
 ) -> None:
+    record = record or get_user_record(state, user_id)
+    ensure_content_delivery_allowed(record)
     item = get_vault_items(state).get(item_key)
     if item is None:
         raise RuntimeError("That vault item is no longer registered.")
@@ -2926,7 +2964,7 @@ async def deliver_unlock_content(
 ) -> str:
     ppv_key = resolve_next_ppv_item_key(state, record)
     if ppv_key is not None:
-        await deliver_ppv_item(bot, state, user_id, ppv_key, target_chat_id=target_chat_id)
+        await deliver_ppv_item(bot, state, user_id, ppv_key, record=record, target_chat_id=target_chat_id)
         delivered_label = build_ppv_item_label(ppv_key, get_ppv_items(state)[ppv_key])
         unlocks = record.setdefault("content_unlocks", [])
         if isinstance(unlocks, list):
@@ -2936,7 +2974,7 @@ async def deliver_unlock_content(
     vault_items = sorted(get_vault_items(state).items(), key=lambda pair: vault_item_sort_key(pair[1]))
     if vault_items:
         item_key, item = vault_items[0]
-        await deliver_vault_item(bot, state, user_id, item_key, target_chat_id=target_chat_id)
+        await deliver_vault_item(bot, state, user_id, item_key, record=record, target_chat_id=target_chat_id)
         unlocks = record.setdefault("content_unlocks", [])
         if isinstance(unlocks, list):
             unlocks.append(item_key)
@@ -2990,7 +3028,7 @@ async def ensure_relay_topic(
         chat_id=relay_group_id,
         message_thread_id=topic_id,
         text=relay_intro_text(user_id, record),
-        reply_markup=build_relay_topic_keyboard(user_id),
+        reply_markup=build_relay_topic_keyboard(user_id, record),
     )
     return topic_id, topic_name
 
@@ -3340,11 +3378,11 @@ async def complete_application(
     admin_text = format_review_card(admin_user_id, record, "New gatekeeper request")
     if exact_match_note:
         admin_text = f"{admin_text}\n{exact_match_note}"
-    await context.bot.send_message(
-        chat_id=admin_chat_id,
-        text=admin_text,
-        reply_markup=build_admin_review_keyboard(admin_user_id),
-    )
+        await context.bot.send_message(
+            chat_id=admin_chat_id,
+            text=admin_text,
+            reply_markup=build_admin_review_keyboard(admin_user_id, record),
+        )
 
 
 async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3424,7 +3462,7 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await context.bot.send_message(
                 chat_id=notification_chat_id,
                 text=format_review_card(user.id, record, "Buyer clarified request"),
-                reply_markup=build_admin_review_keyboard(user.id),
+                reply_markup=build_admin_review_keyboard(user.id, record),
             )
         return
 
@@ -3449,7 +3487,8 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     state = load_state()
     data = query.data or ""
     action = data.partition(":")[0]
-    callback_user_id = extract_callback_user_id(data)
+    callback_user_ref = data.rsplit(":", 1)[-1] if ":" in data else data
+    callback_user_id = resolve_callback_user_id(state, callback_user_ref)
 
     if data.startswith("budget:"):
         record = get_active_private_record(state, query.from_user)
@@ -3565,7 +3604,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             if query.message is not None:
                 await query.edit_message_text(
                     build_ppv_menu_text(record, state),
-                    reply_markup=build_ppv_picker_keyboard(state, query.from_user.id),
+                    reply_markup=build_ppv_picker_keyboard(state, query.from_user.id, record),
                 )
             await query.answer(f"Added {build_ppv_item_label(item_key, item)} to cart.")
             await context.bot.send_message(
@@ -3579,7 +3618,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             if query.message is not None:
                 await query.edit_message_text(
                     build_ppv_menu_text(record, state),
-                    reply_markup=build_ppv_cart_keyboard(query.from_user.id),
+                    reply_markup=build_ppv_cart_keyboard(query.from_user.id, record),
                 )
             await query.answer("Cart opened.")
             return
@@ -3812,6 +3851,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 state,
                 user_id,
                 item_key,
+                record=record,
                 target_chat_id=get_buyer_chat_id(record, user_id),
             )
             save_state(state)
@@ -3925,7 +3965,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             format_detailed_status_message(user_id, record),
             reply_markup=build_post_approval_keyboard(user_id, record)
             if record.get("status") == "approved"
-            else build_admin_review_keyboard(user_id),
+            else build_admin_review_keyboard(user_id, record),
         )
         await query.answer("Details opened.")
         return
@@ -3996,7 +4036,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         log_event("internal_label_set", buyer_id=user_id, label=record["internal_label"])
         await query.edit_message_text(
             format_review_card(user_id, record, "Internal label updated"),
-            reply_markup=build_admin_review_keyboard(user_id),
+            reply_markup=build_admin_review_keyboard(user_id, record),
         )
         await query.answer("Internal label saved.")
         return
@@ -4140,7 +4180,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         log_event("queue_changed", buyer_id=user_id, queue="priority", trigger="button")
         await query.edit_message_text(
             format_review_card(user_id, record, "Marked priority"),
-            reply_markup=build_admin_review_keyboard(user_id),
+            reply_markup=build_admin_review_keyboard(user_id, record),
         )
         await query.answer("Marked priority.")
         return
