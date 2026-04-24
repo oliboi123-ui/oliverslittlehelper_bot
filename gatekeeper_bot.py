@@ -598,13 +598,16 @@ def default_user_record() -> dict[str, Any]:
         "payment_due_amount": None,
         "payment_currency": "USD",
         "paypal_order_id": None,
+        "payment_context": "manual",
+        "payment_item_keys": [],
+        "payment_fulfilled_at": None,
+        "payment_fulfilled_order_id": None,
         "ppv_selected_item_key": None,
         "ppv_selected_item_title": None,
         "ppv_selected_item_price": None,
         "ppv_cart": [],
         "ppv_delivery_history": {},
         "content_unlocks": [],
-        "paypal_order_id": None,
         "not_fit_at": None,
         "trash_at": None,
         "banned_at": None,
@@ -718,6 +721,10 @@ def begin_test_mode_session(state: dict[str, Any], user: Any) -> dict[str, Any]:
     record["payment_reminded_at"] = None
     record["payment_due_amount"] = None
     record["payment_currency"] = "USD"
+    record["payment_context"] = "manual"
+    record["payment_item_keys"] = []
+    record["payment_fulfilled_at"] = None
+    record["payment_fulfilled_order_id"] = None
     record["ppv_selected_item_key"] = None
     record["ppv_selected_item_title"] = None
     record["ppv_selected_item_price"] = None
@@ -924,6 +931,132 @@ def schedule_bot_message(*, chat_id: int, text: str, **kwargs: Any) -> None:
         PAYPAL_BOT.send_message(chat_id=chat_id, text=text, **kwargs),
         PAYPAL_MAIN_LOOP,
     )
+
+
+def get_payment_context(record: dict[str, Any] | None) -> str:
+    return clean_text((record or {}).get("payment_context"), empty="manual").strip().lower() or "manual"
+
+
+def get_payment_item_keys(record: dict[str, Any] | None) -> list[str]:
+    raw_keys = (record or {}).get("payment_item_keys")
+    if not isinstance(raw_keys, list):
+        return []
+    keys: list[str] = []
+    for raw_key in raw_keys:
+        key = clean_text(raw_key, empty="")
+        if key and key not in keys:
+            keys.append(key)
+    return keys
+
+
+async def fulfill_paid_content(
+    bot: Any,
+    state: dict[str, Any],
+    user_id: int,
+    record: dict[str, Any],
+    *,
+    order_id: str | None = None,
+    target_chat_id: int | None = None,
+) -> list[str]:
+    if get_payment_context(record) != "ppv":
+        return []
+    ensure_content_delivery_allowed(record)
+
+    current_order_id = clean_text(order_id or record.get("paypal_order_id"), empty="")
+    if current_order_id and clean_text(record.get("payment_fulfilled_order_id"), empty="") == current_order_id:
+        return []
+
+    item_keys = get_payment_item_keys(record)
+    if not item_keys:
+        item_keys = get_ppv_cart(record)[:]
+    if not item_keys and clean_text(record.get("ppv_selected_item_key"), empty=""):
+        item_keys = [clean_text(record.get("ppv_selected_item_key"), empty="")]
+    if not item_keys:
+        return []
+
+    orders = get_paypal_orders(state)
+    order_entry = orders.get(current_order_id) if current_order_id else None
+    if order_entry is not None:
+        delivery_status = clean_text(order_entry.get("delivery_status"), empty="pending").strip().lower() or "pending"
+        if delivery_status in {"delivering", "fulfilled"}:
+            return []
+        order_entry["delivery_status"] = "delivering"
+        order_entry["delivery_started_at"] = to_iso(utc_now())
+        save_state(state)
+
+    delivered_labels: list[str] = []
+    try:
+        if len(item_keys) == 1:
+            delivered_label = await deliver_unlock_content(
+                bot,
+                state,
+                user_id,
+                record,
+                target_chat_id=target_chat_id,
+            )
+            delivered_labels.append(delivered_label.replace("Delivered ", "", 1))
+        else:
+            for item_key in item_keys:
+                item = get_ppv_items(state).get(item_key)
+                if item is None:
+                    continue
+                await deliver_ppv_item(
+                    bot,
+                    state,
+                    user_id,
+                    item_key,
+                    record=record,
+                    target_chat_id=target_chat_id,
+                )
+                unlocks = record.setdefault("content_unlocks", [])
+                if isinstance(unlocks, list):
+                    unlocks.append(item_key)
+                delivered_labels.append(build_ppv_item_label(item_key, item))
+    except Exception:
+        if order_entry is not None:
+            order_entry["delivery_status"] = "failed"
+            order_entry["delivery_failed_at"] = to_iso(utc_now())
+        save_state(state)
+        raise
+
+    record["payment_fulfilled_at"] = to_iso(utc_now())
+    record["payment_fulfilled_order_id"] = current_order_id or record.get("paypal_order_id")
+    record["payment_item_keys"] = []
+    record["ppv_cart"] = []
+    record["ppv_selected_item_key"] = None
+    record["ppv_selected_item_title"] = None
+    record["ppv_selected_item_price"] = None
+    if order_entry is not None:
+        order_entry["delivery_status"] = "fulfilled"
+        order_entry["delivery_completed_at"] = to_iso(utc_now())
+        order_entry["delivered_items"] = delivered_labels[:]
+    save_state(state)
+    return delivered_labels
+
+
+def schedule_paid_content_fulfillment(
+    user_id: int,
+    *,
+    order_id: str | None = None,
+) -> None:
+    if PAYPAL_BOT is None or PAYPAL_MAIN_LOOP is None:
+        return
+
+    async def _runner() -> None:
+        try:
+            state = load_state()
+            record = get_user_record(state, user_id)
+            await fulfill_paid_content(
+                PAYPAL_BOT,
+                state,
+                user_id,
+                record,
+                order_id=order_id,
+            )
+        except Exception:
+            LOGGER.exception("Auto-fulfillment failed for buyer %s.", user_id)
+
+    asyncio.run_coroutine_threadsafe(_runner(), PAYPAL_MAIN_LOOP)
 
 
 def paypal_api_request_json(method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1142,7 +1275,6 @@ def paypal_mark_payment_complete(state: dict[str, Any], order_id: str, event: di
         return None
     record = get_user_record(state, user_id)
     if record.get("payment_status") == "paid":
-        orders.pop(order_id, None)
         save_state(state)
         return None
     record["payment_status"] = "paid"
@@ -1152,7 +1284,7 @@ def paypal_mark_payment_complete(state: dict[str, Any], order_id: str, event: di
     if order_entry is not None:
         order_entry["status"] = "completed"
         order_entry["completed_at"] = to_iso(utc_now())
-    orders.pop(order_id, None)
+        order_entry.setdefault("delivery_status", "pending")
     save_state(state)
     return user_id, record
 
@@ -1182,6 +1314,7 @@ def paypal_notify_payment_complete(state: dict[str, Any], user_id: int, record: 
             chat_id=int(admin_chat_id),
             text=f"PayPal payment confirmed for {format_person_label(record)} ({user_id}).",
         )
+    schedule_paid_content_fulfillment(user_id, order_id=str(record.get("paypal_order_id") or "").strip() or None)
 
 
 def paypal_process_webhook(raw_body: bytes, headers: Any) -> str:
@@ -1368,6 +1501,8 @@ async def send_paypal_checkout_message(
     description: str,
     text: str,
     target_chat_id: int | None = None,
+    payment_context: str = "manual",
+    payment_item_keys: list[str] | None = None,
 ) -> None:
     order_id, approval_url = await asyncio.to_thread(
         paypal_create_order,
@@ -1383,6 +1518,10 @@ async def send_paypal_checkout_message(
     record["paypal_order_id"] = order_id
     record["payment_status"] = "pending"
     record["payment_requested_at"] = to_iso(utc_now())
+    record["payment_context"] = clean_text(payment_context, empty="manual").strip().lower() or "manual"
+    record["payment_item_keys"] = [clean_text(key, empty="") for key in (payment_item_keys or []) if clean_text(key, empty="")]
+    record["payment_fulfilled_at"] = None
+    record["payment_fulfilled_order_id"] = None
     save_state(state)
     message = await bot.send_message(
         chat_id=target_chat_id if target_chat_id is not None else user_id,
@@ -3064,6 +3203,9 @@ async def deliver_unlock_content(
     *,
     target_chat_id: int | None = None,
 ) -> str:
+    current_order_id = clean_text(record.get("paypal_order_id"), empty="")
+    if get_payment_context(record) == "ppv" and current_order_id and clean_text(record.get("payment_fulfilled_order_id"), empty="") == current_order_id:
+        raise RuntimeError("This PPV order has already been delivered.")
     ppv_key = resolve_next_ppv_item_key(state, record)
     if ppv_key is not None:
         await deliver_ppv_item(bot, state, user_id, ppv_key, record=record, target_chat_id=target_chat_id)
@@ -3142,10 +3284,16 @@ async def send_and_pin_payment_message(
     *,
     target_chat_id: int | None = None,
     callback_user_id: int | None = None,
+    payment_context: str = "manual",
+    payment_item_keys: list[str] | None = None,
 ) -> None:
     current_time = utc_now()
     record["payment_status"] = "pending"
     record["payment_requested_at"] = to_iso(current_time)
+    record["payment_context"] = clean_text(payment_context, empty="manual").strip().lower() or "manual"
+    record["payment_item_keys"] = [clean_text(key, empty="") for key in (payment_item_keys or []) if clean_text(key, empty="")]
+    record["payment_fulfilled_at"] = None
+    record["payment_fulfilled_order_id"] = None
     callback_target_id = callback_user_id if callback_user_id is not None else user_id
     message = await bot.send_message(
         chat_id=target_chat_id if target_chat_id is not None else user_id,
@@ -3648,6 +3796,14 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             save_state(state)
             log_event("payment_confirmed", buyer_id=user_id, trigger="test")
             await query.answer("Payment simulated.")
+            await fulfill_paid_content(
+                context.bot,
+                state,
+                user_id,
+                record,
+                order_id=str(record.get("paypal_order_id") or "").strip() or None,
+                target_chat_id=get_buyer_chat_id(record, user_id),
+            )
             await query.edit_message_text(
                 "Payment marked as received.",
                 reply_markup=build_post_approval_keyboard(user_id, record),
@@ -3754,6 +3910,8 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                         "Tap PayPal below to complete the purchase."
                     ),
                     target_chat_id=buyer_chat_id,
+                    payment_context="ppv",
+                    payment_item_keys=cart,
                 )
                 await query.answer("PayPal checkout sent.")
                 if query.message.chat.type == "supergroup":
@@ -3771,6 +3929,8 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             record,
             target_chat_id=buyer_chat_id,
             callback_user_id=user_id,
+            payment_context="ppv",
+            payment_item_keys=cart,
         )
         save_state(state)
         await query.answer("Payment link sent.")
@@ -4172,6 +4332,14 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await context.bot.send_message(
             chat_id=get_buyer_chat_id(record, user_id),
             text=template("payment_confirmed"),
+        )
+        await fulfill_paid_content(
+            context.bot,
+            state,
+            user_id,
+            record,
+            order_id=str(record.get("paypal_order_id") or "").strip() or None,
+            target_chat_id=get_buyer_chat_id(record, user_id),
         )
         await query.edit_message_text(
             format_review_card(user_id, record, "Payment confirmed"),
