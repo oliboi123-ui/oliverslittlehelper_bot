@@ -323,7 +323,15 @@ def get_paypal_webhook_id() -> str | None:
 
 
 def get_paypal_public_base_url() -> str | None:
-    return get_optional_env("PAYPAL_PUBLIC_BASE_URL")
+    base_url = get_optional_env("PAYPAL_PUBLIC_BASE_URL")
+    if not base_url:
+        return None
+    base_url = base_url.strip()
+    if not base_url:
+        return None
+    if not base_url.startswith(("http://", "https://")):
+        base_url = "https://" + base_url.lstrip("/")
+    return base_url.rstrip("/")
 
 
 def get_paypal_return_url() -> str | None:
