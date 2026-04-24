@@ -678,12 +678,23 @@ def is_sandbox_record(record: dict[str, Any]) -> bool:
     return bool(record.get("test_mode"))
 
 
-def begin_test_mode_session(state: dict[str, Any], user: Any) -> dict[str, Any]:
+def get_test_mode_flow(state: dict[str, Any], user: Any) -> str:
+    session = get_test_sessions(state).get(str(user.id))
+    if session is None:
+        return "buyer"
+    return str(session.get("mode") or "buyer").strip().lower() or "buyer"
+
+
+def begin_test_mode_session(state: dict[str, Any], user: Any, *, mode: str = "buyer") -> dict[str, Any]:
+    mode = str(mode or "buyer").strip().lower()
+    if mode not in {"buyer", "full"}:
+        mode = "buyer"
     session = get_test_sessions(state).setdefault(str(user.id), {})
     session["active"] = True
     session["started_at"] = to_iso(utc_now())
     session["buyer_user_id"] = get_test_session_user_id(user.id)
     session["buyer_chat_id"] = user.id
+    session["mode"] = mode
 
     record = get_user_record(state, session["buyer_user_id"])
     record.clear()
@@ -691,30 +702,8 @@ def begin_test_mode_session(state: dict[str, Any], user: Any) -> dict[str, Any]:
     record["test_mode"] = True
     record["test_mode_buyer_user_id"] = session["buyer_user_id"]
     record["test_mode_chat_id"] = session["buyer_chat_id"]
-    record["status"] = "new"
-    record["telegram_username"] = "test_mode"
-    record["first_name"] = "Test"
-    record["last_name"] = "Buyer"
-    record["approved_at"] = None
-    record["expires_at"] = None
-    record["last_checked_at"] = None
-    record["subscription_status"] = "unknown"
-    record["subscription_expires_at"] = None
-    record["onlyfans_user_id"] = None
-    record["budget_range_key"] = None
-    record["budget_range_label"] = None
-    record["budget_floor"] = None
-    record["review_priority"] = "normal"
-    record["purchase_intent"] = None
-    record["queued_at"] = None
-    record["contact_mode"] = None
-    record["relay_topic_id"] = None
-    record["relay_topic_name"] = None
-    record["relay_enabled_at"] = None
-    record["relay_closed_at"] = None
-    record["direct_shared_at"] = None
-    record["identity_proof_requested_at"] = None
-    record["identity_proof_sent_at"] = None
+    record["test_mode_flow"] = mode
+    record["test_mode_started_at"] = session["started_at"]
     record["payment_message_id"] = None
     record["payment_status"] = "not_requested"
     record["payment_requested_at"] = None
@@ -729,8 +718,6 @@ def begin_test_mode_session(state: dict[str, Any], user: Any) -> dict[str, Any]:
     record["ppv_selected_item_key"] = None
     record["ppv_selected_item_title"] = None
     record["ppv_selected_item_price"] = None
-    record["payment_due_amount"] = None
-    record["payment_currency"] = "USD"
     record["ppv_cart"] = []
     record["ppv_delivery_history"] = {}
     record["content_unlocks"] = []
@@ -741,8 +728,60 @@ def begin_test_mode_session(state: dict[str, Any], user: Any) -> dict[str, Any]:
     record["clarification_requested_at"] = None
     record["clarification_response"] = None
     record["internal_label"] = None
-    begin_application(record)
-    record["test_mode"] = True
+
+    current_time = utc_now()
+    if mode == "full":
+        record["status"] = "new"
+        record["telegram_username"] = "test_mode"
+        record["first_name"] = "Test"
+        record["last_name"] = "Buyer"
+        record["approved_at"] = None
+        record["expires_at"] = None
+        record["last_checked_at"] = None
+        record["subscription_status"] = "unknown"
+        record["subscription_expires_at"] = None
+        record["onlyfans_user_id"] = None
+        record["budget_range_key"] = None
+        record["budget_range_label"] = None
+        record["budget_floor"] = None
+        record["review_priority"] = "normal"
+        record["purchase_intent"] = None
+        record["queued_at"] = None
+        record["contact_mode"] = None
+        record["relay_topic_id"] = None
+        record["relay_topic_name"] = None
+        record["relay_enabled_at"] = None
+        record["relay_closed_at"] = None
+        record["direct_shared_at"] = None
+        record["identity_proof_requested_at"] = None
+        record["identity_proof_sent_at"] = None
+        begin_application(record)
+    else:
+        pseudo_id = abs(int(user.id)) % 10000
+        record["status"] = "approved"
+        record["telegram_username"] = f"buyer_{pseudo_id}"
+        record["first_name"] = "Mika"
+        record["last_name"] = "Vale"
+        record["approved_at"] = to_iso(current_time)
+        record["expires_at"] = to_iso(current_time + timedelta(days=get_access_duration_days()))
+        record["last_checked_at"] = None
+        record["subscription_status"] = "active"
+        record["subscription_expires_at"] = to_iso(current_time + timedelta(days=get_access_duration_days()))
+        record["onlyfans_user_id"] = f"test-{session['buyer_user_id']}"
+        record["budget_range_key"] = "test"
+        record["budget_range_label"] = "Test buyer"
+        record["budget_floor"] = 250
+        record["review_priority"] = "normal"
+        record["purchase_intent"] = "Testing the buyer journey"
+        record["queued_at"] = to_iso(current_time)
+        record["contact_mode"] = "relay"
+        record["relay_topic_id"] = None
+        record["relay_topic_name"] = None
+        record["relay_enabled_at"] = None
+        record["relay_closed_at"] = None
+        record["direct_shared_at"] = None
+        record["identity_proof_requested_at"] = None
+        record["identity_proof_sent_at"] = None
     record["test_mode_started_at"] = session["started_at"]
     return record
 
@@ -3100,7 +3139,7 @@ def resolve_admin_chat_id(state: dict[str, Any], user: Any) -> int | None:
 def get_admin_private_command_state(
     update: Any,
     *,
-    test_mode_message: str = "Exit /testmode first to use this command.",
+    test_mode_message: str = "This chat is in buyer test mode. Use /testmodefull or switch back to the admin chat.",
     chat_message: str = "Open the admin chat first, then use this command there.",
 ) -> tuple[dict[str, Any] | None, str | None]:
     if not getattr(update, "effective_user", None) or not getattr(update, "effective_chat", None) or not getattr(update, "message", None):
@@ -4730,15 +4769,39 @@ async def testmode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if admin_chat_id != update.effective_chat.id:
         return
 
-    if is_test_mode_active(state, update.effective_user):
-        end_test_mode_session(state, update.effective_user)
-        save_state(state)
-        await update.message.reply_text("Exited test mode.")
+    begin_test_mode_session(state, update.effective_user, mode="buyer")
+    save_state(state)
+    log_event("test_mode_started", buyer_id=update.effective_user.id, mode="buyer")
+    record = get_active_private_record(state, update.effective_user)
+    try:
+        await send_relay_contact(
+            context.bot,
+            state,
+            int(record.get("test_mode_buyer_user_id") or update.effective_user.id),
+            record,
+            now=utc_now(),
+        )
+    except Exception as exc:
+        LOGGER.exception("Test buyer relay setup failed.")
+        await update.message.reply_text(f"Test mode started, but relay setup failed: {exc}")
+        return
+    save_state(state)
+
+
+async def testmodefull(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.effective_chat or not update.message:
+        return
+    if update.effective_chat.type != "private":
         return
 
-    begin_test_mode_session(state, update.effective_user)
+    state = load_state()
+    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
+    if admin_chat_id != update.effective_chat.id:
+        return
+
+    begin_test_mode_session(state, update.effective_user, mode="full")
     save_state(state)
-    log_event("test_mode_started", buyer_id=update.effective_user.id)
+    log_event("test_mode_started", buyer_id=update.effective_user.id, mode="full")
     await start(update, context)
 
 
@@ -4753,9 +4816,26 @@ async def testreset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if admin_chat_id != update.effective_chat.id:
         return
 
-    begin_test_mode_session(state, update.effective_user)
+    mode = get_test_mode_flow(state, update.effective_user)
+    begin_test_mode_session(state, update.effective_user, mode=mode)
     save_state(state)
-    log_event("test_mode_reset", buyer_id=update.effective_user.id)
+    log_event("test_mode_reset", buyer_id=update.effective_user.id, mode=mode)
+    if mode == "buyer":
+        record = get_active_private_record(state, update.effective_user)
+        try:
+            await send_relay_contact(
+                context.bot,
+                state,
+                int(record.get("test_mode_buyer_user_id") or update.effective_user.id),
+                record,
+                now=utc_now(),
+            )
+        except Exception as exc:
+            LOGGER.exception("Test buyer relay reset failed.")
+            await update.message.reply_text(f"Test mode reset, but relay setup failed: {exc}")
+            return
+        save_state(state)
+        return
     await start(update, context)
 
 
@@ -5683,6 +5763,7 @@ def main() -> None:
     app.add_handler(CommandHandler("notifyunverified", notify_unverified_manual))
     app.add_handler(CommandHandler("syncsubs", sync_subs))
     app.add_handler(CommandHandler("testmode", testmode))
+    app.add_handler(CommandHandler("testmodefull", testmodefull))
     app.add_handler(CommandHandler("testreset", testreset))
     app.add_handler(CommandHandler("verifyof", verifyof))
     app.add_handler(CommandHandler("setof", setof_manual))
