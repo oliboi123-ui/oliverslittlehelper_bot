@@ -528,8 +528,11 @@ def default_user_record() -> dict[str, Any]:
         "ppv_selected_item_key": None,
         "ppv_selected_item_title": None,
         "ppv_selected_item_price": None,
+        "ppv_cart": [],
+        "ppv_delivery_history": {},
         "content_unlocks": [],
         "not_fit_at": None,
+        "trash_at": None,
         "banned_at": None,
         "ban_reason": None,
         "clarification_requested_at": None,
@@ -625,8 +628,11 @@ def begin_test_mode_session(state: dict[str, Any], user: Any) -> dict[str, Any]:
     record["ppv_selected_item_key"] = None
     record["ppv_selected_item_title"] = None
     record["ppv_selected_item_price"] = None
+    record["ppv_cart"] = []
+    record["ppv_delivery_history"] = {}
     record["content_unlocks"] = []
     record["not_fit_at"] = None
+    record["trash_at"] = None
     record["banned_at"] = None
     record["ban_reason"] = None
     record["clarification_requested_at"] = None
@@ -865,6 +871,11 @@ def classify_low_priority(record: dict[str, Any]) -> bool:
     return budget_floor < 100
 
 
+def classify_trash(record: dict[str, Any]) -> bool:
+    budget_floor = int(record.get("budget_floor") or 0)
+    return budget_floor < 50
+
+
 def get_quick_phrase(key: str) -> dict[str, str] | None:
     for item in QUICK_PHRASES:
         if item["key"] == key:
@@ -944,14 +955,26 @@ def build_ppv_item_label(item_key: str, item: dict[str, Any]) -> str:
     return title
 
 
+def build_ppv_item_detail(item_key: str, item: dict[str, Any]) -> str:
+    title = build_ppv_item_label(item_key, item)
+    sequence_key = clean_text(item.get("sequence_key"), empty=item_key)
+    return f"{title} | Next in line: {sequence_key}"
+
+
 def build_ppv_picker_keyboard(state: dict[str, Any], user_id: int) -> InlineKeyboardMarkup:
     items = sorted(get_ppv_items(state).items(), key=lambda pair: ppv_item_sort_key(pair[1]))
     rows = [
         [InlineKeyboardButton(build_ppv_item_label(item_key, item), callback_data=f"ppv:pick:{item_key}:{user_id}")]
         for item_key, item in items[:20]
     ]
-    if not rows:
-        rows = [[InlineKeyboardButton("No PPVs yet", callback_data=f"noop:{user_id}")]]
+    rows.append(
+        [
+            InlineKeyboardButton("🛒 View cart", callback_data=f"ppv:cart:{user_id}"),
+            InlineKeyboardButton("💸 Checkout", callback_data=f"ppv:checkout:{user_id}"),
+        ]
+    )
+    if not rows[:-1]:
+        rows = [[InlineKeyboardButton("No PPVs yet", callback_data=f"noop:{user_id}")], rows[-1]]
     return InlineKeyboardMarkup(rows)
 
 
@@ -989,6 +1012,7 @@ def build_admin_review_keyboard(user_id: int) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton("⬆ Move Up", callback_data=f"p:{user_id}"),
                 InlineKeyboardButton("⏳ Slow Queue", callback_data=f"l:{user_id}"),
+                InlineKeyboardButton("🗑 Trash", callback_data=f"trash:{user_id}"),
             ],
             [
                 InlineKeyboardButton("🚫 Ban", callback_data=f"ban:{user_id}"),
@@ -1046,11 +1070,97 @@ async def send_ppv_picker(
         chat_id=chat_id,
         text=(
             f"PPVs for {format_person_label(record)}\n"
-            f"Payment: {payment_status_line(record)}"
+            f"Payment: {payment_status_line(record)}\n"
+            "Buying the same PPV again will move to the next item in that line if one exists."
         ),
         reply_markup=build_ppv_picker_keyboard(state, user_id),
         **kwargs,
     )
+
+
+def get_ppv_cart(record: dict[str, Any]) -> list[str]:
+    cart = record.setdefault("ppv_cart", [])
+    if not isinstance(cart, list):
+        cart = []
+        record["ppv_cart"] = cart
+    return cart
+
+
+def get_ppv_delivery_history(record: dict[str, Any]) -> dict[str, int]:
+    history = record.setdefault("ppv_delivery_history", {})
+    if not isinstance(history, dict):
+        history = {}
+        record["ppv_delivery_history"] = history
+    return history
+
+
+def resolve_ppv_sequence_item_key(state: dict[str, Any], base_key: str, delivery_count: int) -> str | None:
+    items = get_ppv_items(state)
+    base_item = items.get(base_key)
+    if base_item is None:
+        return None
+    sequence_key = str(base_item.get("sequence_key") or base_key).strip()
+    if not sequence_key:
+        return base_key
+    sequence_items = [
+        (item_key, item)
+        for item_key, item in items.items()
+        if str(item.get("sequence_key") or item_key).strip() == sequence_key
+    ]
+    sequence_items.sort(key=lambda pair: ppv_item_sort_key(pair[1]))
+    if not sequence_items:
+        return base_key
+    index = min(delivery_count, len(sequence_items) - 1)
+    return sequence_items[index][0]
+
+
+def build_ppv_menu_text(record: dict[str, Any], state: dict[str, Any]) -> str:
+    items = sorted(get_ppv_items(state).items(), key=lambda pair: ppv_item_sort_key(pair[1]))
+    lines = [
+        "PPV menu",
+        "",
+        "Tap to add items to your cart.",
+        "If you buy the same PPV line again, the next item in that line can unlock instead.",
+        "",
+        f"Cart: {len(get_ppv_cart(record))} item{'s' if len(get_ppv_cart(record)) != 1 else ''}",
+    ]
+    for item_key, item in items[:10]:
+        lines.append(f"- {build_ppv_item_detail(item_key, item)}")
+    if not items:
+        lines.append("No PPVs are set up yet.")
+    return "\n".join(lines)
+
+
+def build_ppv_cart_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🧾 Checkout", callback_data=f"ppv:checkout:{user_id}"),
+                InlineKeyboardButton("↩ Back", callback_data=f"ppv:menu:{user_id}"),
+            ]
+        ]
+    )
+
+
+def build_ppv_checkout_summary(record: dict[str, Any], state: dict[str, Any]) -> str:
+    cart = get_ppv_cart(record)
+    if not cart:
+        return "Your cart is empty."
+    lines = [
+        "Checkout",
+        "",
+        f"Items: {len(cart)}",
+    ]
+    total = 0
+    for item_key in cart:
+        item = get_ppv_items(state).get(item_key)
+        if item is None:
+            continue
+        lines.append(f"- {build_ppv_item_label(item_key, item)}")
+        if isinstance(item.get("price"), int):
+            total += int(item["price"])
+    lines.extend(["", f"Total: ${total}"])
+    return "\n".join(lines)
 
 
 async def deliver_ppv_item(
@@ -1242,6 +1352,7 @@ def format_admin_help() -> str:
         "/senddirect <user_id>\n"
         "/revoke <user_id>\n"
         "/removeuser <user_id>\n"
+        "/trash <user_id>\n"
         "/vaultregister\n"
         "/vaultadd <key> [title] (reply to a vault post)\n"
         "/vaultlist\n"
@@ -1252,8 +1363,30 @@ def format_admin_help() -> str:
         "/notifyunverified\n"
         "/syncsubs\n"
         "/testmode\n"
+        "/testreset\n"
         "/verifyof <onlyfans_username>\n"
         "/ofdiag"
+    )
+
+
+def format_operator_help() -> str:
+    return (
+        "Command guide\n\n"
+        "PPVs:\n"
+        "/ppvlist\n"
+        "/ppvadd <key> <price> [title] (reply to media)\n\n"
+        "Queue actions:\n"
+        "/pending [all|low|normal|priority|expired]\n"
+        "/trash <user_id>\n"
+        "/revoke <user_id>\n"
+        "/approve <user_id>\n"
+        "/approverelay <user_id>\n\n"
+        "Test mode:\n"
+        "/testmode\n"
+        "/testreset\n\n"
+        "PPV notes:\n"
+        "Add the same PPV key again to replace the media, title, or price.\n"
+        "Use a sequence key if you want repeat purchases to move to the next item in line."
     )
 
 
@@ -2122,6 +2255,7 @@ def register_ppv_item(
     key: str,
     title: str,
     price: int,
+    sequence_key: str | None = None,
     source_chat_id: int,
     source_message_id: int,
     registered_by: int | None = None,
@@ -2130,6 +2264,7 @@ def register_ppv_item(
     ppv_items[key] = {
         "title": title,
         "price": price,
+        "sequence_key": sequence_key or key,
         "source_chat_id": source_chat_id,
         "source_message_id": source_message_id,
         "registered_by": registered_by,
@@ -2561,6 +2696,20 @@ async def complete_application(
         await update.message.reply_text(low_priority_message())
         return
 
+    if classify_trash(record):
+        record["status"] = "trash"
+        record["trash_at"] = to_iso(utc_now())
+        record["review_priority"] = "trash"
+        save_state(state)
+        log_event(
+            "trash_queued",
+            buyer_id=admin_user_id,
+            budget_key=record.get("budget_range_key"),
+            verified=record.get("subscription_status") == "active",
+        )
+        await update.message.reply_text("Queued as trash.")
+        return
+
     record["status"] = "pending"
     save_state(state)
     log_event(
@@ -2795,23 +2944,52 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             if item is None:
                 await query.answer("That PPV item is no longer registered.", show_alert=True)
                 return
-
-            record["ppv_selected_item_key"] = item_key
-            record["ppv_selected_item_title"] = item.get("title")
-            record["ppv_selected_item_price"] = item.get("price")
+            cart = get_ppv_cart(record)
+            if item_key not in cart:
+                cart.append(item_key)
             save_state(state)
-            await send_and_pin_payment_message(
-                context.bot,
-                query.from_user.id,
-                record,
-                target_chat_id=buyer_chat_id,
-                callback_user_id=query.from_user.id,
-            )
             if query.message is not None:
                 await query.edit_message_text(
-                    f"PPV selected: {build_ppv_item_label(item_key, item)}\n\nPayment link sent."
+                    build_ppv_menu_text(record, state),
+                    reply_markup=build_ppv_picker_keyboard(state, query.from_user.id),
                 )
-            await query.answer("PPV selected.")
+            await query.answer(f"Added {build_ppv_item_label(item_key, item)} to cart.")
+            await context.bot.send_message(
+                chat_id=buyer_chat_id,
+                text=f"Added to cart: {build_ppv_item_label(item_key, item)}",
+                protect_content=True,
+            )
+            return
+
+        if ppv_action == "cart":
+            if query.message is not None:
+                await query.edit_message_text(
+                    build_ppv_menu_text(record, state),
+                    reply_markup=build_ppv_cart_keyboard(query.from_user.id),
+                )
+            await query.answer("Cart opened.")
+            return
+
+        if ppv_action == "checkout":
+            cart = get_ppv_cart(record)
+            if not cart:
+                await query.answer("Your cart is empty.", show_alert=True)
+                return
+            record["ppv_selected_item_key"] = cart[0]
+            first_item = get_ppv_items(state).get(cart[0])
+            record["ppv_selected_item_title"] = first_item.get("title") if first_item else None
+            record["ppv_selected_item_price"] = first_item.get("price") if first_item else None
+            save_state(state)
+            await context.bot.send_message(
+                chat_id=buyer_chat_id,
+                text=(
+                    f"{build_ppv_checkout_summary(record, state)}\n\n"
+                    "Use the PayPal button below to complete the purchase."
+                ),
+                reply_markup=build_payment_keyboard(query.from_user.id, record),
+                protect_content=True,
+            )
+            await query.answer("Checkout ready.")
             return
 
         if ppv_action == "back":
@@ -2987,33 +3165,53 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if record.get("status") != "approved" or str(record.get("payment_status") or "").strip().lower() != "paid":
             await query.answer("Mark payment as paid first.", show_alert=True)
             return
-        selected_ppv_key = str(record.get("ppv_selected_item_key") or "").strip()
-        if selected_ppv_key:
-            item = get_ppv_items(state).get(selected_ppv_key)
-            if item is None:
-                await query.answer("That PPV item is no longer registered.", show_alert=True)
-                return
-            await deliver_ppv_item(
-                context.bot,
-                state,
-                user_id,
-                selected_ppv_key,
-                target_chat_id=get_buyer_chat_id(record, user_id),
-            )
-            record.setdefault("content_unlocks", []).append(
-                {
-                    "item_key": selected_ppv_key,
-                    "delivered_at": to_iso(utc_now()),
-                }
-            )
+        cart = get_ppv_cart(record)
+        if cart:
+            total = 0
+            delivered_labels: list[str] = []
+            delivered_counts = get_ppv_delivery_history(record)
+            for item_key in cart:
+                item = get_ppv_items(state).get(item_key)
+                if item is None:
+                    continue
+                base_key = str(item.get("sequence_key") or item_key).strip() or item_key
+                delivery_count = int(delivered_counts.get(base_key, 0))
+                delivery_key = resolve_ppv_sequence_item_key(state, item_key, delivery_count)
+                if delivery_key is None:
+                    continue
+                delivery_item = get_ppv_items(state).get(delivery_key)
+                if delivery_item is None:
+                    continue
+                await deliver_ppv_item(
+                    context.bot,
+                    state,
+                    user_id,
+                    delivery_key,
+                    target_chat_id=get_buyer_chat_id(record, user_id),
+                )
+                delivered_labels.append(build_ppv_item_label(delivery_key, delivery_item))
+                delivered_counts[base_key] = delivery_count + 1
+                record.setdefault("content_unlocks", []).append(
+                    {
+                        "item_key": delivery_key,
+                        "delivered_at": to_iso(utc_now()),
+                    }
+                )
+                if isinstance(delivery_item.get("price"), int):
+                    total += int(delivery_item["price"])
+            record["ppv_selected_item_key"] = cart[0]
+            first_item = get_ppv_items(state).get(cart[0])
+            record["ppv_selected_item_title"] = first_item.get("title") if first_item else None
+            record["ppv_selected_item_price"] = first_item.get("price") if first_item else None
+            record["ppv_cart"] = []
             save_state(state)
-            await query.answer("PPV unlocked.")
+            await query.answer("PPVs unlocked.")
             message_kwargs: dict[str, Any] = {}
             if query.message.chat.type == "supergroup":
                 message_kwargs["message_thread_id"] = query.message.message_thread_id
             await context.bot.send_message(
                 chat_id=query.message.chat.id,
-                text=f"Unlocked PPV: {build_ppv_item_label(selected_ppv_key, item)}",
+                text=f"Unlocked PPVs: {', '.join(delivered_labels)}",
                 **message_kwargs,
             )
             return
@@ -3334,6 +3532,16 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         log_event("queue_changed", buyer_id=user_id, queue="low", trigger="button")
         await query.edit_message_text(format_review_card(user_id, record, "Moved to low-priority queue"))
         await query.answer("Moved to low-priority queue.")
+        return
+
+    if action == "trash":
+        record["review_priority"] = "trash"
+        record["status"] = "trash"
+        record["trash_at"] = to_iso(utc_now())
+        save_state(state)
+        log_event("queue_changed", buyer_id=user_id, queue="trash", trigger="button")
+        await query.edit_message_text(format_review_card(user_id, record, "Moved to trash queue"))
+        await query.answer("Moved to trash queue.")
         return
 
     await query.answer("Unknown action.", show_alert=True)
@@ -3695,7 +3903,50 @@ async def lowpriority_manual(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await reprioritize(update, context, "low")
 
 
-async def reprioritize(update: Update, context: ContextTypes.DEFAULT_TYPE, new_priority: str) -> None:
+async def trash_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.effective_chat or not update.message:
+        return
+    if update.effective_chat.type != "private":
+        return
+
+    state = load_state()
+    if is_private_buyer_test_context(state, update):
+        return
+    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
+    if admin_chat_id != update.effective_chat.id:
+        return
+
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: /trash <user_id>")
+        return
+
+    user_id = int(context.args[0])
+    record = get_user_record(state, user_id)
+    record["status"] = "trash"
+    record["review_priority"] = "trash"
+    record["trash_at"] = to_iso(utc_now())
+    save_state(state)
+    log_event("queue_changed", buyer_id=user_id, queue="trash", trigger="command")
+    await update.message.reply_text("Queued as trash.")
+
+
+async def ppvhelp_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.effective_chat or not update.message:
+        return
+    if update.effective_chat.type != "private":
+        return
+
+    state = load_state()
+    if is_private_buyer_test_context(state, update):
+        return
+    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
+    if admin_chat_id != update.effective_chat.id:
+        return
+
+    await update.message.reply_text(format_operator_help())
+
+
+async def reprioritize(update: Update, context: Types.DEFAULT_TYPE, new_priority: str) -> None:
     if not update.effective_user or not update.effective_chat or not update.message:
         return
     if update.effective_chat.type != "private":
@@ -4111,6 +4362,7 @@ def main() -> None:
     app.add_handler(CommandHandler("reject", reject_manual))
     app.add_handler(CommandHandler("priority", priority_manual))
     app.add_handler(CommandHandler("lowpriority", lowpriority_manual))
+    app.add_handler(CommandHandler("trash", trash_manual))
     app.add_handler(CommandHandler("renew", renew_manual))
     app.add_handler(CommandHandler("senddirect", senddirect_manual))
     app.add_handler(CommandHandler("revoke", revoke_manual))
@@ -4120,6 +4372,7 @@ def main() -> None:
     app.add_handler(CommandHandler("vaultlist", vaultlist_manual))
     app.add_handler(CommandHandler("ppvadd", ppvadd_manual))
     app.add_handler(CommandHandler("ppvlist", ppvlist_manual))
+    app.add_handler(CommandHandler("ppvhelp", ppvhelp_manual))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("details", details_command))
     app.add_handler(CommandHandler("expiring", expiring))
