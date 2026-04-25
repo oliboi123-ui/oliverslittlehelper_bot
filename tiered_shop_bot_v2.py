@@ -595,6 +595,7 @@ def new_record(
         "notes": [],
         "purchases": [],
         "pending_buyer_action": None,
+        "bot_issue_reports": [],
         "delivery_counters": {},
         "created_at": to_iso(utc_now()),
         "updated_at": to_iso(utc_now()),
@@ -625,6 +626,7 @@ def get_user_record(state: dict[str, Any], user_id: int) -> dict[str, Any]:
             "notes": [],
             "purchases": [],
             "pending_buyer_action": None,
+            "bot_issue_reports": [],
             "delivery_counters": {},
             "created_at": to_iso(utc_now()),
             "updated_at": to_iso(utc_now()),
@@ -693,6 +695,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("my access \U0001f464", callback_data="menu:access")],
             [InlineKeyboardButton("my purchases \U0001f4e6", callback_data="menu:purchases")],
             [InlineKeyboardButton("payment help \U0001f4b8", callback_data="menu:payment_help")],
+            [InlineKeyboardButton("something wrong? \U0001f6df", callback_data="menu:report_issue")],
             [InlineKeyboardButton("rules & boundaries \u26a0\ufe0f", callback_data="menu:rules")],
         ]
     )
@@ -970,6 +973,65 @@ def payment_help_text() -> str:
     )
 
 
+def buyer_help_text(record: dict[str, Any]) -> str:
+    tier = tier_label(record.get("tier"))
+    intake_state = str(record.get("intake_state") or "buyer_active").replace("_", " ")
+    lines = [
+        "help \U0001f6df",
+        "",
+        "use /start to refresh your private menu.",
+        f"current access: {tier}",
+    ]
+    if record.get("tier") == TIER_PRO:
+        lines.append("Pro chat is open. Send a normal message here and it relays straight to me.")
+    elif intake_state == "awaiting of username":
+        lines.append("send your OnlyFans username to continue.")
+    elif intake_state == "awaiting budget":
+        lines.append("choose your budget range using the buttons in this chat.")
+    elif intake_state == "awaiting purchase intent":
+        lines.append("tell me what you want to buy first.")
+    elif intake_state == "waiting review":
+        lines.append("your request is waiting for review.")
+    else:
+        lines.append("use the menu buttons to browse access, purchases, payment help, and rules.")
+    lines.extend(
+        [
+            "",
+            "if something looks wrong with the bot, use /reportissue or tap 'something wrong?' in the menu.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def admin_help_text() -> str:
+    return (
+        "admin help\n\n"
+        "/testmode - seed an approved buyer straight into the private menu\n"
+        "/testmodefull - start from username, budget, and request\n"
+        "/testreset - end the current buyer test session\n"
+        "/setvault - run in the vault chat to register that chat\n"
+        "/addcontent <line_key> [title] - reply to a vault post to add it\n"
+        "/catalog - show stored vault line counts\n"
+        "/help - show this help, or buyer help while test mode is active\n\n"
+        "buyer support:\n"
+        "/reportissue - buyer-side debug report flow while test mode is active\n\n"
+        "line keys for v2 right now:\n"
+        "dickpic_hard\n"
+        "dickpic_soft\n"
+        "stroking\n"
+        "ass_noboxers\n"
+        "strip"
+    )
+
+
+def report_issue_prompt_text() -> str:
+    return (
+        "tell me what looks wrong \U0001f6df\n\n"
+        "send one message with what happened.\n"
+        "button name, last thing you tapped, or what you expected helps a lot."
+    )
+
+
 def rules_text() -> str:
     return (
         "rules & boundaries \u26a0\ufe0f\n\n"
@@ -1160,6 +1222,21 @@ def format_admin_review_card(record: dict[str, Any], title: str) -> str:
         f"looking for: {record.get('purchase_intent') or 'Not set'}\n"
         f"tier: {tier_label(record.get('tier'))}\n"
         f"flagged: {'yes' if record.get('flagged') else 'no'}"
+    )
+
+
+def format_bot_issue_report(record: dict[str, Any], issue_text: str) -> str:
+    telegram = f"@{record.get('telegram_username')}" if record.get("telegram_username") else "No username"
+    return (
+        "buyer bot issue report\n\n"
+        f"{record.get('display_name', 'Unknown')}\n"
+        f"user id: {record['user_id']}\n"
+        f"telegram: {telegram}\n"
+        f"\nOnlyFans: {record.get('of_username') or 'Not set'}\n"
+        f"tier: {tier_label(record.get('tier'))}\n"
+        f"state: {str(record.get('intake_state') or 'unknown').replace('_', ' ')}\n"
+        f"test mode: {'yes' if record.get('test_mode') else 'no'}\n\n"
+        f"issue:\n{issue_text.strip()[:3000]}"
     )
 
 
@@ -1791,6 +1868,11 @@ async def handle_buyer_menu(query: Any, record: dict[str, Any]) -> None:
         await edit_buyer_view(query, payment_help_text(), simple_back_keyboard("home"))
         return
 
+    if destination == "report_issue":
+        record["pending_buyer_action"] = {"kind": "bot_issue_report"}
+        await edit_buyer_view(query, report_issue_prompt_text(), simple_back_keyboard("home"))
+        return
+
     if destination == "rules":
         await edit_buyer_view(query, rules_text(), simple_back_keyboard("home"))
         return
@@ -1885,21 +1967,95 @@ async def helpadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     settings: Settings = context.application.bot_data["settings"]
     if not is_admin_update(update, settings) or update.message is None:
         return
-    await update.message.reply_text(
-        "admin help\n\n"
-        "/testmode - seed an approved buyer straight into the private menu\n"
-        "/testmodefull - start from username, budget, and request\n"
-        "/testreset - end the current buyer test session\n"
-        "/setvault - run in the vault chat to register that chat\n"
-        "/addcontent <line_key> [title] - reply to a vault post to add it\n"
-        "/catalog - show stored vault line counts\n\n"
-        "line keys for v2 right now:\n"
-        "dickpic_hard\n"
-        "dickpic_soft\n"
-        "stroking\n"
-        "ass_noboxers\n"
-        "strip"
+    await update.message.reply_text(admin_help_text())
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    state = load_state(settings)
+    if update.effective_user is None or update.effective_chat is None or update.message is None:
+        return
+    if update.effective_chat.type != "private":
+        return
+
+    record = get_active_private_record(state, update.effective_user.id)
+    if record is not None:
+        sync_record_identity(record, update.effective_user, update.effective_chat.id)
+        save_state(settings, state)
+        await update.message.reply_text(buyer_help_text(record))
+        return
+
+    if is_admin_update(update, settings):
+        await update.message.reply_text(admin_help_text())
+        return
+
+    if settings.test_only_mode:
+        await update.message.reply_text("this test bot is private for now.")
+        return
+    await update.message.reply_text("use /start to begin.")
+
+
+async def report_issue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    state = load_state(settings)
+    if update.effective_user is None or update.effective_chat is None or update.message is None:
+        return
+    if update.effective_chat.type != "private":
+        return
+
+    record = get_active_private_record(state, update.effective_user.id)
+    if record is None:
+        if is_admin_update(update, settings):
+            await update.message.reply_text("Use /testmode first if you want to test buyer issue reporting.")
+        elif settings.test_only_mode:
+            await update.message.reply_text("this test bot is private for now.")
+        else:
+            await update.message.reply_text("use /start first, then send /reportissue if something looks wrong.")
+        return
+
+    sync_record_identity(record, update.effective_user, update.effective_chat.id)
+    record["pending_buyer_action"] = {"kind": "bot_issue_report"}
+    save_state(settings, state)
+    await update.message.reply_text(report_issue_prompt_text())
+
+
+async def submit_bot_issue_report(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    settings: Settings,
+    state: dict[str, Any],
+    record: dict[str, Any],
+) -> None:
+    if update.message is None:
+        return
+    issue_text = (update.message.text or "").strip()
+    if not issue_text:
+        await update.message.reply_text("send the issue as text so i can pass it along clearly.")
+        return
+
+    record.setdefault("bot_issue_reports", []).append(
+        {
+            "reported_at": to_iso(utc_now()),
+            "tier": record.get("tier"),
+            "intake_state": record.get("intake_state"),
+            "text": issue_text[:3000],
+        }
     )
+    clear_pending_buyer_action(record)
+    save_state(settings, state)
+
+    if settings.relay_admin_group_id is None:
+        LOGGER.warning("No relay admin group configured for bot issue report from %s.", record.get("user_id"))
+    else:
+        await post_to_admin_topic(
+            context.bot,
+            settings,
+            state,
+            record,
+            format_bot_issue_report(record, issue_text),
+        )
+
+    await update.message.reply_text("thank you. i sent that over for a debug check.", reply_markup=main_menu_keyboard())
 
 
 async def testmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2021,6 +2177,10 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     intake_state = record.get("intake_state")
     pending_action = record.get("pending_buyer_action")
 
+    if isinstance(pending_action, dict) and pending_action.get("kind") == "bot_issue_report":
+        await submit_bot_issue_report(update, context, settings, state, record)
+        return
+
     if intake_state == "awaiting_of_username":
         record["of_username"] = update.message.text.strip()
         record["intake_state"] = "awaiting_budget"
@@ -2107,6 +2267,11 @@ async def private_non_text_message(update: Update, context: ContextTypes.DEFAULT
 
     sync_record_identity(record, update.effective_user, update.effective_chat.id)
     pending_action = record.get("pending_buyer_action")
+    if isinstance(pending_action, dict) and pending_action.get("kind") == "bot_issue_report":
+        save_state(settings, state)
+        await update.message.reply_text("send the issue as text so i can pass it along clearly.")
+        return
+
     if isinstance(pending_action, dict) and pending_action.get("kind") == "pro_voice_request":
         save_state(settings, state)
         await update.message.reply_text(
@@ -2650,6 +2815,8 @@ def build_application(settings: Settings) -> Application:
     application.bot_data["settings"] = settings
 
     application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("reportissue", report_issue_command))
     application.add_handler(CommandHandler("helpadmin", helpadmin_command))
     application.add_handler(CommandHandler("testmode", testmode_command))
     application.add_handler(CommandHandler("testmodefull", testmodefull_command))
