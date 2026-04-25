@@ -2337,7 +2337,9 @@ def format_admin_help() -> str:
         "/notifyunverified\n"
         "/syncsubs\n"
         "/testmode\n"
+        "/testmodefull\n"
         "/testreset\n"
+        "/testend\n"
         "/verifyof <onlyfans_username>\n"
         "/ofdiag"
     )
@@ -2359,7 +2361,9 @@ def format_operator_help() -> str:
         "/approverelay <user_id>\n\n"
         "Test mode:\n"
         "/testmode\n"
-        "/testreset\n\n"
+        "/testmodefull\n"
+        "/testreset\n"
+        "/testend\n\n"
         "PPV notes:\n"
         "Add the same PPV key again to replace the media, title, or price.\n"
         "Use a sequence key if you want repeat purchases to move to the next item in line.\n\n"
@@ -4024,10 +4028,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             return
 
         if test_action == "exit":
-            end_test_mode_session(state, query.from_user)
-            save_state(state)
-            await query.answer("Test mode exited.")
-            await query.edit_message_text("Exited test mode.")
+            await query.answer("Use /testend to end test mode.", show_alert=True)
             return
 
         await query.answer("Unknown test action.", show_alert=True)
@@ -4878,6 +4879,28 @@ async def testreset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await start(update, context)
 
 
+async def testend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.effective_chat or not update.message:
+        return
+    if update.effective_chat.type != "private":
+        return
+
+    state = load_state()
+    admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
+    if admin_chat_id != update.effective_chat.id:
+        await update.message.reply_text("Open the admin private chat first, then use /testend there.")
+        return
+
+    if not is_test_mode_active(state, update.effective_user):
+        await update.message.reply_text("No active test mode session.")
+        return
+
+    end_test_mode_session(state, update.effective_user)
+    save_state(state)
+    log_event("test_mode_ended", buyer_id=update.effective_user.id, trigger="command")
+    await update.message.reply_text("Test mode ended.")
+
+
 async def verifyof(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.effective_chat or not update.message:
         return
@@ -4991,7 +5014,7 @@ async def requestpay_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     state = load_state()
     if is_private_buyer_test_context(state, update):
-        await update.message.reply_text("Exit /testmode first to use /requestpay.")
+        await update.message.reply_text("Use /testend first to use /requestpay.")
         return
     admin_chat_id = resolve_admin_chat_id(state, update.effective_user)
     if admin_chat_id != update.effective_chat.id:
@@ -5804,6 +5827,7 @@ def main() -> None:
     app.add_handler(CommandHandler("testmode", testmode))
     app.add_handler(CommandHandler("testmodefull", testmodefull))
     app.add_handler(CommandHandler("testreset", testreset))
+    app.add_handler(CommandHandler("testend", testend))
     app.add_handler(CommandHandler("verifyof", verifyof))
     app.add_handler(CommandHandler("setof", setof_manual))
     app.add_handler(CommandHandler("ofdiag", ofdiag))
