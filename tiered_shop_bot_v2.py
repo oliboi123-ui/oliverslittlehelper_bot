@@ -1,15 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
 import random
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib import error as urllib_error
+from urllib import parse as urllib_parse
+from urllib import request as urllib_request
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -27,6 +34,12 @@ logging.basicConfig(
     level=logging.INFO,
 )
 LOGGER = logging.getLogger("tiered_shop_bot_v2")
+
+PAYPAL_MAIN_LOOP: asyncio.AbstractEventLoop | None = None
+PAYPAL_BOT: Any | None = None
+PAYPAL_SETTINGS: "Settings | None" = None
+PAYPAL_WEBHOOK_SERVER: ThreadingHTTPServer | None = None
+PAYPAL_WEBHOOK_THREAD: threading.Thread | None = None
 
 TEST_SESSION_ID_OFFSET = 9_000_000_000_000_000
 TIER_VERIFIED = "onlyfans_verified"
@@ -127,9 +140,14 @@ class Settings:
     bot_token: str
     admin_user_ids: frozenset[int]
     relay_admin_group_id: int | None
-    payment_url: str | None
     test_only_mode: bool
     state_path: Path
+    paypal_client_id: str | None
+    paypal_client_secret: str | None
+    paypal_webhook_id: str | None
+    paypal_public_base_url: str | None
+    paypal_env: str
+    paypal_webhook_port: int
 
 
 def utc_now() -> datetime:
@@ -170,6 +188,10 @@ def money_text(cents: int) -> str:
     return f"${cents / 100:.2f}"
 
 
+def cents_to_paypal_value(cents: int) -> str:
+    return f"{cents / 100:.2f}"
+
+
 def parse_admin_ids(raw_value: str) -> frozenset[int]:
     admin_ids: set[int] = set()
     for part in raw_value.split(","):
@@ -180,6 +202,15 @@ def parse_admin_ids(raw_value: str) -> frozenset[int]:
     return frozenset(admin_ids)
 
 
+def normalize_public_base_url(raw_value: str | None) -> str | None:
+    value = (raw_value or "").strip()
+    if not value:
+        return None
+    if not value.startswith(("http://", "https://")):
+        value = "https://" + value.lstrip("/")
+    return value.rstrip("/")
+
+
 def load_settings() -> Settings:
     bot_token = os.environ["BOT_TOKEN"].strip()
     admin_ids = parse_admin_ids(os.environ.get("ADMIN_USER_IDS", ""))
@@ -187,7 +218,6 @@ def load_settings() -> Settings:
         raise RuntimeError("ADMIN_USER_IDS must contain at least one Telegram user id.")
     relay_group_raw = os.environ.get("RELAY_ADMIN_GROUP_ID", "").strip()
     relay_group_id = int(relay_group_raw) if relay_group_raw else None
-    payment_url = os.environ.get("PAYMENT_URL", "").strip() or None
     test_only_mode = os.environ.get("TEST_ONLY_MODE", "true").strip().lower() in {
         "1",
         "true",
@@ -202,9 +232,14 @@ def load_settings() -> Settings:
         bot_token=bot_token,
         admin_user_ids=admin_ids,
         relay_admin_group_id=relay_group_id,
-        payment_url=payment_url,
         test_only_mode=test_only_mode,
         state_path=state_path,
+        paypal_client_id=os.environ.get("PAYPAL_CLIENT_ID", "").strip() or None,
+        paypal_client_secret=os.environ.get("PAYPAL_CLIENT_SECRET", "").strip() or None,
+        paypal_webhook_id=os.environ.get("PAYPAL_WEBHOOK_ID", "").strip() or None,
+        paypal_public_base_url=normalize_public_base_url(os.environ.get("PAYPAL_PUBLIC_BASE_URL")),
+        paypal_env=os.environ.get("PAYPAL_ENV", "live").strip().lower() or "live",
+        paypal_webhook_port=int(os.environ.get("PAYPAL_WEBHOOK_PORT", os.environ.get("PORT", "8080"))),
     )
 
 
@@ -215,6 +250,8 @@ def load_state(settings: Settings) -> dict[str, Any]:
             "test_sessions": {},
             "vault_chat_id": None,
             "vault_lines": {},
+            "pending_admin_actions": {},
+            "paypal_orders": {},
         }
     try:
         state = json.loads(settings.state_path.read_text(encoding="utf-8"))
@@ -225,11 +262,15 @@ def load_state(settings: Settings) -> dict[str, Any]:
             "test_sessions": {},
             "vault_chat_id": None,
             "vault_lines": {},
+            "pending_admin_actions": {},
+            "paypal_orders": {},
         }
     state.setdefault("users", {})
     state.setdefault("test_sessions", {})
     state.setdefault("vault_chat_id", None)
     state.setdefault("vault_lines", {})
+    state.setdefault("pending_admin_actions", {})
+    state.setdefault("paypal_orders", {})
     return state
 
 
@@ -238,6 +279,200 @@ def save_state(settings: Settings, state: dict[str, Any]) -> None:
     temp_path = settings.state_path.with_suffix(".tmp")
     temp_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     temp_path.replace(settings.state_path)
+
+
+def paypal_api_base(settings: Settings) -> str:
+    if settings.paypal_env == "sandbox":
+        return "https://api-m.sandbox.paypal.com"
+    return "https://api-m.paypal.com"
+
+
+def paypal_is_configured(settings: Settings) -> bool:
+    return bool(
+        settings.paypal_client_id
+        and settings.paypal_client_secret
+        and settings.paypal_webhook_id
+        and settings.paypal_public_base_url
+    )
+
+
+def paypal_return_url(settings: Settings) -> str:
+    if not settings.paypal_public_base_url:
+        raise RuntimeError("PAYPAL_PUBLIC_BASE_URL is required for PayPal checkout.")
+    return settings.paypal_public_base_url.rstrip("/") + "/paypal/return"
+
+
+def paypal_cancel_url(settings: Settings) -> str:
+    if not settings.paypal_public_base_url:
+        raise RuntimeError("PAYPAL_PUBLIC_BASE_URL is required for PayPal checkout.")
+    return settings.paypal_public_base_url.rstrip("/") + "/paypal/cancel"
+
+
+def paypal_get_access_token(settings: Settings) -> str:
+    if not settings.paypal_client_id or not settings.paypal_client_secret:
+        raise RuntimeError("PayPal client credentials are missing.")
+    auth = base64.b64encode(
+        f"{settings.paypal_client_id}:{settings.paypal_client_secret}".encode("utf-8")
+    ).decode("ascii")
+    request = urllib_request.Request(
+        paypal_api_base(settings).rstrip("/") + "/v1/oauth2/token",
+        data=urllib_parse.urlencode({"grant_type": "client_credentials"}).encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": f"Basic {auth}",
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    try:
+        with urllib_request.urlopen(request, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib_error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"PayPal token request failed ({exc.code}): {detail}") from exc
+    token = str(payload.get("access_token") or "").strip()
+    if not token:
+        raise RuntimeError("PayPal did not return an access token.")
+    return token
+
+
+def paypal_create_order(
+    settings: Settings,
+    state: dict[str, Any],
+    record: dict[str, Any],
+    purchase: dict[str, Any],
+) -> tuple[str, str]:
+    if not paypal_is_configured(settings):
+        raise RuntimeError("PayPal checkout is not configured.")
+
+    token = paypal_get_access_token(settings)
+    user_id = int(record["user_id"])
+    purchase_id = str(purchase["purchase_id"])
+    invoice_id = f"v2-{user_id}-{purchase_id}-{uuid.uuid4().hex[:8]}"
+    payload = {
+        "intent": "CAPTURE",
+        "purchase_units": [
+            {
+                "custom_id": f"{user_id}:{purchase_id}",
+                "invoice_id": invoice_id,
+                "description": str(purchase.get("title") or "private unlock")[:127],
+                "amount": {
+                    "currency_code": "USD",
+                    "value": cents_to_paypal_value(int(purchase.get("price_cents", 0))),
+                },
+            }
+        ],
+        "application_context": {
+            "brand_name": "Oliver's Little Helper",
+            "return_url": paypal_return_url(settings),
+            "cancel_url": paypal_cancel_url(settings),
+        },
+    }
+    request = urllib_request.Request(
+        paypal_api_base(settings).rstrip("/") + "/v2/checkout/orders",
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "PayPal-Request-Id": f"{user_id}-{purchase_id}-{uuid.uuid4().hex}",
+        },
+    )
+    try:
+        with urllib_request.urlopen(request, timeout=30) as response:
+            order_payload = json.loads(response.read().decode("utf-8"))
+    except urllib_error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"PayPal order creation failed ({exc.code}): {detail}") from exc
+
+    order_id = str(order_payload.get("id") or "").strip()
+    if not order_id:
+        raise RuntimeError("PayPal did not return an order id.")
+
+    approval_url = ""
+    for link in order_payload.get("links", []):
+        if link.get("rel") in {"approve", "payer-action"} and link.get("href"):
+            approval_url = str(link["href"])
+            break
+    if not approval_url:
+        raise RuntimeError("PayPal did not return an approval URL.")
+
+    purchase["paypal_order_id"] = order_id
+    purchase["paypal_approval_url"] = approval_url
+    purchase["paypal_invoice_id"] = invoice_id
+    state.setdefault("paypal_orders", {})[order_id] = {
+        "user_id": user_id,
+        "purchase_id": purchase_id,
+        "amount": cents_to_paypal_value(int(purchase.get("price_cents", 0))),
+        "currency": "USD",
+        "status": "created",
+        "created_at": to_iso(utc_now()),
+    }
+    save_state(settings, state)
+    return order_id, approval_url
+
+
+def paypal_capture_order(settings: Settings, order_id: str) -> dict[str, Any]:
+    if not paypal_is_configured(settings):
+        raise RuntimeError("PayPal checkout is not configured.")
+    token = paypal_get_access_token(settings)
+    request = urllib_request.Request(
+        paypal_api_base(settings).rstrip("/") + f"/v2/checkout/orders/{urllib_parse.quote(order_id)}/capture",
+        data=b"{}",
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "PayPal-Request-Id": f"{order_id}-{uuid.uuid4().hex}",
+        },
+    )
+    try:
+        with urllib_request.urlopen(request, timeout=30) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib_error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"PayPal order capture failed ({exc.code}): {detail}") from exc
+
+
+def paypal_verify_webhook(settings: Settings, raw_body: bytes, headers: Any) -> dict[str, Any]:
+    if not paypal_is_configured(settings):
+        raise RuntimeError("PayPal webhook verification is not configured.")
+    event = json.loads(raw_body.decode("utf-8"))
+    verification_payload = {
+        "auth_algo": headers.get("PAYPAL-AUTH-ALGO") or headers.get("paypal-auth-algo"),
+        "cert_url": headers.get("PAYPAL-CERT-URL") or headers.get("paypal-cert-url"),
+        "transmission_id": headers.get("PAYPAL-TRANSMISSION-ID") or headers.get("paypal-transmission-id"),
+        "transmission_sig": headers.get("PAYPAL-TRANSMISSION-SIG") or headers.get("paypal-transmission-sig"),
+        "transmission_time": headers.get("PAYPAL-TRANSMISSION-TIME") or headers.get("paypal-transmission-time"),
+        "webhook_id": settings.paypal_webhook_id,
+        "webhook_event": event,
+    }
+    required = ("auth_algo", "cert_url", "transmission_id", "transmission_sig", "transmission_time", "webhook_id")
+    if not all(verification_payload.get(key) for key in required):
+        raise RuntimeError("Missing PayPal signature headers.")
+
+    token = paypal_get_access_token(settings)
+    request = urllib_request.Request(
+        paypal_api_base(settings).rstrip("/") + "/v1/notifications/verify-webhook-signature",
+        data=json.dumps(verification_payload).encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib_request.urlopen(request, timeout=30) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib_error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"PayPal webhook verification failed ({exc.code}): {detail}") from exc
+    if str(result.get("verification_status") or "").upper() != "SUCCESS":
+        raise RuntimeError("PayPal webhook verification failed.")
+    return event
 
 
 def is_admin_user_id(user_id: int, settings: Settings) -> bool:
@@ -304,6 +539,7 @@ def new_record(
         "flagged": False,
         "notes": [],
         "purchases": [],
+        "pending_buyer_action": None,
         "delivery_counters": {},
         "created_at": to_iso(utc_now()),
         "updated_at": to_iso(utc_now()),
@@ -333,6 +569,7 @@ def get_user_record(state: dict[str, Any], user_id: int) -> dict[str, Any]:
             "flagged": False,
             "notes": [],
             "purchases": [],
+            "pending_buyer_action": None,
             "delivery_counters": {},
             "created_at": to_iso(utc_now()),
             "updated_at": to_iso(utc_now()),
@@ -351,6 +588,37 @@ def sync_record_identity(record: dict[str, Any], user: Any, chat_id: int) -> Non
     record["telegram_username"] = user.username
     record["buyer_chat_id"] = chat_id
     record["updated_at"] = to_iso(utc_now())
+
+
+def clear_pending_buyer_action(record: dict[str, Any]) -> None:
+    record["pending_buyer_action"] = None
+
+
+def is_internal_topic_note(message: Any) -> bool:
+    text = str(message.text or message.caption or "").strip()
+    return text.startswith("//")
+
+
+def find_record_by_topic_id(state: dict[str, Any], topic_id: int | None) -> dict[str, Any] | None:
+    if not isinstance(topic_id, int):
+        return None
+    for record in state.get("users", {}).values():
+        if int(record.get("topic_id") or 0) == topic_id:
+            return record
+    return None
+
+
+def pending_admin_action(state: dict[str, Any], admin_user_id: int) -> dict[str, Any] | None:
+    action = state.setdefault("pending_admin_actions", {}).get(str(admin_user_id))
+    return action if isinstance(action, dict) else None
+
+
+def set_pending_admin_action(state: dict[str, Any], admin_user_id: int, action: dict[str, Any]) -> None:
+    state.setdefault("pending_admin_actions", {})[str(admin_user_id)] = action
+
+
+def clear_pending_admin_action(state: dict[str, Any], admin_user_id: int) -> None:
+    state.setdefault("pending_admin_actions", {}).pop(str(admin_user_id), None)
 
 
 def budget_keyboard() -> InlineKeyboardMarkup:
@@ -467,14 +735,14 @@ def pro_voice_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def payment_keyboard(settings: Settings, purchase_id: str) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    if settings.payment_url:
-        rows.append([InlineKeyboardButton("pay with paypal 💸", url=settings.payment_url)])
-    rows.append([InlineKeyboardButton("i've paid \u2705", callback_data=f"paid:{purchase_id}")])
-    rows.append([InlineKeyboardButton("my purchases \U0001f4e6", callback_data="menu:purchases")])
-    rows.append([InlineKeyboardButton("back", callback_data="nav:home")])
-    return InlineKeyboardMarkup(rows)
+def payment_keyboard(approval_url: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("pay with paypal \U0001f4b8", url=approval_url)],
+            [InlineKeyboardButton("my purchases \U0001f4e6", callback_data="menu:purchases")],
+            [InlineKeyboardButton("back", callback_data="nav:home")],
+        ]
+    )
 
 
 def admin_review_keyboard(user_id: int) -> InlineKeyboardMarkup:
@@ -503,6 +771,18 @@ def admin_payment_keyboard(user_id: int, purchase_id: str) -> InlineKeyboardMark
             [
                 InlineKeyboardButton("mark paid \u2705", callback_data=f"adm:pay:{user_id}:{purchase_id}"),
                 InlineKeyboardButton("reject payment", callback_data=f"adm:deny:{user_id}:{purchase_id}"),
+            ],
+            [InlineKeyboardButton("summary", callback_data=f"adm:summary:{user_id}")],
+        ]
+    )
+
+
+def admin_voice_request_keyboard(user_id: int, purchase_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("accept request \u2705", callback_data=f"adm:voiceok:{user_id}:{purchase_id}"),
+                InlineKeyboardButton("decline with reply \u274c", callback_data=f"adm:voiceno:{user_id}:{purchase_id}"),
             ],
             [InlineKeyboardButton("summary", callback_data=f"adm:summary:{user_id}")],
         ]
@@ -749,6 +1029,7 @@ def pro_voice_text(record: dict[str, Any]) -> str:
     return (
         "personal voice note \U0001f399\ufe0f\n\n"
         "up to around 1 minute, depending on the topic.\n"
+        "tell me what you want first, then i approve or decline it before payment.\n"
         "available only for Pro members.\n\n"
         f"price: {money_text(display_price_cents(record, 'pro_voice_note'))}"
     )
@@ -757,7 +1038,9 @@ def pro_voice_text(record: dict[str, Any]) -> str:
 def pro_chat_text() -> str:
     return (
         "Pro chat access \U0001f4ac\n\n"
-        "since you've reached Pro, you can chat directly.\n"
+        "since you've reached Pro, you can talk to me directly here through the bot.\n"
+        "just send your message in this chat and it relays over to me.\n"
+        "photos, videos, voice notes, and text all work.\n\n"
         "keep it respectful and easygoing."
     )
 
@@ -769,11 +1052,13 @@ def purchase_lines(record: dict[str, Any]) -> list[str]:
         lines.append("no purchases yet.")
         return lines
     status_icons = {
+        "awaiting_approval": "\U0001f440",
         "awaiting_payment": "\U0001f4b8",
         "payment_claimed": "\u23f3",
         "paid": "\u2705",
         "pending_manual": "\U0001f6e0\ufe0f",
         "fulfilled": "\U0001f381",
+        "declined": "\u274c",
     }
     for purchase in reversed(purchases[-12:]):
         status = purchase.get("status", "unknown")
@@ -803,7 +1088,7 @@ def format_admin_review_card(record: dict[str, Any], title: str) -> str:
 
 
 def format_admin_purchase_card(record: dict[str, Any], purchase: dict[str, Any], title: str) -> str:
-    return (
+    lines = [
         f"{title}\n\n"
         f"{record.get('display_name', 'Unknown')}\n"
         f"user id: {record['user_id']}\n"
@@ -812,7 +1097,14 @@ def format_admin_purchase_card(record: dict[str, Any], purchase: dict[str, Any],
         f"amount: {money_text(int(purchase.get('price_cents', 0)))}\n"
         f"status: {purchase.get('status')}\n"
         f"requested: {format_dt(purchase.get('requested_at'))}"
-    )
+    ]
+    request_text = str(purchase.get("request_text") or "").strip()
+    if request_text:
+        lines.append(f"request: {request_text}")
+    admin_reply = str(purchase.get("admin_reply") or "").strip()
+    if admin_reply:
+        lines.append(f"admin reply: {admin_reply}")
+    return "\n".join(lines)
 
 
 def display_price_cents(record: dict[str, Any], sku: str) -> int:
@@ -839,7 +1131,13 @@ def find_purchase(record: dict[str, Any], purchase_id: str) -> dict[str, Any] | 
     return None
 
 
-def create_purchase(record: dict[str, Any], sku: str) -> dict[str, Any]:
+def create_purchase(
+    record: dict[str, Any],
+    sku: str,
+    *,
+    status: str = "awaiting_payment",
+    request_text: str | None = None,
+) -> dict[str, Any]:
     purchase_id = uuid.uuid4().hex[:10]
     price_cents = display_price_cents(record, sku)
     product = CATALOG[sku]
@@ -848,11 +1146,18 @@ def create_purchase(record: dict[str, Any], sku: str) -> dict[str, Any]:
         "sku": sku,
         "title": product["title"],
         "price_cents": price_cents,
-        "status": "awaiting_payment",
+        "status": status,
         "requested_at": to_iso(utc_now()),
         "paid_at": None,
         "fulfilled_at": None,
         "delivery_summary": None,
+        "request_text": request_text,
+        "admin_reply": None,
+        "approved_at": None,
+        "declined_at": None,
+        "paypal_order_id": None,
+        "paypal_approval_url": None,
+        "paypal_invoice_id": None,
     }
     record.setdefault("purchases", []).append(purchase)
     record["updated_at"] = to_iso(utc_now())
@@ -966,6 +1271,125 @@ async def deliver_purchase(
     return False, "unknown product"
 
 
+def find_purchase_by_paypal_order(state: dict[str, Any], order_id: str) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    order_entry = state.setdefault("paypal_orders", {}).get(order_id)
+    if isinstance(order_entry, dict):
+        user_id = order_entry.get("user_id")
+        purchase_id = str(order_entry.get("purchase_id") or "")
+        record = state.get("users", {}).get(str(user_id))
+        if record is not None:
+            purchase = find_purchase(record, purchase_id)
+            if purchase is not None:
+                return record, purchase
+    for record in state.get("users", {}).values():
+        for purchase in record.get("purchases", []):
+            if str(purchase.get("paypal_order_id") or "") == order_id:
+                return record, purchase
+    return None
+
+
+async def finalize_paid_purchase(
+    bot: Any,
+    settings: Settings,
+    state: dict[str, Any],
+    record: dict[str, Any],
+    purchase: dict[str, Any],
+) -> None:
+    if purchase.get("status") in {"fulfilled", "pending_manual"}:
+        return
+
+    purchase["status"] = "paid"
+    purchase["paid_at"] = purchase.get("paid_at") or to_iso(utc_now())
+    order_id = str(purchase.get("paypal_order_id") or "").strip()
+    if order_id:
+        order_entry = state.setdefault("paypal_orders", {}).setdefault(order_id, {})
+        order_entry["status"] = "completed"
+        order_entry["completed_at"] = to_iso(utc_now())
+
+    tier_before = record.get("tier")
+    new_tier = apply_tier_progression(record, purchase["sku"])
+    save_state(settings, state)
+
+    if CATALOG[purchase["sku"]]["delivery_mode"] == "manual":
+        purchase["status"] = "pending_manual"
+        save_state(settings, state)
+        await bot.send_message(
+            chat_id=int(record["buyer_chat_id"]),
+            text="payment confirmed.\n\nthis one is prepared manually, so i'll handle it from here.",
+            reply_markup=main_menu_keyboard(),
+        )
+        await post_to_admin_topic(
+            bot,
+            settings,
+            state,
+            record,
+            format_admin_purchase_card(record, purchase, "manual fulfillment needed"),
+            reply_markup=admin_manual_fulfillment_keyboard(record["user_id"], purchase["purchase_id"]),
+        )
+    else:
+        delivered, detail = await deliver_purchase(bot, settings, state, record, purchase)
+        if delivered:
+            purchase["status"] = "fulfilled"
+            purchase["fulfilled_at"] = to_iso(utc_now())
+            save_state(settings, state)
+            await bot.send_message(
+                chat_id=int(record["buyer_chat_id"]),
+                text=f"payment confirmed \u2705\n\n{detail}",
+                reply_markup=main_menu_keyboard(),
+            )
+        else:
+            purchase["status"] = "pending_manual"
+            purchase["delivery_summary"] = detail
+            save_state(settings, state)
+            await bot.send_message(
+                chat_id=int(record["buyer_chat_id"]),
+                text="payment confirmed.\n\nsomething needs a manual check before delivery, so i'm handling it from here.",
+                reply_markup=main_menu_keyboard(),
+            )
+            await post_to_admin_topic(
+                bot,
+                settings,
+                state,
+                record,
+                format_admin_purchase_card(record, purchase, f"delivery held up: {detail}"),
+                reply_markup=admin_manual_fulfillment_keyboard(record["user_id"], purchase["purchase_id"]),
+            )
+
+    if new_tier and new_tier != tier_before:
+        await notify_buyer_of_tier_change(bot, record, new_tier)
+
+
+async def complete_paypal_order(settings: Settings, bot: Any, order_id: str, event: dict[str, Any]) -> str:
+    state = load_state(settings)
+    found = find_purchase_by_paypal_order(state, order_id)
+    if found is None:
+        return f"Order {order_id} not found"
+    record, purchase = found
+    if purchase.get("status") in {"fulfilled", "pending_manual"}:
+        return f"Order {order_id} already completed"
+    await finalize_paid_purchase(bot, settings, state, record, purchase)
+    return f"Payment confirmed for {record.get('user_id')}"
+
+
+def complete_paypal_order_from_server(order_id: str, event: dict[str, Any]) -> str:
+    if PAYPAL_MAIN_LOOP is None or PAYPAL_BOT is None or PAYPAL_SETTINGS is None:
+        raise RuntimeError("PayPal server is not connected to the bot.")
+    future = asyncio.run_coroutine_threadsafe(
+        complete_paypal_order(PAYPAL_SETTINGS, PAYPAL_BOT, order_id, event),
+        PAYPAL_MAIN_LOOP,
+    )
+    return future.result(timeout=60)
+
+
+def paypal_order_id_from_capture_event(event: dict[str, Any]) -> str:
+    resource = event.get("resource") or {}
+    related_ids = (resource.get("supplementary_data") or {}).get("related_ids") or {}
+    order_id = str(related_ids.get("order_id") or "").strip()
+    if not order_id:
+        raise RuntimeError("PayPal event did not include an order id.")
+    return order_id
+
+
 async def ensure_topic(
     bot: Any,
     settings: Settings,
@@ -1005,6 +1429,190 @@ async def post_to_admin_topic(
         text=text,
         reply_markup=reply_markup,
     )
+
+
+async def relay_buyer_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    settings: Settings,
+    state: dict[str, Any],
+    record: dict[str, Any],
+) -> None:
+    if update.effective_chat is None or update.message is None:
+        return
+
+    topic_id = await ensure_topic(context.bot, settings, state, record)
+    if topic_id is None or settings.relay_admin_group_id is None:
+        await update.message.reply_text(
+            "chat isn't ready on my side yet. give me a moment and try again."
+        )
+        return
+
+    try:
+        await context.bot.copy_message(
+            chat_id=settings.relay_admin_group_id,
+            from_chat_id=update.effective_chat.id,
+            message_id=update.message.message_id,
+            message_thread_id=topic_id,
+        )
+    except Exception:
+        LOGGER.exception("Could not relay buyer message for user %s.", record.get("user_id"))
+        await update.message.reply_text(
+            "that didn't go through just now. send it one more time in a moment."
+        )
+
+
+async def send_voice_note_payment_prompt(
+    bot: Any,
+    settings: Settings,
+    state: dict[str, Any],
+    record: dict[str, Any],
+    purchase: dict[str, Any],
+) -> None:
+    buyer_chat_id = int(record.get("buyer_chat_id") or 0)
+    if buyer_chat_id <= 0:
+        return
+    _, approval_url = paypal_create_order(settings, state, record, purchase)
+    request_text = str(purchase.get("request_text") or "").strip()
+    await bot.send_message(
+        chat_id=buyer_chat_id,
+        text=(
+            "voice note request approved \u2705\n\n"
+            f"request: {request_text}\n"
+            f"amount due: {money_text(int(purchase.get('price_cents', 0)))}\n\n"
+            "if that still feels good, tap paypal. i'll update this chat when PayPal confirms it."
+        ),
+        reply_markup=payment_keyboard(approval_url),
+    )
+
+
+async def handle_pending_admin_reply(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    settings: Settings,
+    state: dict[str, Any],
+) -> bool:
+    if update.effective_user is None or update.message is None:
+        return False
+
+    pending = pending_admin_action(state, update.effective_user.id)
+    if pending is None:
+        return False
+    if pending.get("thread_id") != update.message.message_thread_id:
+        return False
+
+    if pending.get("kind") != "voice_decline":
+        clear_pending_admin_action(state, update.effective_user.id)
+        save_state(settings, state)
+        return False
+
+    decline_text = (update.message.text or "").strip()
+    if not decline_text:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            message_thread_id=update.message.message_thread_id,
+            text="send the decline as one text message so i can pass it on cleanly.",
+        )
+        return True
+
+    record = state.get("users", {}).get(str(pending.get("user_id")))
+    if record is None:
+        clear_pending_admin_action(state, update.effective_user.id)
+        save_state(settings, state)
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            message_thread_id=update.message.message_thread_id,
+            text="that buyer record is gone, so i couldn't finish the decline.",
+        )
+        return True
+
+    purchase = find_purchase(record, str(pending.get("purchase_id")))
+    if purchase is None:
+        clear_pending_admin_action(state, update.effective_user.id)
+        save_state(settings, state)
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            message_thread_id=update.message.message_thread_id,
+            text="that voice note request no longer exists.",
+        )
+        return True
+
+    purchase["status"] = "declined"
+    purchase["declined_at"] = to_iso(utc_now())
+    purchase["admin_reply"] = decline_text
+    record["updated_at"] = to_iso(utc_now())
+    clear_pending_admin_action(state, update.effective_user.id)
+    save_state(settings, state)
+
+    buyer_chat_id = int(record.get("buyer_chat_id") or 0)
+    if buyer_chat_id > 0:
+        await context.bot.send_message(
+            chat_id=buyer_chat_id,
+            text=(
+                "voice note request update \u274c\n\n"
+                "i can't approve this one as asked.\n\n"
+                f"{decline_text}"
+            ),
+            reply_markup=main_menu_keyboard(),
+        )
+
+    admin_chat_id = pending.get("chat_id")
+    admin_message_id = pending.get("message_id")
+    if isinstance(admin_chat_id, int) and isinstance(admin_message_id, int):
+        await context.bot.edit_message_text(
+            chat_id=admin_chat_id,
+            message_id=admin_message_id,
+            text=format_admin_purchase_card(record, purchase, "voice note declined"),
+            reply_markup=admin_review_keyboard(record["user_id"]),
+        )
+
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        message_thread_id=update.message.message_thread_id,
+        text="decline sent to buyer.",
+    )
+    return True
+
+
+async def relay_admin_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    if update.effective_chat is None or update.effective_user is None or update.message is None:
+        return
+    if update.effective_chat.type != "supergroup":
+        return
+    if settings.relay_admin_group_id is None or update.effective_chat.id != settings.relay_admin_group_id:
+        return
+    if update.effective_user.is_bot:
+        return
+
+    state = load_state(settings)
+    if await handle_pending_admin_reply(update, context, settings, state):
+        return
+    if is_internal_topic_note(update.message):
+        return
+
+    record = find_record_by_topic_id(state, update.message.message_thread_id)
+    if record is None or record.get("tier") != TIER_PRO:
+        return
+
+    buyer_chat_id = int(record.get("buyer_chat_id") or 0)
+    if buyer_chat_id <= 0:
+        return
+
+    try:
+        await context.bot.copy_message(
+            chat_id=buyer_chat_id,
+            from_chat_id=update.effective_chat.id,
+            message_id=update.message.message_id,
+            protect_content=True,
+        )
+    except Exception:
+        LOGGER.exception("Could not relay admin message to buyer %s.", record.get("user_id"))
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            message_thread_id=update.message.message_thread_id,
+            text="that reply didn't reach the buyer. try again in a moment.",
+        )
 
 
 async def send_buyer_home(message_target: Any, record: dict[str, Any]) -> None:
@@ -1312,6 +1920,7 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     sync_record_identity(record, update.effective_user, update.effective_chat.id)
     intake_state = record.get("intake_state")
+    pending_action = record.get("pending_buyer_action")
 
     if intake_state == "awaiting_of_username":
         record["of_username"] = update.message.text.strip()
@@ -1320,6 +1929,35 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(
             "thanks. to route the request properly, what range are you planning for the first request?",
             reply_markup=budget_keyboard(),
+        )
+        return
+
+    if isinstance(pending_action, dict) and pending_action.get("kind") == "pro_voice_request":
+        request_text = update.message.text.strip()
+        if not request_text:
+            await update.message.reply_text("tell me what you want in the voice note first.")
+            return
+        clear_pending_buyer_action(record)
+        purchase = create_purchase(
+            record,
+            "pro_voice_note",
+            status="awaiting_approval",
+            request_text=request_text,
+        )
+        save_state(settings, state)
+        await update.message.reply_text(
+            "got it \U0001f399\ufe0f\n\n"
+            "i sent your voice note idea over for approval first.\n"
+            "if it works, i'll ask for payment next.\n"
+            "if not, i'll explain what i can do instead."
+        )
+        await post_to_admin_topic(
+            context.bot,
+            settings,
+            state,
+            record,
+            format_admin_purchase_card(record, purchase, "voice note request waiting on approval"),
+            reply_markup=admin_voice_request_keyboard(record["user_id"], purchase["purchase_id"]),
         )
         return
 
@@ -1349,14 +1987,37 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     if record.get("tier") == TIER_PRO:
-        await post_to_admin_topic(
-            context.bot,
-            settings,
-            state,
-            record,
-            f"pro chat message\n\n{record.get('display_name')}\n\n{update.message.text.strip()}",
+        save_state(settings, state)
+        await relay_buyer_message(update, context, settings, state, record)
+        return
+
+    await update.message.reply_text("use the menu below.", reply_markup=main_menu_keyboard())
+
+
+async def private_non_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    if update.effective_user is None or update.effective_chat is None or update.message is None:
+        return
+    if update.effective_chat.type != "private":
+        return
+
+    state = load_state(settings)
+    record = get_active_private_record(state, update.effective_user.id)
+    if record is None:
+        return
+
+    sync_record_identity(record, update.effective_user, update.effective_chat.id)
+    pending_action = record.get("pending_buyer_action")
+    if isinstance(pending_action, dict) and pending_action.get("kind") == "pro_voice_request":
+        save_state(settings, state)
+        await update.message.reply_text(
+            "send the voice note request as text so i can review exactly what you want."
         )
-        await update.message.reply_text("got it \U0001f4ac")
+        return
+
+    save_state(settings, state)
+    if record.get("tier") == TIER_PRO:
+        await relay_buyer_message(update, context, settings, state, record)
         return
 
     await update.message.reply_text("use the menu below.", reply_markup=main_menu_keyboard())
@@ -1403,65 +2064,12 @@ async def mark_purchase_paid(
     record: dict[str, Any],
     purchase: dict[str, Any],
 ) -> None:
-    purchase["status"] = "paid"
-    purchase["paid_at"] = to_iso(utc_now())
-    tier_before = record.get("tier")
-    new_tier = apply_tier_progression(record, purchase["sku"])
-    save_state(settings, state)
-
-    if CATALOG[purchase["sku"]]["delivery_mode"] == "manual":
-        purchase["status"] = "pending_manual"
-        save_state(settings, state)
-        await context.bot.send_message(
-            chat_id=int(record["buyer_chat_id"]),
-            text="payment confirmed.\n\nthis one is prepared manually, so i’ll handle it from here.",
-            reply_markup=main_menu_keyboard(),
-        )
-        await post_to_admin_topic(
-            context.bot,
-            settings,
-            state,
-            record,
-            format_admin_purchase_card(record, purchase, "manual fulfillment needed"),
-            reply_markup=admin_manual_fulfillment_keyboard(record["user_id"], purchase["purchase_id"]),
-        )
-    else:
-        delivered, detail = await deliver_purchase(context.bot, settings, state, record, purchase)
-        if delivered:
-            purchase["status"] = "fulfilled"
-            purchase["fulfilled_at"] = to_iso(utc_now())
-            save_state(settings, state)
-            await context.bot.send_message(
-                chat_id=int(record["buyer_chat_id"]),
-                text=f"payment confirmed \u2705\n\n{detail}",
-                reply_markup=main_menu_keyboard(),
-            )
-        else:
-            purchase["status"] = "pending_manual"
-            purchase["delivery_summary"] = detail
-            save_state(settings, state)
-            await context.bot.send_message(
-                chat_id=int(record["buyer_chat_id"]),
-                text="payment confirmed.\n\nsomething needs a manual check before delivery, so i’m handling it from here.",
-                reply_markup=main_menu_keyboard(),
-            )
-            await post_to_admin_topic(
-                context.bot,
-                settings,
-                state,
-                record,
-                format_admin_purchase_card(record, purchase, f"delivery held up: {detail}"),
-                reply_markup=admin_manual_fulfillment_keyboard(record["user_id"], purchase["purchase_id"]),
-            )
-
-    if new_tier and new_tier != tier_before:
-        await notify_buyer_of_tier_change(context.bot, record, new_tier)
+    await finalize_paid_purchase(context.bot, settings, state, record, purchase)
 
     await query.edit_message_text(
         text=format_admin_purchase_card(record, purchase, "payment confirmed"),
         reply_markup=admin_review_keyboard(record["user_id"]),
     )
-
 
 async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings: Settings = context.application.bot_data["settings"]
@@ -1497,6 +2105,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if record is None:
             await query.answer("no active buyer session.", show_alert=True)
             return
+        clear_pending_buyer_action(record)
         await query.answer()
         await handle_buyer_menu(query, record)
         save_state(settings, state)
@@ -1508,6 +2117,8 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await query.answer("no active buyer session.", show_alert=True)
             return
         target = data.partition(":")[2]
+        clear_pending_buyer_action(record)
+        save_state(settings, state)
         await query.answer()
         if target == "home":
             await edit_buyer_view(query, current_home_text(record), main_menu_keyboard())
@@ -1534,8 +2145,44 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if sku.startswith("pro_") and not can_open_pro(record):
             await query.answer("pro is locked.", show_alert=True)
             return
+        if sku == "pro_voice_note":
+            record["pending_buyer_action"] = {"kind": "pro_voice_request", "sku": sku}
+            save_state(settings, state)
+            await query.answer()
+            await query.edit_message_text(
+                text=(
+                    "personal voice note \U0001f399\ufe0f\n\n"
+                    "send me one message with what you want in the voice note.\n"
+                    "i'll review it first before asking you to pay.\n\n"
+                    "be as clear as you want about the vibe, wording, or angle."
+                ),
+                reply_markup=simple_back_keyboard("pro"),
+            )
+            return
 
         purchase = create_purchase(record, sku)
+        try:
+            _, approval_url = paypal_create_order(settings, state, record, purchase)
+        except Exception as exc:
+            purchase["status"] = "payment_setup_failed"
+            purchase["delivery_summary"] = str(exc)
+            save_state(settings, state)
+            await post_to_admin_topic(
+                context.bot,
+                settings,
+                state,
+                record,
+                format_admin_purchase_card(record, purchase, f"PayPal setup failed: {exc}"),
+            )
+            await query.answer("PayPal setup failed", show_alert=True)
+            await query.edit_message_text(
+                text=(
+                    "payment setup needs a quick fix on my side.\n\n"
+                    "i saved the request and i'll sort the checkout link."
+                ),
+                reply_markup=main_menu_keyboard(),
+            )
+            return
         save_state(settings, state)
         await post_to_admin_topic(
             context.bot,
@@ -1550,9 +2197,10 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 "payment request\n\n"
                 f"{purchase['title']}\n"
                 f"amount due: {money_text(int(purchase['price_cents']))}\n\n"
-                "tap paypal when you're ready.\n\ni'll keep track of this here."
+                "tap paypal when you're ready.\n\n"
+                "i'll update this chat when PayPal confirms it."
             ),
-            reply_markup=payment_keyboard(settings, purchase["purchase_id"]),
+            reply_markup=payment_keyboard(approval_url),
         )
         return
 
@@ -1654,6 +2302,69 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
             return
 
+        if action in {"voiceok", "voiceno"} and len(parts) == 4:
+            purchase_id = parts[3]
+            purchase = find_purchase(record, purchase_id)
+            if purchase is None:
+                await query.answer("purchase not found", show_alert=True)
+                return
+            if purchase.get("sku") != "pro_voice_note":
+                await query.answer("not a voice note request", show_alert=True)
+                return
+            if purchase["status"] not in {"awaiting_approval"}:
+                await query.answer("already handled", show_alert=True)
+                return
+            if query.message is None or query.message.message_thread_id is None:
+                await query.answer("open this from the buyer topic.", show_alert=True)
+                return
+            if action == "voiceok":
+                purchase["status"] = "awaiting_payment"
+                purchase["approved_at"] = to_iso(utc_now())
+                try:
+                    await send_voice_note_payment_prompt(context.bot, settings, state, record, purchase)
+                except Exception as exc:
+                    purchase["status"] = "payment_setup_failed"
+                    purchase["delivery_summary"] = str(exc)
+                    save_state(settings, state)
+                    await query.answer("PayPal setup failed", show_alert=True)
+                    await query.edit_message_text(
+                        text=format_admin_purchase_card(record, purchase, f"PayPal setup failed: {exc}"),
+                        reply_markup=admin_voice_request_keyboard(user_id, purchase_id),
+                    )
+                    return
+                save_state(settings, state)
+                await query.answer("approved")
+                await query.edit_message_text(
+                    text=format_admin_purchase_card(record, purchase, "voice note approved"),
+                    reply_markup=admin_review_keyboard(user_id),
+                )
+                return
+            set_pending_admin_action(
+                state,
+                query.from_user.id,
+                {
+                    "kind": "voice_decline",
+                    "user_id": user_id,
+                    "purchase_id": purchase_id,
+                    "thread_id": query.message.message_thread_id,
+                    "chat_id": query.message.chat.id,
+                    "message_id": query.message.message_id,
+                },
+            )
+            save_state(settings, state)
+            await query.answer("send your decline reply")
+            await context.bot.send_message(
+                chat_id=query.message.chat.id,
+                message_thread_id=query.message.message_thread_id,
+                text=(
+                    "send one text reply here with:\n"
+                    "- why you're declining it\n"
+                    "- what you can do instead\n\n"
+                    "i'll pass that straight to the buyer."
+                ),
+            )
+            return
+
         if action in {"pay", "deny", "fulfill"} and len(parts) == 4:
             purchase_id = parts[3]
             purchase = find_purchase(record, purchase_id)
@@ -1697,6 +2408,139 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await query.answer("unknown admin action", show_alert=True)
 
 
+def paypal_return_page(title: str, message: str) -> str:
+    return (
+        "<html><head>"
+        "<meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<script>try{history.replaceState(null,'',location.pathname);}catch(e){}</script>"
+        "</head><body>"
+        f"<h1>{title}</h1>"
+        f"<p>{message}</p>"
+        "</body></html>"
+    )
+
+
+class PaypalWebhookHandler(BaseHTTPRequestHandler):
+    server_version = "OliverLittleHelperV2PayPal/1.0"
+
+    def log_message(self, format: str, *args: Any) -> None:
+        LOGGER.info("paypal server %s", format % args)
+
+    def send_text(self, status: HTTPStatus, body: str) -> None:
+        data = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def send_html(self, status: HTTPStatus, body: str) -> None:
+        data = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self) -> None:
+        if PAYPAL_SETTINGS is None:
+            self.send_text(HTTPStatus.SERVICE_UNAVAILABLE, "PayPal server is not ready")
+            return
+
+        if self.path.startswith("/paypal/return"):
+            parsed = urllib_parse.urlsplit(self.path)
+            query = urllib_parse.parse_qs(parsed.query)
+            order_id = str((query.get("token") or [""])[0]).strip()
+            if order_id:
+                try:
+                    capture_payload = paypal_capture_order(PAYPAL_SETTINGS, order_id)
+                    complete_paypal_order_from_server(order_id, capture_payload)
+                    self.send_html(
+                        HTTPStatus.OK,
+                        paypal_return_page(
+                            "Payment confirmed",
+                            "Your payment has been confirmed. You can close this page and return to Telegram.",
+                        ),
+                    )
+                    return
+                except Exception:
+                    LOGGER.exception("PayPal return capture failed for order %s.", order_id)
+            self.send_html(
+                HTTPStatus.OK,
+                paypal_return_page(
+                    "Payment processing",
+                    "Your payment is being confirmed. You can close this page and return to Telegram.",
+                ),
+            )
+            return
+
+        if self.path.startswith("/paypal/cancel"):
+            self.send_html(
+                HTTPStatus.OK,
+                paypal_return_page(
+                    "Payment cancelled",
+                    "Your payment was cancelled. You can return to Telegram.",
+                ),
+            )
+            return
+
+        self.send_text(HTTPStatus.OK, "OK")
+
+    def do_POST(self) -> None:
+        if PAYPAL_SETTINGS is None:
+            self.send_text(HTTPStatus.SERVICE_UNAVAILABLE, "PayPal server is not ready")
+            return
+        if not self.path.startswith("/paypal/webhook"):
+            self.send_text(HTTPStatus.NOT_FOUND, "Not found")
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+        except ValueError:
+            self.send_text(HTTPStatus.BAD_REQUEST, "Invalid content length")
+            return
+        raw_body = self.rfile.read(length)
+        try:
+            event = paypal_verify_webhook(PAYPAL_SETTINGS, raw_body, self.headers)
+            event_type = str(event.get("event_type") or "").strip()
+            if event_type != "PAYMENT.CAPTURE.COMPLETED":
+                self.send_text(HTTPStatus.OK, f"Ignored {event_type or 'unknown'}")
+                return
+            order_id = paypal_order_id_from_capture_event(event)
+            message = complete_paypal_order_from_server(order_id, event)
+        except Exception as exc:
+            LOGGER.exception("PayPal webhook processing failed.")
+            self.send_text(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        self.send_text(HTTPStatus.OK, message)
+
+
+def start_paypal_webhook_server(settings: Settings, loop: asyncio.AbstractEventLoop, bot: Any) -> None:
+    global PAYPAL_MAIN_LOOP, PAYPAL_BOT, PAYPAL_SETTINGS, PAYPAL_WEBHOOK_SERVER, PAYPAL_WEBHOOK_THREAD
+    PAYPAL_MAIN_LOOP = loop
+    PAYPAL_BOT = bot
+    PAYPAL_SETTINGS = settings
+    if PAYPAL_WEBHOOK_SERVER is not None:
+        return
+    PAYPAL_WEBHOOK_SERVER = ThreadingHTTPServer(("0.0.0.0", settings.paypal_webhook_port), PaypalWebhookHandler)
+    PAYPAL_WEBHOOK_THREAD = threading.Thread(
+        target=PAYPAL_WEBHOOK_SERVER.serve_forever,
+        name="paypal-webhook",
+        daemon=True,
+    )
+    PAYPAL_WEBHOOK_THREAD.start()
+    LOGGER.info("PayPal webhook server started on port %s", settings.paypal_webhook_port)
+
+
+def stop_paypal_webhook_server() -> None:
+    global PAYPAL_WEBHOOK_SERVER
+    if PAYPAL_WEBHOOK_SERVER is None:
+        return
+    PAYPAL_WEBHOOK_SERVER.shutdown()
+    PAYPAL_WEBHOOK_SERVER.server_close()
+    PAYPAL_WEBHOOK_SERVER = None
+
+
 def build_application(settings: Settings) -> Application:
     application = Application.builder().token(settings.bot_token).build()
     application.bot_data["settings"] = settings
@@ -1711,15 +2555,22 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CommandHandler("catalog", catalog_command))
     application.add_handler(CallbackQueryHandler(button_click))
     application.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, text_message))
+    application.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.TEXT & ~filters.COMMAND, private_non_text_message))
+    application.add_handler(MessageHandler(filters.ChatType.SUPERGROUP & ~filters.COMMAND, relay_admin_group_message))
     return application
 
 
 def main() -> None:
     settings = load_settings()
     LOGGER.info("starting v2 bot; test_only_mode=%s", settings.test_only_mode)
-    asyncio.set_event_loop(asyncio.new_event_loop())
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     application = build_application(settings)
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    start_paypal_webhook_server(settings, loop, application.bot)
+    try:
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+    finally:
+        stop_paypal_webhook_server()
 
 
 if __name__ == "__main__":
