@@ -833,6 +833,15 @@ def admin_payment_keyboard(user_id: int, purchase_id: str) -> InlineKeyboardMark
     )
 
 
+def admin_payment_fallback_keyboard(user_id: int, purchase_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("manually verify payment \u2705", callback_data=f"adm:pay:{user_id}:{purchase_id}")],
+            [InlineKeyboardButton("summary", callback_data=f"adm:summary:{user_id}")],
+        ]
+    )
+
+
 def admin_voice_request_keyboard(user_id: int, purchase_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -1174,6 +1183,8 @@ def format_admin_purchase_card(record: dict[str, Any], purchase: dict[str, Any],
     detail = str(purchase.get("delivery_summary") or "").strip()
     if detail and purchase.get("status") in {"payment_setup_failed", "pending_manual"}:
         lines.append(f"note: {detail}")
+    if purchase.get("manual_payment_verified"):
+        lines.append(f"manual payment verified: {format_dt(purchase.get('manual_payment_verified_at'))}")
     return "\n".join(lines)
 
 
@@ -1228,6 +1239,8 @@ def create_purchase(
         "paypal_order_id": None,
         "paypal_approval_url": None,
         "paypal_invoice_id": None,
+        "manual_payment_verified": False,
+        "manual_payment_verified_at": None,
     }
     record.setdefault("purchases", []).append(purchase)
     record["updated_at"] = to_iso(utc_now())
@@ -2259,6 +2272,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 state,
                 record,
                 format_admin_purchase_card(record, purchase, paypal_setup_failure_title(exc)),
+                reply_markup=admin_payment_fallback_keyboard(record["user_id"], purchase["purchase_id"]),
             )
             await query.answer("PayPal setup failed", show_alert=True)
             await query.edit_message_text(
@@ -2412,7 +2426,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     await query.answer("PayPal setup failed", show_alert=True)
                     await query.edit_message_text(
                         text=format_admin_purchase_card(record, purchase, paypal_setup_failure_title(exc)),
-                        reply_markup=admin_voice_request_keyboard(user_id, purchase_id),
+                        reply_markup=admin_payment_fallback_keyboard(user_id, purchase_id),
                     )
                     return
                 save_state(settings, state)
@@ -2454,6 +2468,11 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             if purchase is None:
                 await query.answer("that purchase is no longer available.", show_alert=True)
                 return
+            if action == "pay" and purchase.get("status") == "payment_setup_failed":
+                purchase["manual_payment_verified"] = True
+                purchase["manual_payment_verified_at"] = to_iso(utc_now())
+                purchase["delivery_summary"] = "PayPal failed; admin manually verified payment."
+                save_state(settings, state)
             if action == "pay":
                 await query.answer("payment confirmed")
                 await mark_purchase_paid(query, context, settings, state, record, purchase)
