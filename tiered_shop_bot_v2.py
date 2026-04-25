@@ -300,6 +300,12 @@ def paypal_setup_failure_title(exc: Exception) -> str:
     message = str(exc)
     if "PAYEE_ACCOUNT_RESTRICTED" in message:
         return "PayPal account restricted - checkout blocked"
+    if "PayPal checkout is not configured" in message or "PAYPAL_PUBLIC_BASE_URL" in message:
+        return "PayPal checkout is not fully configured"
+    if "PayPal client credentials are missing" in message:
+        return "PayPal credentials are missing"
+    if "PayPal token request failed" in message:
+        return "PayPal credentials were rejected"
     return "PayPal setup failed"
 
 
@@ -310,13 +316,24 @@ def paypal_setup_failure_detail(exc: Exception) -> str:
             "PayPal refused to create the checkout because the receiving merchant account is restricted. "
             "Open the PayPal account Resolution Center or contact PayPal support to remove the restriction."
         )
+    if "PayPal checkout is not configured" in message:
+        return (
+            "PayPal checkout is missing one or more Railway variables: PAYPAL_CLIENT_ID, "
+            "PAYPAL_CLIENT_SECRET, PAYPAL_WEBHOOK_ID, or PAYPAL_PUBLIC_BASE_URL."
+        )
+    if "PAYPAL_PUBLIC_BASE_URL" in message:
+        return "PAYPAL_PUBLIC_BASE_URL should be the public Railway base URL, without /paypal/webhook at the end."
+    if "PayPal client credentials are missing" in message:
+        return "PAYPAL_CLIENT_ID and PAYPAL_CLIENT_SECRET need to be set in Railway."
+    if "PayPal token request failed" in message:
+        return "PayPal rejected the client id/secret. Check that PAYPAL_ENV matches the credential type."
     return message
 
 
 def buyer_payment_unavailable_text() -> str:
     return (
-        "payment is temporarily unavailable on PayPal right now.\n\n"
-        "i saved your request, and i'll check the payment setup from my side."
+        "payment is paused for a moment.\n\n"
+        "your request is saved, and i'll sort the PayPal side before asking you to try again."
     )
 
 
@@ -535,6 +552,20 @@ def tier_label(tier: str | None) -> str:
     return TIER_LABELS.get(tier, tier)
 
 
+def purchase_status_label(status: str | None) -> str:
+    labels = {
+        "awaiting_approval": "waiting for approval",
+        "awaiting_payment": "waiting for payment",
+        "payment_claimed": "payment under review",
+        "paid": "paid",
+        "pending_manual": "being prepared",
+        "fulfilled": "delivered",
+        "declined": "declined",
+        "payment_setup_failed": "payment temporarily unavailable",
+    }
+    return labels.get(status or "", status or "unknown")
+
+
 def new_record(
     synthetic_user_id: int,
     owner_user_id: int,
@@ -661,6 +692,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("pro menu \U0001f525", callback_data="menu:pro")],
             [InlineKeyboardButton("my access \U0001f464", callback_data="menu:access")],
             [InlineKeyboardButton("my purchases \U0001f4e6", callback_data="menu:purchases")],
+            [InlineKeyboardButton("payment help \U0001f4b8", callback_data="menu:payment_help")],
             [InlineKeyboardButton("rules & boundaries \u26a0\ufe0f", callback_data="menu:rules")],
         ]
     )
@@ -794,7 +826,7 @@ def admin_payment_keyboard(user_id: int, purchase_id: str) -> InlineKeyboardMark
         [
             [
                 InlineKeyboardButton("mark paid \u2705", callback_data=f"adm:pay:{user_id}:{purchase_id}"),
-                InlineKeyboardButton("reject payment", callback_data=f"adm:deny:{user_id}:{purchase_id}"),
+                InlineKeyboardButton("payment not found", callback_data=f"adm:deny:{user_id}:{purchase_id}"),
             ],
             [InlineKeyboardButton("summary", callback_data=f"adm:summary:{user_id}")],
         ]
@@ -806,7 +838,7 @@ def admin_voice_request_keyboard(user_id: int, purchase_id: str) -> InlineKeyboa
         [
             [
                 InlineKeyboardButton("accept request \u2705", callback_data=f"adm:voiceok:{user_id}:{purchase_id}"),
-                InlineKeyboardButton("decline with reply \u274c", callback_data=f"adm:voiceno:{user_id}:{purchase_id}"),
+                InlineKeyboardButton("decline + explain \u274c", callback_data=f"adm:voiceno:{user_id}:{purchase_id}"),
             ],
             [InlineKeyboardButton("summary", callback_data=f"adm:summary:{user_id}")],
         ]
@@ -920,6 +952,15 @@ def access_text(record: dict[str, Any]) -> str:
     return "your access \U0001f464\n\nno active access yet."
 
 
+def payment_help_text() -> str:
+    return (
+        "payment help \U0001f4b8\n\n"
+        "when you buy something, this chat opens a fresh PayPal checkout link for that item.\n"
+        "after PayPal confirms it, this chat updates automatically.\n\n"
+        "if PayPal is temporarily unavailable, your request stays saved so it can be handled cleanly."
+    )
+
+
 def rules_text() -> str:
     return (
         "rules & boundaries \u26a0\ufe0f\n\n"
@@ -927,7 +968,8 @@ def rules_text() -> str:
         "purchases are delivered through the bot.\n"
         "chatting is only available at Pro.\n"
         "be respectful and easygoing.\n"
-        "if something needs manual handling, i'll say so clearly."
+        "if something needs manual handling, i'll say so clearly.\n\n"
+        "payment is handled through fresh PayPal checkout links made for each item."
     )
 
 
@@ -935,8 +977,8 @@ def tier_locked_text(target: str, current_tier: str | None) -> str:
     if target == "plus":
         return (
             "Plus is locked for now \U0001f512\n\n"
-            "start with Starter first,\n"
-            "or wait for manual approval if you've bought before."
+            "Starter is the first paid step.\n"
+            "after that, Plus opens the next layer."
         )
     if target == "pro" and current_tier == TIER_STARTER:
         return "this is a Pro unlock \U0001f512\n\nPro opens after a Plus purchase."
@@ -944,7 +986,7 @@ def tier_locked_text(target: str, current_tier: str | None) -> str:
         return "this opens at Pro \U0001f512\n\ncomplete any Plus unlock to open Pro access."
     if target == "chat":
         return "chat opens at Pro \U0001f4ac\U0001f512\n\nchatting isn't included yet.\nit unlocks once you reach Pro."
-    return "this area is locked right now."
+    return "this area opens later in your access path."
 
 
 def what_comes_next_text() -> str:
@@ -1083,6 +1125,7 @@ def purchase_lines(record: dict[str, Any]) -> list[str]:
         "pending_manual": "\U0001f6e0\ufe0f",
         "fulfilled": "\U0001f381",
         "declined": "\u274c",
+        "payment_setup_failed": "\u26a0\ufe0f",
     }
     for purchase in reversed(purchases[-12:]):
         status = purchase.get("status", "unknown")
@@ -1090,7 +1133,7 @@ def purchase_lines(record: dict[str, Any]) -> list[str]:
         amount = money_text(int(purchase.get("price_cents", 0)))
         requested_at = format_dt(purchase.get("requested_at"))
         icon = status_icons.get(status, "\U0001f4cc")
-        lines.append(f"{icon} {title} - {amount} - {status} - {requested_at}")
+        lines.append(f"{icon} {title} - {amount} - {purchase_status_label(status)} - {requested_at}")
     return lines
 
 
@@ -1119,7 +1162,7 @@ def format_admin_purchase_card(record: dict[str, Any], purchase: dict[str, Any],
         f"tier: {tier_label(record.get('tier'))}\n"
         f"item: {purchase.get('title')}\n"
         f"amount: {money_text(int(purchase.get('price_cents', 0)))}\n"
-        f"status: {purchase.get('status')}\n"
+        f"status: {purchase_status_label(str(purchase.get('status') or ''))}\n"
         f"requested: {format_dt(purchase.get('requested_at'))}"
     ]
     request_text = str(purchase.get("request_text") or "").strip()
@@ -1128,6 +1171,9 @@ def format_admin_purchase_card(record: dict[str, Any], purchase: dict[str, Any],
     admin_reply = str(purchase.get("admin_reply") or "").strip()
     if admin_reply:
         lines.append(f"admin reply: {admin_reply}")
+    detail = str(purchase.get("delivery_summary") or "").strip()
+    if detail and purchase.get("status") in {"payment_setup_failed", "pending_manual"}:
+        lines.append(f"note: {detail}")
     return "\n".join(lines)
 
 
@@ -1403,6 +1449,18 @@ def complete_paypal_order_from_server(order_id: str, event: dict[str, Any]) -> s
         PAYPAL_MAIN_LOOP,
     )
     return future.result(timeout=60)
+
+
+def paypal_capture_completed(payload: dict[str, Any]) -> bool:
+    if str(payload.get("status") or "").upper() == "COMPLETED":
+        return True
+    purchase_units = payload.get("purchase_units") or []
+    for unit in purchase_units:
+        payments = (unit.get("payments") or {}).get("captures") or []
+        for capture in payments:
+            if str(capture.get("status") or "").upper() == "COMPLETED":
+                return True
+    return False
 
 
 def paypal_order_id_from_capture_event(event: dict[str, Any]) -> str:
@@ -1714,6 +1772,10 @@ async def handle_buyer_menu(query: Any, record: dict[str, Any]) -> None:
 
     if destination == "purchases":
         await edit_buyer_view(query, purchases_text(record), simple_back_keyboard("home"))
+        return
+
+    if destination == "payment_help":
+        await edit_buyer_view(query, payment_help_text(), simple_back_keyboard("home"))
         return
 
     if destination == "rules":
@@ -2106,10 +2168,10 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if data.startswith("budget:"):
         record = get_active_private_record(state, query.from_user.id)
         if record is None:
-            await query.answer("no active buyer session.", show_alert=True)
+            await query.answer("open /start to refresh your menu.", show_alert=True)
             return
         if record.get("intake_state") != "awaiting_budget":
-            await query.answer("that step is no longer active.", show_alert=True)
+            await query.answer("that step is already done.", show_alert=True)
             return
         budget_key = data.partition(":")[2]
         record["budget_key"] = budget_key
@@ -2127,7 +2189,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if data.startswith("menu:"):
         record = get_active_private_record(state, query.from_user.id)
         if record is None:
-            await query.answer("no active buyer session.", show_alert=True)
+            await query.answer("open /start to refresh your menu.", show_alert=True)
             return
         clear_pending_buyer_action(record)
         await query.answer()
@@ -2138,7 +2200,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if data.startswith("nav:"):
         record = get_active_private_record(state, query.from_user.id)
         if record is None:
-            await query.answer("no active buyer session.", show_alert=True)
+            await query.answer("open /start to refresh your menu.", show_alert=True)
             return
         target = data.partition(":")[2]
         clear_pending_buyer_action(record)
@@ -2153,21 +2215,21 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if data.startswith("buy:"):
         record = get_active_private_record(state, query.from_user.id)
         if record is None:
-            await query.answer("no active buyer session.", show_alert=True)
+            await query.answer("open /start to refresh your menu.", show_alert=True)
             return
         sku = data.partition(":")[2]
         if sku not in CATALOG:
-            await query.answer("unknown product", show_alert=True)
+            await query.answer("that item is no longer available.", show_alert=True)
             return
 
         if sku == "starter_unlock" and tier_rank(record.get("tier")) < tier_rank(TIER_VERIFIED):
             await query.answer("starter opens after verification.", show_alert=True)
             return
         if sku.startswith("plus_") and not can_open_plus(record):
-            await query.answer("plus is locked.", show_alert=True)
+            await query.answer("Plus opens after Starter.", show_alert=True)
             return
         if sku.startswith("pro_") and not can_open_pro(record):
-            await query.answer("pro is locked.", show_alert=True)
+            await query.answer("Pro opens after the Plus step.", show_alert=True)
             return
         if sku == "pro_voice_note":
             record["pending_buyer_action"] = {"kind": "pro_voice_request", "sku": sku}
@@ -2228,15 +2290,15 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if data.startswith("paid:"):
         record = get_active_private_record(state, query.from_user.id)
         if record is None:
-            await query.answer("no active buyer session.", show_alert=True)
+            await query.answer("open /start to refresh your menu.", show_alert=True)
             return
         purchase_id = data.partition(":")[2]
         purchase = find_purchase(record, purchase_id)
         if purchase is None:
-            await query.answer("purchase not found.", show_alert=True)
+            await query.answer("that purchase is no longer available.", show_alert=True)
             return
         if purchase["status"] not in {"awaiting_payment", "payment_claimed"}:
-            await query.answer("payment is already being handled.", show_alert=True)
+            await query.answer("that payment is already being handled.", show_alert=True)
             return
         purchase["status"] = "payment_claimed"
         save_state(settings, state)
@@ -2264,13 +2326,13 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             return
         parts = data.split(":")
         if len(parts) < 3:
-            await query.answer("invalid admin action", show_alert=True)
+            await query.answer("that admin button is outdated.", show_alert=True)
             return
         action = parts[1]
         user_id = int(parts[2])
         record = state.get("users", {}).get(str(user_id))
         if record is None:
-            await query.answer("buyer not found", show_alert=True)
+            await query.answer("that buyer record is no longer available.", show_alert=True)
             return
 
         if action == "tier" and len(parts) == 4:
@@ -2327,13 +2389,13 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             purchase_id = parts[3]
             purchase = find_purchase(record, purchase_id)
             if purchase is None:
-                await query.answer("purchase not found", show_alert=True)
+                await query.answer("that purchase is no longer available.", show_alert=True)
                 return
             if purchase.get("sku") != "pro_voice_note":
-                await query.answer("not a voice note request", show_alert=True)
+                await query.answer("that button is for voice notes only.", show_alert=True)
                 return
             if purchase["status"] not in {"awaiting_approval"}:
-                await query.answer("already handled", show_alert=True)
+                await query.answer("that request was already handled.", show_alert=True)
                 return
             if query.message is None or query.message.message_thread_id is None:
                 await query.answer("open this from the buyer topic.", show_alert=True)
@@ -2390,7 +2452,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             purchase_id = parts[3]
             purchase = find_purchase(record, purchase_id)
             if purchase is None:
-                await query.answer("purchase not found", show_alert=True)
+                await query.answer("that purchase is no longer available.", show_alert=True)
                 return
             if action == "pay":
                 await query.answer("payment confirmed")
@@ -2426,7 +2488,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 )
                 return
 
-        await query.answer("unknown admin action", show_alert=True)
+        await query.answer("that admin button is no longer current.", show_alert=True)
 
 
 def paypal_return_page(title: str, message: str) -> str:
@@ -2476,6 +2538,8 @@ class PaypalWebhookHandler(BaseHTTPRequestHandler):
             if order_id:
                 try:
                     capture_payload = paypal_capture_order(PAYPAL_SETTINGS, order_id)
+                    if not paypal_capture_completed(capture_payload):
+                        raise RuntimeError("PayPal did not mark the capture as completed yet.")
                     complete_paypal_order_from_server(order_id, capture_payload)
                     self.send_html(
                         HTTPStatus.OK,
