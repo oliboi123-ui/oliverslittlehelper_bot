@@ -826,6 +826,14 @@ def relay_mode_enabled(record: dict[str, Any]) -> bool:
     )
 
 
+def testmode_contact_available(state: dict[str, Any], user_id: int, record: dict[str, Any]) -> bool:
+    if not record.get("test_mode"):
+        return False
+    if record.get("status") != "approved":
+        return False
+    return get_buyer_chat_id(record, user_id) is not None
+
+
 def contact_mode_label(record: dict[str, Any]) -> str:
     mode = str(record.get("contact_mode") or "").strip().lower()
     if mode == "relay":
@@ -3572,7 +3580,13 @@ async def relay_buyer_message(
     relay_group_id = get_relay_group_id()
     relay_topic_id = record.get("relay_topic_id")
     if relay_group_id is None or not isinstance(relay_topic_id, int):
-        await update.message.reply_text("Your relay chat is not ready yet. Please wait a moment.")
+        if testmode_contact_available(state, update.effective_user.id, record):
+            await update.message.reply_text(
+                "Your test session is running in direct fallback right now. "
+                "Messages from here won't relay into a topic until relay setup works again."
+            )
+        else:
+            await update.message.reply_text("Your relay chat is not ready yet. Please wait a moment.")
         return
     logical_user_id = int(record.get("test_mode_buyer_user_id") or update.effective_user.id)
     get_relay_topics(state)[str(relay_topic_id)] = logical_user_id
@@ -4243,7 +4257,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         user_id = callback_user_id
         record = get_user_record(state, user_id)
-        if not relay_mode_enabled(record):
+        if not relay_mode_enabled(record) and not testmode_contact_available(state, user_id, record):
             await query.answer("That relay is no longer active.", show_alert=True)
             return
 
