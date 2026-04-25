@@ -296,6 +296,30 @@ def paypal_is_configured(settings: Settings) -> bool:
     )
 
 
+def paypal_setup_failure_title(exc: Exception) -> str:
+    message = str(exc)
+    if "PAYEE_ACCOUNT_RESTRICTED" in message:
+        return "PayPal account restricted - checkout blocked"
+    return "PayPal setup failed"
+
+
+def paypal_setup_failure_detail(exc: Exception) -> str:
+    message = str(exc)
+    if "PAYEE_ACCOUNT_RESTRICTED" in message:
+        return (
+            "PayPal refused to create the checkout because the receiving merchant account is restricted. "
+            "Open the PayPal account Resolution Center or contact PayPal support to remove the restriction."
+        )
+    return message
+
+
+def buyer_payment_unavailable_text() -> str:
+    return (
+        "payment is temporarily unavailable on PayPal right now.\n\n"
+        "i saved your request, and i'll check the payment setup from my side."
+    )
+
+
 def paypal_return_url(settings: Settings) -> str:
     if not settings.paypal_public_base_url:
         raise RuntimeError("PAYPAL_PUBLIC_BASE_URL is required for PayPal checkout.")
@@ -2165,21 +2189,18 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             _, approval_url = paypal_create_order(settings, state, record, purchase)
         except Exception as exc:
             purchase["status"] = "payment_setup_failed"
-            purchase["delivery_summary"] = str(exc)
+            purchase["delivery_summary"] = paypal_setup_failure_detail(exc)
             save_state(settings, state)
             await post_to_admin_topic(
                 context.bot,
                 settings,
                 state,
                 record,
-                format_admin_purchase_card(record, purchase, f"PayPal setup failed: {exc}"),
+                format_admin_purchase_card(record, purchase, paypal_setup_failure_title(exc)),
             )
             await query.answer("PayPal setup failed", show_alert=True)
             await query.edit_message_text(
-                text=(
-                    "payment setup needs a quick fix on my side.\n\n"
-                    "i saved the request and i'll sort the checkout link."
-                ),
+                text=buyer_payment_unavailable_text(),
                 reply_markup=main_menu_keyboard(),
             )
             return
@@ -2324,11 +2345,11 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     await send_voice_note_payment_prompt(context.bot, settings, state, record, purchase)
                 except Exception as exc:
                     purchase["status"] = "payment_setup_failed"
-                    purchase["delivery_summary"] = str(exc)
+                    purchase["delivery_summary"] = paypal_setup_failure_detail(exc)
                     save_state(settings, state)
                     await query.answer("PayPal setup failed", show_alert=True)
                     await query.edit_message_text(
-                        text=format_admin_purchase_card(record, purchase, f"PayPal setup failed: {exc}"),
+                        text=format_admin_purchase_card(record, purchase, paypal_setup_failure_title(exc)),
                         reply_markup=admin_voice_request_keyboard(user_id, purchase_id),
                     )
                     return
