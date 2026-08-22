@@ -2,19 +2,19 @@
 cd /d "%~dp0"
 
 if not exist ".env" (
-  echo Filen .env saknas i den har mappen.
-  echo Skapa den innan du startar boten.
+  echo The .env file is missing from this folder.
+  echo Create it before starting the bot.
   pause
   exit /b 1
 )
 
 if not exist ".venv\Scripts\python.exe" (
-  echo Python-miljon saknas.
-  echo Kor setup_bot.bat forst.
+  echo The Python environment is missing.
+  echo Run setup_bot.bat first.
   pause
   exit /b 1
 )
 
-echo Startar boten...
+echo Starting the bot...
 ".venv\Scripts\python.exe" ".\gatekeeper_bot.py"
 pause

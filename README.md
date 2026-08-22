@@ -1,0 +1,140 @@
+# Gatekeeper Bot
+
+A Telegram bot that gives paying subscribers a private line to you without
+exposing your personal Telegram account.
+
+## How it works
+
+1. Someone subscribes to your Telegram tier on Fansly.
+2. You run `/newcode <their_fansly_handle>` and get back a one-time link.
+3. You send that link in a Fansly DM. **This is the only link they ever get.**
+4. They tap it. Access is granted, the code burns, and a forum topic named
+   after them appears in your private admin group.
+5. They message the bot. Their messages land in that topic. You reply in the
+   topic and the bot copies it back to them. They never see your handle.
+
+## Access lifecycle
+
+The bot has no connection to Fansly and cannot see who is still subscribed.
+It tracks one thing: how long since you last confirmed a customer is paying.
+It defaults to cutting them off, and you override that with a button.
+
+- Redeeming a link grants `ACCESS_DURATION_DAYS` (30 by default).
+- `access_digest.py` runs daily. It pauses anyone whose time ran out, closes
+  their topic, and DMs you a list of who lapsed and who lapses within
+  `EXPIRY_WARNING_DAYS`.
+- Run `/expiring` to get each of them as a message with ✅ Extend / ❌ Cut.
+  Check your Fansly subscriber list, tap down the row, done.
+- Extending adds time to the *current expiry*, not to today, so tapping early
+  costs the customer nothing.
+
+A paused customer keeps their topic and its full history — the topic just
+closes, which makes them easy to spot in the group's topic list. Their
+messages still reach you (someone messaging after a lapse is usually about to
+resubscribe), and they get a "your access is paused" notice at most once a
+day. Extending reopens the topic. No new link is ever needed.
+
+`/revoke` is the harder version: access is cut and the bot stops relaying in
+both directions.
+
+## Commands
+
+All admin commands only work in the registered admin chat.
+
+| Command | What it does |
+| --- | --- |
+| `/newcode <fansly_handle>` | Create a one-time access link |
+| `/codes` | List links that haven't been used yet |
+| `/customers` | Everyone with access, and their status |
+| `/who <user_id>` | One customer's full details |
+| `/extend <user_id> [days]` | Add time, reopening a paused topic |
+| `/revoke <user_id>` | Cut access now |
+| `/expiring` | Who lapses soon, with Extend/Cut buttons |
+
+Inside a customer's forum topic, a message starting with `//` stays in the
+topic and is not sent to the customer.
+
+## Setup
+
+### 1. The bot
+
+Create the bot with [@BotFather](https://t.me/BotFather) and copy the token.
+
+### 2. The admin group
+
+1. Create a private Telegram supergroup.
+2. Turn on **Topics** in group settings.
+3. Add the bot as an admin with **Manage Topics** permission.
+4. Get the group's ID (it starts with `-100`) and set `RELAY_ADMIN_GROUP_ID`.
+
+### 3. Environment
+
+Copy `.env.example` to `.env` and fill it in. In production these live in
+Railway Variables instead.
+
+| Variable | Required | Notes |
+| --- | --- | --- |
+| `BOT_TOKEN` | Yes | From BotFather |
+| `ADMIN_USERNAME` | Yes* | Your Telegram username, no `@` |
+| `ADMIN_CHAT_ID` | No | Pins the admin chat by ID instead |
+| `RELAY_ADMIN_GROUP_ID` | Yes | The forum supergroup, starts with `-100` |
+| `ACCESS_DURATION_DAYS` | No | Defaults to 30 |
+| `EXPIRY_WARNING_DAYS` | No | Defaults to 7 |
+| `BOT_DATA_DIR` | No | Where `bot_state.json` lives |
+
+\* Either `ADMIN_USERNAME` or `ADMIN_CHAT_ID` must be set.
+
+### 4. Register yourself
+
+Send `/start` to the bot from your own Telegram account. It registers that
+chat as the admin chat and confirms with the command list.
+
+## Running it
+
+Locally, on Windows:
+
+```bash
+setup_bot.bat
+```
+
+Then `start_bot.bat`. Or by hand:
+
+```bash
+py -m venv .venv && .venv/Scripts/python.exe -m pip install -r requirements.txt
+```
+
+```bash
+.venv/Scripts/python.exe gatekeeper_bot.py
+```
+
+Don't run a local bot while the Railway one is live — two pollers sharing a
+token fight each other.
+
+### Railway
+
+Two services off this repo:
+
+- **Bot:** `python -u gatekeeper_bot.py`
+- **Daily digest cron:** `python access_digest.py`
+
+Mount a Railway Volume at `/app/data` and set `BOT_DATA_DIR=/app/data` on both
+so `bot_state.json` survives redeploys. Railway deploys from `main`, so
+pushing triggers a production redeploy.
+
+## State
+
+Everything lives in `bot_state.json`: the admin chat ID, issued codes, one
+record per customer, and a topic-to-customer map. It's rewritten atomically on
+every change. There's no database.
+
+## Don't commit
+
+`.env`, `bot_state.json`, `*.log`, and the bot token. `.gitignore` already
+covers these — keep it that way.
+
+## Upgrading from the old version
+
+The access model changed completely, so delete any `bot_state.json` written by
+the previous bot before the first run. Records with a status this version
+doesn't recognise are treated as paused, which is safe but means old customers
+show up needing a manual extend.
