@@ -13,6 +13,12 @@ exposing your personal Telegram account.
 5. They message the bot. Their messages land in that topic. You reply in the
    topic and the bot copies it back to them. They never see your handle.
 
+Inside a topic, customer messages are forwarded so Telegram labels them with
+the customer's name, while your own replies are reposted under the bot's
+name (the bot copies each one and deletes your original, which is why it
+needs **Delete Messages**). Notes starting with `//` are left alone, so they
+stay visibly yours and never reach the customer.
+
 ## Access lifecycle
 
 The bot has no connection to Fansly and cannot see who is still subscribed.
@@ -64,7 +70,8 @@ Create the bot with [@BotFather](https://t.me/BotFather) and copy the token.
 
 1. Create a private Telegram supergroup.
 2. Turn on **Topics** in group settings.
-3. Add the bot as an admin with **Manage Topics** permission.
+3. Add the bot as an admin with **Manage Topics** and **Delete Messages**
+   permissions.
 4. Get the group's ID (it starts with `-100`) and set `RELAY_ADMIN_GROUP_ID`.
 
 ### 3. Environment

@@ -171,7 +171,13 @@ def days_until(value: str | None, now: datetime | None = None) -> int | None:
 
 
 def empty_state() -> dict[str, Any]:
-    return {"admin_chat_id": None, "codes": {}, "users": {}, "topics": {}}
+    return {
+        "admin_chat_id": None,
+        "codes": {},
+        "users": {},
+        "topics": {},
+        "delete_permission_warned": False,
+    }
 
 
 def load_state() -> dict[str, Any]:
@@ -760,12 +766,26 @@ async def relay_to_topic(
     get_topics(state)[str(topic_id)] = user_id
 
     try:
-        await context.bot.copy_message(
-            chat_id=relay_group_id,
-            from_chat_id=update.effective_chat.id,
-            message_id=update.message.message_id,
-            message_thread_id=topic_id,
-        )
+        # Forwarded rather than copied so Telegram labels it with the customer's
+        # name. A copy would arrive wearing the bot's identity, which makes the
+        # two sides of the conversation indistinguishable in the topic.
+        try:
+            await context.bot.forward_message(
+                chat_id=relay_group_id,
+                from_chat_id=update.effective_chat.id,
+                message_id=update.message.message_id,
+                message_thread_id=topic_id,
+            )
+        except Exception:
+            LOGGER.warning(
+                "Could not forward message from user %s, falling back to a copy.", user_id
+            )
+            await context.bot.copy_message(
+                chat_id=relay_group_id,
+                from_chat_id=update.effective_chat.id,
+                message_id=update.message.message_id,
+                message_thread_id=topic_id,
+            )
     except Exception as exc:
         LOGGER.exception("Could not relay a message from user %s.", user_id)
         admin_chat_id = state.get("admin_chat_id")
@@ -836,6 +856,65 @@ async def customer_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
 
 
+async def repost_as_bot(bot: Any, state: dict[str, Any], message: Any) -> None:
+    """Replace an operator's message in a topic with an identical bot message.
+
+    Telegram gives no way to post into a group as a bot, so the message is
+    copied under the bot's identity and the original is deleted. If the delete
+    is refused the copy is removed again, because a duplicate reads worse than
+    the original message simply staying put.
+    """
+    relay_group_id = get_relay_group_id()
+    if relay_group_id is None:
+        return
+
+    try:
+        copy = await bot.copy_message(
+            chat_id=relay_group_id,
+            from_chat_id=relay_group_id,
+            message_id=message.message_id,
+            message_thread_id=message.message_thread_id,
+        )
+    except Exception:
+        LOGGER.exception("Could not repost an operator message as the bot.")
+        return
+
+    try:
+        await bot.delete_message(chat_id=relay_group_id, message_id=message.message_id)
+    except Exception:
+        LOGGER.warning("Could not delete the operator's original message; removing the copy.")
+        try:
+            await bot.delete_message(chat_id=relay_group_id, message_id=copy.message_id)
+        except Exception:
+            LOGGER.exception("Could not remove the duplicate copy either.")
+        await warn_missing_delete_permission(bot, state, message.message_thread_id)
+
+
+async def warn_missing_delete_permission(
+    bot: Any, state: dict[str, Any], topic_id: int | None
+) -> None:
+    """Explain the missing permission once rather than on every message."""
+    if state.get("delete_permission_warned"):
+        return
+    state["delete_permission_warned"] = True
+    save_state(state)
+    relay_group_id = get_relay_group_id()
+    if relay_group_id is None:
+        return
+    try:
+        await bot.send_message(
+            chat_id=relay_group_id,
+            message_thread_id=topic_id,
+            text=(
+                "Your messages are being delivered, but I can't repost them under my own "
+                "name because I don't have the Delete Messages permission in this group. "
+                "Grant it in the group's admin settings and they'll post as me from then on."
+            ),
+        )
+    except Exception:
+        LOGGER.exception("Could not warn about the missing delete permission.")
+
+
 async def relay_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Copy an operator's reply in a forum topic back to the matching customer."""
     if not update.effective_chat or not update.message or not update.effective_user:
@@ -879,6 +958,9 @@ async def relay_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             message_thread_id=update.message.message_thread_id,
             text=f"Delivery failed: {exc}",
         )
+        return
+
+    await repost_as_bot(context.bot, state, update.message)
 
 
 # ---------------------------------------------------------------------------
