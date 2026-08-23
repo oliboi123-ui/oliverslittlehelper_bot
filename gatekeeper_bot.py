@@ -220,6 +220,7 @@ def default_user_record() -> dict[str, Any]:
         "pause_notice_sent_at": None,
         "topic_id": None,
         "topic_name": None,
+        "awaiting_fansly_handle": False,
     }
 
 
@@ -297,11 +298,13 @@ def truncate_text(value: str, limit: int) -> str:
 
 
 def build_topic_name(record: dict[str, Any]) -> str:
-    parts = [display_name(record)]
+    """Telegram writes the per-message "Forwarded from" header itself and won't
+    take a custom name, so the Fansly handle lives in the topic title instead,
+    where it stays on screen for the whole conversation.
+    """
+    name = display_name(record)
     handle = str(record.get("fansly_handle") or "").strip()
-    if handle:
-        parts.append(handle)
-    return truncate_text(" | ".join(part for part in parts if part) or "Customer", 120)
+    return truncate_text(f"{name} ({handle})" if handle else name or "Customer", 120)
 
 
 def status_line(record: dict[str, Any]) -> str:
@@ -529,6 +532,25 @@ async def reopen_topic(bot: Any, record: dict[str, Any], note: str | None = None
             LOGGER.exception("Could not post a note after reopening topic %s.", topic_id)
 
 
+async def rename_topic(bot: Any, record: dict[str, Any]) -> None:
+    """Re-title a topic after the customer's details change."""
+    relay_group_id = get_relay_group_id()
+    topic_id = record.get("topic_id")
+    if relay_group_id is None or not isinstance(topic_id, int):
+        return
+    topic_name = build_topic_name(record)
+    if topic_name == record.get("topic_name"):
+        return
+    try:
+        await bot.edit_forum_topic(
+            chat_id=relay_group_id, message_thread_id=topic_id, name=topic_name
+        )
+    except Exception:
+        LOGGER.exception("Could not rename topic %s.", topic_id)
+        return
+    record["topic_name"] = topic_name
+
+
 def is_internal_note(message: Any) -> bool:
     text = str(message.text or message.caption or "").strip()
     return text.startswith("//")
@@ -539,36 +561,52 @@ def is_internal_note(message: Any) -> bool:
 # ---------------------------------------------------------------------------
 
 
+# Everything the customer sees is lowercase, so the bot reads the way the
+# operator actually types rather than like an automated system.
+
+
 def welcome_text(record: dict[str, Any]) -> str:
     return (
-        "You're in. Send me a message here whenever you like and I'll reply personally.\n\n"
-        f"Your access runs until {format_date(record.get('expires_at'))} and keeps "
+        "you're in. message me here whenever you like and i'll reply personally.\n\n"
+        f"your access runs until {format_date(record.get('expires_at')).lower()} and keeps "
         "renewing while your subscription is active."
     )
 
 
+def ask_fansly_handle_text() -> str:
+    return "hey, you made it :) what's your fansly username, so i know who i'm talking to?"
+
+
+def fansly_handle_saved_text() -> str:
+    return "got it, thanks. message me whenever."
+
+
 def paused_text() -> str:
     return (
-        "Your access has paused because your subscription is no longer showing as active.\n\n"
-        "Resubscribe and send me a message here and I'll switch it back on. "
-        "You don't need a new link."
+        "your access has paused because your subscription isn't showing as active anymore.\n\n"
+        "resubscribe and message me here and i'll switch it back on. "
+        "you don't need a new link."
     )
 
 
 def no_code_text() -> str:
     return (
-        "This bot is for subscribers only. You'll get a personal access link in a "
-        "direct message once you subscribe to the Telegram tier.\n\n"
-        "Already have a code? Send it to me here."
+        "this bot is for subscribers only. you'll get a personal access link in a "
+        "direct message once you subscribe to the telegram tier.\n\n"
+        "already have a code? send it to me here."
     )
 
 
 def bad_code_text() -> str:
-    return "That code isn't valid. Check it and try again, or ask me for a new link."
+    return "that code isn't valid. check it and try again, or ask me for a new link."
 
 
 def used_code_text() -> str:
-    return "That code has already been used. If that wasn't you, message me and I'll sort it out."
+    return "that code has already been used. if that wasn't you, message me and i'll sort it out."
+
+
+def relay_failed_text() -> str:
+    return "i couldn't get that through just now. try again in a moment?"
 
 
 # ---------------------------------------------------------------------------
@@ -692,8 +730,8 @@ async def redeem_code(
         LOGGER.exception("Could not open a topic for user %s.", user.id)
         save_state(state)
         await update.message.reply_text(
-            "You're in, but I couldn't open our chat thread just yet. "
-            "Send me a message and I'll pick it up."
+            "you're in, but i couldn't open our chat thread just yet. "
+            "message me and i'll pick it up."
         )
         admin_chat_id = state.get("admin_chat_id")
         if admin_chat_id:
@@ -701,6 +739,15 @@ async def redeem_code(
                 chat_id=int(admin_chat_id),
                 text=f"Topic creation failed for {user.id} ({person_label(record)}): {exc}",
             )
+        return
+
+    # The handle normally arrives with the code, so this only fires when a code
+    # was issued without one.
+    if not str(record.get("fansly_handle") or "").strip():
+        record["awaiting_fansly_handle"] = True
+        save_state(state)
+        await update.message.reply_text(welcome_text(record))
+        await update.message.reply_text(ask_fansly_handle_text())
         return
 
     save_state(state)
@@ -838,6 +885,21 @@ async def customer_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         mark_paused(record)
         await close_topic(context.bot, record, "Access lapsed. Relay paused.")
 
+    # Their first reply answers the handle question rather than starting the
+    # conversation, so it is captured instead of relayed.
+    if record.get("awaiting_fansly_handle"):
+        handle = normalize_handle(str(update.message.text or ""))
+        if handle:
+            record["fansly_handle"] = handle
+            record["awaiting_fansly_handle"] = False
+            await rename_topic(context.bot, record)
+            save_state(state)
+            await update.message.reply_text(fansly_handle_saved_text())
+            return
+        await update.message.reply_text(ask_fansly_handle_text())
+        save_state(state)
+        return
+
     paused = record.get("status") == STATUS_PAUSED
 
     # Paused customers still reach the operator: someone messaging after a lapse
@@ -851,9 +913,7 @@ async def customer_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     save_state(state)
 
     if not delivered:
-        await update.message.reply_text(
-            "I couldn't get that through just now. Please try again in a moment."
-        )
+        await update.message.reply_text(relay_failed_text())
 
 
 async def repost_as_bot(bot: Any, state: dict[str, Any], message: Any) -> None:
