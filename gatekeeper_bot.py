@@ -565,16 +565,13 @@ def is_internal_note(message: Any) -> bool:
 # operator actually types rather than like an automated system.
 
 
-def welcome_text(record: dict[str, Any]) -> str:
-    return (
-        "you're in. message me here whenever you like and i'll reply personally.\n\n"
-        f"your access runs until {format_date(record.get('expires_at')).lower()} and keeps "
-        "renewing while your subscription is active."
-    )
+def welcome_text() -> str:
+    return "hey, you made it :)"
 
 
 def ask_fansly_handle_text() -> str:
-    return "hey, you made it :) what's your fansly username, so i know who i'm talking to?"
+    # Sent straight after the welcome, so it doesn't repeat the greeting.
+    return "what's your fansly username, so i know who i'm talking to?"
 
 
 def fansly_handle_saved_text() -> str:
@@ -709,7 +706,7 @@ async def redeem_code(
         if int(entry["redeemed_by"]) == user.id and record is not None:
             # Re-clicking your own link is harmless, so just restate the status.
             await update.message.reply_text(
-                welcome_text(record) if record.get("status") == STATUS_ACTIVE else paused_text()
+                welcome_text() if record.get("status") == STATUS_ACTIVE else paused_text()
             )
             return
         await update.message.reply_text(used_code_text())
@@ -746,12 +743,12 @@ async def redeem_code(
     if not str(record.get("fansly_handle") or "").strip():
         record["awaiting_fansly_handle"] = True
         save_state(state)
-        await update.message.reply_text(welcome_text(record))
+        await update.message.reply_text(welcome_text())
         await update.message.reply_text(ask_fansly_handle_text())
         return
 
     save_state(state)
-    await update.message.reply_text(welcome_text(record))
+    await update.message.reply_text(welcome_text())
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -786,7 +783,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     save_state(state)
 
     if record.get("status") == STATUS_ACTIVE:
-        await update.message.reply_text(welcome_text(record))
+        await update.message.reply_text(welcome_text())
     else:
         await update.message.reply_text(paused_text())
 
