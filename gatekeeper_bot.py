@@ -61,11 +61,12 @@ STATUS_REVOKED = "revoked"
 PAUSE_NOTICE_INTERVAL_HOURS = 24
 
 BROADCAST_AUDIENCES = {
-    "customers": "Everyone ever granted access",
+    "customers": "Bought at least once",
     "active": "Access still running",
-    "paused": "Lapsed and paused",
+    "paused": "Bought before, lapsed since",
     "revoked": "Access cut",
-    "all": "Everyone the bot has a record for",
+    "leads": "Imported, never bought",
+    "all": "Everyone, customers and leads",
 }
 
 BROADCAST_SEND_DELAY_SECONDS = 0.05
@@ -607,10 +608,14 @@ def broadcast_audience_matches(audience: str, record: dict[str, Any]) -> bool:
     status = record.get("status")
     if audience == "all":
         return True
+    if audience == "leads":
+        return is_v1_lead(record)
+    # Leads are stored as paused, so every customer-shaped audience has to
+    # exclude them or it quietly picks up people who never bought.
     if audience == "active":
-        return is_access_active(record)
+        return is_access_active(record) and not is_v1_lead(record)
     if audience == "paused":
-        return status == STATUS_PAUSED
+        return status == STATUS_PAUSED and not is_v1_lead(record)
     if audience == "revoked":
         return status == STATUS_REVOKED
     if audience == "customers":
@@ -660,6 +665,9 @@ def format_broadcast_usage(state: dict[str, Any]) -> str:
             "",
             "Example:",
             "/broadcast customers The new group is open. Reply here for the invite link.",
+            "",
+            "leads never bought anything, so keep that message different from the one",
+            "your paying customers get. all sends to both at once.",
             "",
             "You get a preview and a confirm button before anything is sent.",
         ]

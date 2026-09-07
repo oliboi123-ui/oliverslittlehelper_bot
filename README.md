@@ -71,10 +71,24 @@ topic and is not sent to the customer.
 
 ### Broadcast
 
-`/broadcast` sends one message to every customer in an audience, in their
-private chat with the bot. Audiences are `customers` (everyone ever granted
-access), `active`, `paused`, `revoked`, and `all`. Send `/broadcast` on its
-own to see the live headcount for each.
+`/broadcast` sends one message to everyone in an audience, in their private
+chat with the bot. Send `/broadcast` on its own to see the live headcount for
+each one.
+
+| Audience | Who it reaches |
+| --- | --- |
+| `customers` | Bought at least once |
+| `active` | Access still running |
+| `paused` | Bought before, lapsed since |
+| `revoked` | Access cut |
+| `leads` | Imported, never bought |
+| `all` | Everyone, customers and leads |
+
+Imported leads are stored as paused, so every customer-shaped audience
+explicitly excludes them. `leads` reaches them on their own and `all` reaches
+both groups at once. Leads never paid you anything, so a message written for
+your customers rarely suits them — `run python test_broadcast_audiences.py` to
+confirm the split still holds.
 
 The command replies with a preview showing the audience, the recipient count,
 the exact message text, and the first ten recipients. Nothing goes out until
