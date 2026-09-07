@@ -892,7 +892,7 @@ ADMIN_HELP = "\n".join(
         "Commands:",
         "/newcode <fansly_handle> - create a one-time access link",
         "/codes - unused access links",
-        "/customers - everyone with access",
+        "/customers - people who actually bought, leads excluded",
         "/leads - imported people who never bought, with budget and request",
         "/who <user_id> - one customer's details",
         "/extend <user_id> [days] - add time",
@@ -1404,19 +1404,36 @@ async def customers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin_chat(state, update) or update.message is None:
         return
 
-    items = [
-        (int(user_id_text), record)
-        for user_id_text, record in state.get("users", {}).items()
-        if record.get("status") != STATUS_REVOKED
-    ]
+    # Imported leads are stored as paused, so they would otherwise be counted
+    # here as customers. They never bought anything, so /leads owns them.
+    items = []
+    lead_count = 0
+    for user_id_text, record in state.get("users", {}).items():
+        if record.get("status") == STATUS_REVOKED:
+            continue
+        if is_v1_lead(record):
+            lead_count += 1
+            continue
+        items.append((int(user_id_text), record))
+
     if not items:
-        await update.message.reply_text("No customers yet.")
+        message = "No customers yet."
+        if lead_count:
+            message += f"\n\n{lead_count} imported leads are waiting in /leads."
+        await update.message.reply_text(message)
         return
 
     items.sort(key=lambda item: item[1].get("expires_at") or "")
-    lines = [f"Customers: {len(items)}", ""]
+    active = sum(1 for _, record in items if is_access_active(record))
+    lines = [
+        f"Customers: {len(items)} ({active} with access running)",
+        "",
+    ]
     lines.extend(format_customer_line(user_id, record) for user_id, record in items)
-    lines.extend(["", "Full detail on one of them: /who <id>"])
+    lines.append("")
+    if lead_count:
+        lines.append(f"Plus {lead_count} imported leads who never bought: /leads")
+    lines.append("Full detail on one of them: /who <id>")
     await reply_in_chunks(update.message, lines)
 
 

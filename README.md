@@ -51,7 +51,7 @@ All admin commands only work in the registered admin chat.
 | --- | --- |
 | `/newcode <fansly_handle>` | Create a one-time access link |
 | `/codes` | List links that haven't been used yet |
-| `/customers` | Everyone with access, and their status |
+| `/customers` | People who actually bought, and their status |
 | `/who <user_id>` | One customer's full details |
 | `/extend <user_id> [days]` | Add time, reopening a paused topic |
 | `/revoke <user_id>` | Cut access now |
