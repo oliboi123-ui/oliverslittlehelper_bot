@@ -85,9 +85,55 @@ def classify(record: dict[str, Any], now: datetime) -> str:
     return "paused"
 
 
+def v1_details(record: dict[str, Any]) -> dict[str, Any]:
+    """The parts of a v1 record this bot has no column for, kept verbatim.
+
+    Budget, purchase intent and payment state are the notes worth having in
+    front of you when someone writes in, so they ride along instead of being
+    dropped on import.
+    """
+    return {
+        "status": str(record.get("status") or "").strip() or None,
+        "of_username": str(record.get("of_username") or "").strip() or None,
+        "budget_label": record.get("budget_range_label"),
+        "budget_floor": record.get("budget_floor"),
+        "review_priority": record.get("review_priority"),
+        "purchase_intent": record.get("purchase_intent"),
+        "payment_status": record.get("payment_status"),
+        "subscription_status": record.get("subscription_status"),
+        "queued_at": record.get("queued_at"),
+        "approved_at": record.get("approved_at"),
+        "expires_at": record.get("expires_at"),
+        "was_customer": bool(record.get("approved_at")),
+    }
+
+
+def refresh_details(
+    target_record: dict[str, Any],
+    source_record: dict[str, Any],
+    now: datetime | None = None,
+) -> None:
+    """Update an already-imported record with v1 detail, leaving access alone.
+
+    Status, expiry, topic wiring and anything set here since the import are
+    left untouched. Only the v1 notes and blank identity fields are filled.
+    """
+    now = now or utc_now()
+    target_record["v1"] = v1_details(source_record)
+    target_record["v1_refreshed_at"] = to_iso(now)
+    for key in ("telegram_username", "first_name", "last_name"):
+        if not target_record.get(key) and source_record.get(key):
+            target_record[key] = source_record[key]
+    if not target_record.get("fansly_handle"):
+        handle = str(source_record.get("of_username") or "").strip()
+        if handle:
+            target_record["fansly_handle"] = handle
+
+
 def translate(record: dict[str, Any], verdict: str, now: datetime) -> dict[str, Any]:
     stamp = to_iso(now)
     return {
+        "v1": v1_details(record),
         "status": STATUS_ACTIVE if verdict == "active" else STATUS_PAUSED,
         # v1 collected an OnlyFans username. This bot labels the field for
         # Fansly and only uses it for topic names and display, so the handle
@@ -138,6 +184,7 @@ def plan_migration(
     source_users = source.get("users", {}) if isinstance(source, dict) else {}
     counts = {"active": 0, "paused": 0, "lead": 0, "drop": 0}
     planned: list[tuple[str, str, dict[str, Any]]] = []
+    refreshable: list[tuple[str, dict[str, Any]]] = []
     skipped_existing = 0
 
     def sort_key(item: tuple[str, Any]) -> int:
@@ -157,11 +204,14 @@ def plan_migration(
             continue
         if user_id_text in target_users and not overwrite:
             skipped_existing += 1
+            # Already here, so leave their access alone and refresh the notes.
+            refreshable.append((user_id_text, record))
             continue
         planned.append((user_id_text, verdict, record))
 
     return {
         "planned": planned,
+        "refreshable": refreshable,
         "counts": counts,
         "skipped_existing": skipped_existing,
         "source_total": len(source_users),
@@ -169,9 +219,21 @@ def plan_migration(
     }
 
 
-def apply_migration(target_users: dict[str, Any], plan: dict[str, Any]) -> int:
-    """Write the planned records into target_users. Returns how many landed."""
+def apply_migration(target_users: dict[str, Any], plan: dict[str, Any]) -> dict[str, int]:
+    """Write the planned records, and refresh notes on ones already here.
+
+    Returns {"added": n, "refreshed": n}. Refreshing never touches access
+    state, so re-sending the same file is safe.
+    """
     now = plan["now"]
     for user_id_text, verdict, record in plan["planned"]:
         target_users[user_id_text] = translate(record, verdict, now)
-    return len(plan["planned"])
+
+    refreshed = 0
+    for user_id_text, record in plan.get("refreshable", []):
+        existing = target_users.get(user_id_text)
+        if isinstance(existing, dict):
+            refresh_details(existing, record, now)
+            refreshed += 1
+
+    return {"added": len(plan["planned"]), "refreshed": refreshed}

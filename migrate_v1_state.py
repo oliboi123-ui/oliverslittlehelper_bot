@@ -109,7 +109,7 @@ def main() -> int:
         print("Preview only. Re-run with --apply to write these records.")
         return 0
 
-    written = v1_migration.apply_migration(target_users, plan)
+    result = v1_migration.apply_migration(target_users, plan)
 
     if target_path.exists():
         stamp = plan["now"].strftime("%Y%m%d%H%M%S")
@@ -123,10 +123,12 @@ def main() -> int:
     temp_path.write_text(json.dumps(target, ensure_ascii=False, indent=2), encoding="utf-8")
     temp_path.replace(target_path)
 
-    print(f"Wrote {written} customers into {target_path}")
+    print(f"Wrote {result['added']} customers into {target_path}")
+    if result["refreshed"]:
+        print(f"Refreshed old-bot notes on {result['refreshed']} existing records")
     print()
     print("Restart the bot so it reloads the state file.")
-    print("Check the result with /customers, then reach them with /broadcast customers <message>.")
+    print("Check the result with /customers and /leads, then reach them with /broadcast.")
     return 0
 
 

@@ -497,7 +497,10 @@ def format_v1_import_preview(plan: dict[str, Any], include_leads: bool) -> str:
         f"  Banned, trashed, rejected, sandbox: {counts['drop']}",
     ]
     if plan["skipped_existing"]:
-        lines.append(f"  Already here, left alone: {plan['skipped_existing']}")
+        lines.append(
+            f"  Already here: {plan['skipped_existing']}"
+            " (access untouched, their old notes refreshed)"
+        )
     lines.extend(
         [
             "",
@@ -523,15 +526,15 @@ def format_v1_import_preview(plan: dict[str, Any], include_leads: bool) -> str:
     return "\n".join(lines)
 
 
-def format_v1_import_result(written: int, plan: dict[str, Any]) -> str:
+def format_v1_import_result(result: dict[str, int], plan: dict[str, Any]) -> str:
     return "\n".join(
         [
             "v1 import finished",
             "",
-            f"Customers added: {written}",
-            f"Left alone because they were already here: {plan['skipped_existing']}",
+            f"Added: {result['added']}",
+            f"Already here, notes refreshed, access untouched: {result['refreshed']}",
             "",
-            "Check them with /customers.",
+            "Check them with /customers and /leads.",
             "Reach them with /broadcast customers <message>.",
             "",
             "A customer only receives that message if they pressed Start on this",
@@ -890,6 +893,7 @@ ADMIN_HELP = "\n".join(
         "/newcode <fansly_handle> - create a one-time access link",
         "/codes - unused access links",
         "/customers - everyone with access",
+        "/leads - imported people who never bought, with budget and request",
         "/who <user_id> - one customer's details",
         "/extend <user_id> [days] - add time",
         "/revoke <user_id> - cut access now",
@@ -915,20 +919,97 @@ def format_customer_line(user_id: int, record: dict[str, Any]) -> str:
     return f"{user_id} | {person_label(record)} | {status_line(record)}"
 
 
+TELEGRAM_MESSAGE_LIMIT = 4096
+
+
+def chunk_lines(lines: list[str], limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
+    """Group lines into messages Telegram will accept."""
+    chunks: list[str] = []
+    current: list[str] = []
+    length = 0
+    for line in lines:
+        addition = len(line) + 1
+        if current and length + addition > limit:
+            chunks.append("\n".join(current))
+            current = []
+            length = 0
+        current.append(line)
+        length += addition
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+
+async def reply_in_chunks(message: Any, lines: list[str]) -> None:
+    for chunk in chunk_lines(lines):
+        await message.reply_text(chunk)
+
+
+def v1_notes(record: dict[str, Any]) -> dict[str, Any]:
+    notes = record.get("v1")
+    return notes if isinstance(notes, dict) else {}
+
+
+def is_v1_lead(record: dict[str, Any]) -> bool:
+    """Came over from v1 having never been approved there."""
+    notes = v1_notes(record)
+    if not notes:
+        return False
+    return not notes.get("was_customer")
+
+
+def format_v1_lines(record: dict[str, Any]) -> list[str]:
+    notes = v1_notes(record)
+    if not notes:
+        return []
+    lines = ["", "From the old bot:"]
+    lines.append(f"  Their status there: {clean_text(notes.get('status'), empty='Unknown')}")
+    lines.append(f"  OnlyFans: {clean_text(notes.get('of_username'))}")
+    lines.append(f"  Budget: {clean_text(notes.get('budget_label'), empty='Never answered')}")
+    priority = str(notes.get("review_priority") or "").strip()
+    if priority:
+        lines.append(f"  Priority: {priority}")
+    lines.append(f"  Wanted: {clean_text(notes.get('purchase_intent'), empty='Never answered')}")
+    payment = str(notes.get("payment_status") or "").strip()
+    if payment and payment != "not_requested":
+        lines.append(f"  Payment: {payment}")
+    subscription = str(notes.get("subscription_status") or "").strip()
+    if subscription and subscription != "unknown":
+        lines.append(f"  Subscription: {subscription}")
+    if notes.get("queued_at"):
+        lines.append(f"  First asked: {format_date(notes.get('queued_at'))}")
+    if notes.get("approved_at"):
+        lines.append(f"  Approved there: {format_date(notes.get('approved_at'))}")
+    return lines
+
+
+def format_lead_line(user_id: int, record: dict[str, Any]) -> str:
+    notes = v1_notes(record)
+    username = str(record.get("telegram_username") or "").strip()
+    parts = [
+        str(user_id),
+        person_label(record),
+        f"@{username}" if username else "no handle",
+        clean_text(notes.get("budget_label"), empty="no budget"),
+        truncate_text(clean_text(notes.get("purchase_intent"), empty="no request"), 60),
+    ]
+    return " | ".join(parts)
+
+
 def format_customer_details(user_id: int, record: dict[str, Any]) -> str:
     username = record.get("telegram_username")
-    return "\n".join(
-        [
-            person_label(record),
-            f"ID: {user_id}",
-            f"Telegram: @{username}" if username else "Telegram: Not set",
-            f"Fansly: {clean_text(record.get('fansly_handle'))}",
-            f"Code: {clean_text(record.get('code'))}",
-            status_line(record),
-            f"First granted: {format_date(record.get('granted_at'))}",
-            f"Last extended: {format_date(record.get('last_extended_at'), empty='Never')}",
-        ]
-    )
+    lines = [
+        person_label(record),
+        f"ID: {user_id}",
+        f"Telegram: @{username}" if username else "Telegram: Not set",
+        f"Fansly: {clean_text(record.get('fansly_handle'))}",
+        f"Code: {clean_text(record.get('code'))}",
+        status_line(record),
+        f"First granted: {format_date(record.get('granted_at'))}",
+        f"Last extended: {format_date(record.get('last_extended_at'), empty='Never')}",
+    ]
+    lines.extend(format_v1_lines(record))
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -1333,8 +1414,40 @@ async def customers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     items.sort(key=lambda item: item[1].get("expires_at") or "")
-    lines = [format_customer_line(user_id, record) for user_id, record in items[:50]]
-    await update.message.reply_text("\n".join(lines))
+    lines = [f"Customers: {len(items)}", ""]
+    lines.extend(format_customer_line(user_id, record) for user_id, record in items)
+    lines.extend(["", "Full detail on one of them: /who <id>"])
+    await reply_in_chunks(update.message, lines)
+
+
+async def leads(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Everyone imported from v1 who never became a customer there."""
+    state = load_state()
+    if not is_admin_chat(state, update) or update.message is None:
+        return
+
+    items = [
+        (int(user_id_text), record)
+        for user_id_text, record in state.get("users", {}).items()
+        if is_v1_lead(record)
+    ]
+    if not items:
+        await update.message.reply_text(
+            "No leads stored.\n\n"
+            "Leads only arrive if you tapped Import everyone when sending the old "
+            "bot's state file. Send that file again and tap Import everyone to add them."
+        )
+        return
+
+    items.sort(key=lambda item: str(v1_notes(item[1]).get("queued_at") or ""))
+    lines = [
+        f"Leads from the old bot: {len(items)}",
+        "id | name | handle | budget | wanted",
+        "",
+    ]
+    lines.extend(format_lead_line(user_id, record) for user_id, record in items)
+    lines.extend(["", "Full detail on one of them: /who <id>"])
+    await reply_in_chunks(update.message, lines)
 
 
 async def who(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1492,15 +1605,20 @@ async def run_v1_import(
 
     users = state.setdefault("users", {})
     plan = v1_migration.plan_migration(source, users, include_leads=include_leads)
-    written = v1_migration.apply_migration(users, plan)
+    result = v1_migration.apply_migration(users, plan)
 
     state["pending_v1_import"] = None
     save_state(state)
     import_path.unlink(missing_ok=True)
 
-    LOGGER.info("Imported %s v1 customers (include_leads=%s).", written, include_leads)
-    await query.answer(f"Imported {written}.")
-    await query.edit_message_text(format_v1_import_result(written, plan))
+    LOGGER.info(
+        "v1 import: added %s, refreshed %s (include_leads=%s).",
+        result["added"],
+        result["refreshed"],
+        include_leads,
+    )
+    await query.answer(f"Added {result['added']}, refreshed {result['refreshed']}.")
+    await query.edit_message_text(format_v1_import_result(result, plan))
 
 
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1745,6 +1863,7 @@ def main() -> None:
     app.add_handler(CommandHandler("newcode", newcode))
     app.add_handler(CommandHandler("codes", codes))
     app.add_handler(CommandHandler("customers", customers))
+    app.add_handler(CommandHandler("leads", leads))
     app.add_handler(CommandHandler("who", who))
     app.add_handler(CommandHandler("extend", extend))
     app.add_handler(CommandHandler("revoke", revoke))

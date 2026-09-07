@@ -55,6 +55,7 @@ All admin commands only work in the registered admin chat.
 | `/who <user_id>` | One customer's full details |
 | `/extend <user_id> [days]` | Add time, reopening a paused topic |
 | `/revoke <user_id>` | Cut access now |
+| `/leads` | Imported people who never bought, with budget and request |
 | `/expiring` | Who lapses soon, with Extend/Cut buttons |
 | `/broadcast <audience> <message>` | Message every customer in an audience |
 
@@ -91,6 +92,17 @@ Both bots key customers by Telegram user id, so a migrated buyer needs no
 access code: `/start` and any message they send relay straight through, and
 their forum topic is created the first time they write. Records already in this
 bot are left alone.
+
+Each imported record keeps the notes the old bot collected — the status it
+had there, OnlyFans handle, budget range, what they asked for, payment and
+subscription state, and when they first wrote in. `/who <id>` prints them under
+"From the old bot", and `/leads` lists everyone who never became a customer,
+with their budget and request on one line each.
+
+Re-sending the same file later is safe: records already here keep their access,
+status and topic exactly as they are, and only their old-bot notes are
+refreshed. That is also how you fill in notes on customers you imported before
+this feature existed — send the file again and tap either import button.
 
 Telegram caps bot file downloads at 20 MB. Past that, or if you would rather
 run it next to the file, `migrate_v1_state.py` does the same job from a shell:
