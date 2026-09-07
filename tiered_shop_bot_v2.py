@@ -19,6 +19,7 @@ from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import Forbidden, RetryAfter
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -150,6 +151,19 @@ class Settings:
     paypal_webhook_port: int
 
 
+BROADCAST_AUDIENCES = {
+    "buyers": "everyone who ever paid for something",
+    "approved": "approved buyers, paid or not",
+    "tier": "everyone above the starting tier",
+    "all": "everyone who ever opened the bot",
+}
+
+BROADCAST_SEND_DELAY_SECONDS = 0.05
+BROADCAST_MAX_MESSAGE_LENGTH = 3500
+BROADCAST_PREVIEW_RECIPIENTS = 10
+BROADCAST_PAID_STATUSES = {"paid", "pending_manual", "fulfilled"}
+
+
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -252,6 +266,7 @@ def load_state(settings: Settings) -> dict[str, Any]:
             "vault_lines": {},
             "pending_admin_actions": {},
             "paypal_orders": {},
+            "broadcast_drafts": {},
         }
     try:
         state = json.loads(settings.state_path.read_text(encoding="utf-8"))
@@ -264,6 +279,7 @@ def load_state(settings: Settings) -> dict[str, Any]:
             "vault_lines": {},
             "pending_admin_actions": {},
             "paypal_orders": {},
+            "broadcast_drafts": {},
         }
     state.setdefault("users", {})
     state.setdefault("test_sessions", {})
@@ -271,6 +287,7 @@ def load_state(settings: Settings) -> dict[str, Any]:
     state.setdefault("vault_lines", {})
     state.setdefault("pending_admin_actions", {})
     state.setdefault("paypal_orders", {})
+    state.setdefault("broadcast_drafts", {})
     return state
 
 
@@ -678,6 +695,166 @@ def clear_pending_admin_action(state: dict[str, Any], admin_user_id: int) -> Non
     state.setdefault("pending_admin_actions", {}).pop(str(admin_user_id), None)
 
 
+def get_broadcast_drafts(state: dict[str, Any]) -> dict[str, Any]:
+    return state.setdefault("broadcast_drafts", {})
+
+
+def has_paid_purchase(record: dict[str, Any]) -> bool:
+    for purchase in record.get("purchases", []) or []:
+        if str(purchase.get("status") or "") in BROADCAST_PAID_STATUSES:
+            return True
+    return False
+
+
+def broadcast_audience_matches(audience: str, record: dict[str, Any]) -> bool:
+    if str(record.get("review_status") or "") == "rejected":
+        return False
+    if audience == "all":
+        return True
+    if audience == "approved":
+        return str(record.get("review_status") or "") == "approved"
+    if audience == "tier":
+        return tier_rank(record.get("tier")) > tier_rank(TIER_VERIFIED)
+    if audience == "buyers":
+        return has_paid_purchase(record)
+    return False
+
+
+def get_broadcast_recipients(state: dict[str, Any], audience: str) -> list[dict[str, Any]]:
+    recipients: list[dict[str, Any]] = []
+    for record in state.get("users", {}).values():
+        if record.get("test_mode"):
+            continue
+        if not broadcast_audience_matches(audience, record):
+            continue
+        recipients.append(record)
+    recipients.sort(key=lambda item: str(item.get("created_at") or ""))
+    return recipients
+
+
+def broadcast_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("\u2705 send broadcast", callback_data="bcast:send"),
+                InlineKeyboardButton("\u274c cancel", callback_data="bcast:cancel"),
+            ]
+        ]
+    )
+
+
+def broadcast_usage_text(state: dict[str, Any]) -> str:
+    lines = [
+        "broadcast",
+        "",
+        "sends one message to every buyer in an audience, in their private chat with the bot.",
+        "",
+        "usage:",
+        "/broadcast <audience> <message>",
+        "",
+        "audiences:",
+    ]
+    for key, description in BROADCAST_AUDIENCES.items():
+        lines.append(f"{key} - {description} ({len(get_broadcast_recipients(state, key))})")
+    lines.extend(
+        [
+            "",
+            "example:",
+            "/broadcast buyers new drop is up. open /start to see it.",
+            "",
+            "you get a preview and a confirm button before anything is sent.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def broadcast_preview_text(audience: str, message: str, recipients: list[dict[str, Any]]) -> str:
+    lines = [
+        "broadcast preview",
+        "",
+        f"audience: {audience} - {BROADCAST_AUDIENCES.get(audience, 'unknown')}",
+        f"recipients: {len(recipients)}",
+        "",
+        "message buyers will see:",
+        "",
+        message,
+        "",
+        "going to:",
+    ]
+    for record in recipients[:BROADCAST_PREVIEW_RECIPIENTS]:
+        lines.append(f"{record.get('user_id')} | {record.get('display_name') or 'Unknown'}")
+    remaining = len(recipients) - BROADCAST_PREVIEW_RECIPIENTS
+    if remaining > 0:
+        lines.append(f"...and {remaining} more.")
+    lines.extend(["", "nothing is sent until you tap send broadcast."])
+    return "\n".join(lines)
+
+
+def broadcast_summary_text(summary: dict[str, Any]) -> str:
+    return (
+        "broadcast finished\n\n"
+        f"audience: {summary['audience']}\n"
+        f"matched: {summary['recipients']}\n"
+        f"sent: {summary['sent']}\n"
+        f"blocked the bot: {summary['blocked']}\n"
+        f"failed: {summary['failed']}"
+    )
+
+
+async def send_broadcast(
+    bot: Any,
+    state: dict[str, Any],
+    audience: str,
+    message: str,
+) -> dict[str, Any]:
+    recipients = get_broadcast_recipients(state, audience)
+    sent = 0
+    blocked = 0
+    failed = 0
+    stamp = to_iso(utc_now())
+
+    for record in recipients:
+        chat_id = int(record.get("buyer_chat_id") or record.get("user_id") or 0)
+        if not chat_id:
+            failed += 1
+            continue
+        try:
+            await bot.send_message(chat_id=chat_id, text=message)
+        except RetryAfter as exc:
+            await asyncio.sleep(float(getattr(exc, "retry_after", 5)) + 1)
+            try:
+                await bot.send_message(chat_id=chat_id, text=message)
+            except Forbidden:
+                record["broadcast_blocked_at"] = stamp
+                blocked += 1
+                continue
+            except Exception:
+                LOGGER.exception("Broadcast retry failed for %s.", chat_id)
+                failed += 1
+                continue
+        except Forbidden:
+            record["broadcast_blocked_at"] = stamp
+            blocked += 1
+            continue
+        except Exception:
+            LOGGER.exception("Broadcast failed for %s.", chat_id)
+            failed += 1
+            continue
+
+        record["last_broadcast_at"] = stamp
+        record["broadcast_blocked_at"] = None
+        sent += 1
+        await asyncio.sleep(BROADCAST_SEND_DELAY_SECONDS)
+
+    return {
+        "audience": audience,
+        "recipients": len(recipients),
+        "sent": sent,
+        "blocked": blocked,
+        "failed": failed,
+    }
+
+
 def budget_keyboard() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(option["label"], callback_data=f"budget:{option['key']}")]
@@ -1012,6 +1189,7 @@ def admin_help_text() -> str:
         "/setvault - run in the vault chat to register that chat\n"
         "/addcontent <line_key> [title] - reply to a vault post to add it\n"
         "/catalog - show stored vault line counts\n"
+        "/broadcast <audience> <message> - message every buyer in an audience\n"
         "/help - show this help, or buyer help while test mode is active\n\n"
         "buyer support:\n"
         "/reportissue - buyer-side debug report flow while test mode is active\n\n"
@@ -2140,6 +2318,55 @@ async def addcontent_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(f"added to {line_key}. total items: {len(line)}")
 
 
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    state = load_state(settings)
+    if update.message is None or update.effective_chat is None or update.effective_user is None:
+        return
+    if update.effective_chat.type != "private":
+        return
+    if not is_admin_user_id(update.effective_user.id, settings):
+        return
+
+    command_parts = (update.message.text or "").split(None, 1)
+    remainder = command_parts[1] if len(command_parts) > 1 else ""
+    audience_parts = remainder.split(None, 1)
+    audience = audience_parts[0].strip().lower() if audience_parts else ""
+    message = audience_parts[1].strip() if len(audience_parts) > 1 else ""
+
+    if audience not in BROADCAST_AUDIENCES:
+        await update.message.reply_text(broadcast_usage_text(state))
+        return
+
+    if not message:
+        await update.message.reply_text(
+            f"add the message after the audience.\n\n/broadcast {audience} new drop is up."
+        )
+        return
+
+    if len(message) > BROADCAST_MAX_MESSAGE_LENGTH:
+        await update.message.reply_text(
+            f"that message is {len(message)} characters. keep it under {BROADCAST_MAX_MESSAGE_LENGTH}."
+        )
+        return
+
+    recipients = get_broadcast_recipients(state, audience)
+    if not recipients:
+        await update.message.reply_text(f"nobody matches the {audience} audience right now.")
+        return
+
+    get_broadcast_drafts(state)[str(update.effective_user.id)] = {
+        "audience": audience,
+        "message": message,
+        "created_at": to_iso(utc_now()),
+    }
+    save_state(settings, state)
+    await update.message.reply_text(
+        broadcast_preview_text(audience, message, recipients),
+        reply_markup=broadcast_confirm_keyboard(),
+    )
+
+
 async def catalog_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings: Settings = context.application.bot_data["settings"]
     state = load_state(settings)
@@ -2499,6 +2726,48 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
+    if data.startswith("bcast:"):
+        if not is_admin_user_id(query.from_user.id, settings):
+            await query.answer("admin only", show_alert=True)
+            return
+
+        drafts = get_broadcast_drafts(state)
+        draft_key = str(query.from_user.id)
+        bcast_action = data.partition(":")[2]
+
+        if bcast_action == "cancel":
+            drafts.pop(draft_key, None)
+            save_state(settings, state)
+            await query.answer("cancelled")
+            await query.edit_message_text("broadcast cancelled. nothing was sent.")
+            return
+
+        if bcast_action != "send":
+            await query.answer("that broadcast button is outdated.", show_alert=True)
+            return
+
+        draft = drafts.pop(draft_key, None)
+        if draft is None:
+            await query.answer("that broadcast draft is gone. run /broadcast again.", show_alert=True)
+            return
+
+        save_state(settings, state)
+        await query.answer("sending")
+        await query.edit_message_text("sending broadcast...")
+
+        summary = await send_broadcast(
+            context.bot,
+            state,
+            str(draft.get("audience") or ""),
+            str(draft.get("message") or ""),
+        )
+        save_state(settings, state)
+        await context.bot.send_message(
+            chat_id=query.message.chat.id if query.message is not None else query.from_user.id,
+            text=broadcast_summary_text(summary),
+        )
+        return
+
     if data.startswith("adm:"):
         if not is_admin_user_id(query.from_user.id, settings):
             await query.answer("admin only", show_alert=True)
@@ -2824,6 +3093,7 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CommandHandler("setvault", setvault_command))
     application.add_handler(CommandHandler("addcontent", addcontent_command))
     application.add_handler(CommandHandler("catalog", catalog_command))
+    application.add_handler(CommandHandler("broadcast", broadcast_command))
     application.add_handler(CallbackQueryHandler(button_click))
     application.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, text_message))
     application.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.TEXT & ~filters.COMMAND, private_non_text_message))

@@ -82,6 +82,18 @@ Before editing anything:
 
 Build a clean `v2` around the tiered buyer journey, while keeping test mode foolproof and admin-only during development.
 
+## Broadcast
+
+`/broadcast <audience> <message>` sends one message to every buyer in an audience, in their private chat with the bot. Admin only, private chat only.
+
+Audiences: `buyers` (ever paid), `approved`, `tier` (above the starting tier), `all`. Send `/broadcast` on its own to see the live headcount for each.
+
+The command replies with a preview showing the audience, the recipient count, the exact message text, and the first ten recipients. Nothing goes out until you tap `send broadcast`. The draft is stored in state, so a restart mid-decision leaves it recoverable, and a double tap sends once.
+
+Sending is paced at about twenty messages per second to stay under Telegram's rate limit, with one retry when Telegram asks for a delay. Buyers who blocked the bot are counted separately and stamped with `broadcast_blocked_at`. Delivered buyers get `last_broadcast_at`.
+
+A bot can only message someone who already pressed Start on it, so a broadcast reaches people who opened this bot. It cannot reach anyone who never did.
+
 ## Current Shared UX Commands
 
 These exist in both active v1 and active v2 as of 2026-04-25:
