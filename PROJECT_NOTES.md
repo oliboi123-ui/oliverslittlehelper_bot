@@ -97,6 +97,20 @@ git push origin main
 
 Railway deploys from GitHub `main`, so a pushed commit can trigger a production redeploy.
 
+## Getting The State File Off Railway
+
+`export_state.py` sends `bot_state.json` to you as a Telegram document. Use it when the Railway dashboard shows no file browser for the volume, or when the service is crash-looping and a shell will not stay open.
+
+On the service that holds the volume:
+
+1. Variables: add `EXPORT_BOT_TOKEN` set to a token that still works. Add `EXPORT_CHAT_ID` set to your Telegram user id only if the state file has no `admin_chat_id` stored.
+2. Settings: change the start command to `python export_state.py`.
+3. Redeploy and watch the logs.
+
+It sends the file once, then holds the process open so Railway does not restart it and resend. Change the start command back afterwards.
+
+The logs say plainly what happened, including the case where no state file exists, which means nothing was ever written to a volume and there is nothing to recover.
+
 ## Listing Stored Buyers
 
 `bot_state.json` is gitignored and never leaves the machine that runs the bot, so the buyer list only exists where the bot runs.

@@ -11,5 +11,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY gatekeeper_bot.py ./
 COPY sync_onlyfans.py ./
 COPY weekly_low_priority_review.py ./
+COPY export_state.py ./
+COPY list_users.py ./
 
 CMD ["python", "-u", "gatekeeper_bot.py"]
