@@ -106,6 +106,11 @@ subscription state, and when they first wrote in. `/who <id>` prints them under
 "From the old bot", and `/leads` lists everyone who never became a customer,
 with their budget and request on one line each.
 
+**Import everyone** widens the import to leads only. Banned, trashed, rejected
+and sandbox records are excluded under every button, and they are not given
+old-bot notes even if a record with that id already exists here. Run
+`python test_v1_migration.py` to check that still holds.
+
 Re-sending the same file later is safe: records already here keep their access,
 status and topic exactly as they are, and only their old-bot notes are
 refreshed. That is also how you fill in notes on customers you imported before
@@ -131,7 +136,7 @@ How v1 statuses land here:
 | `approved` but lapsed, `expired`, `revoked` | `paused` |
 | Unknown status | `paused` (fails closed) |
 | `pending`, `low_priority`, other pre-approval states | Skipped, or `paused` with `--include-leads` |
-| `banned`, `trash`, `rejected`, test-mode sandbox | Dropped |
+| `banned`, `trash`, `rejected`, test-mode sandbox | Never imported, under either button |
 
 v1 collected an OnlyFans username and this bot's field is named
 `fansly_handle`. The handle is carried across as written, since the field only

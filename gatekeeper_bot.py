@@ -495,7 +495,7 @@ def format_v1_import_preview(plan: dict[str, Any], include_leads: bool) -> str:
         f"  Approved and still in date: {counts['active']}",
         f"  Lapsed, expired, or revoked: {counts['paused']}",
         f"  Never approved (leads): {counts['lead']}",
-        f"  Banned, trashed, rejected, sandbox: {counts['drop']}",
+        f"  Banned, trashed, rejected, sandbox: {counts['drop']} (never imported)",
     ]
     if plan["skipped_existing"]:
         lines.append(
