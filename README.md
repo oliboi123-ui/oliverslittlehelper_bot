@@ -79,6 +79,49 @@ A bot can only message someone who already started it, so a broadcast reaches
 the people who redeemed an access link. It cannot reach anyone who never
 opened the bot.
 
+## Bringing v1 customers over
+
+`migrate_v1_state.py` translates the old gatekeeper bot's records into this
+bot's shape and merges them into `bot_state.json`. Both bots key customers by
+Telegram user id, so a migrated buyer needs no access code: `/start` and any
+message they send relay straight through, and their forum topic is created the
+first time they write.
+
+```bash
+python migrate_v1_state.py path/to/v1_bot_state.json                 # preview
+python migrate_v1_state.py path/to/v1_bot_state.json --apply         # write
+```
+
+It previews by default and prints every record it would touch. `--apply`
+backs up the target state file first. Records already in this bot are left
+alone unless you pass `--overwrite`.
+
+How v1 statuses land here:
+
+| v1 record | Here |
+| --- | --- |
+| `approved`, still in date | `active`, keeping its expiry |
+| `approved` but lapsed, `expired`, `revoked` | `paused` |
+| Unknown status | `paused` (fails closed) |
+| `pending`, `low_priority`, other pre-approval states | Skipped, or `paused` with `--include-leads` |
+| `banned`, `trash`, `rejected`, test-mode sandbox | Dropped |
+
+v1 collected an OnlyFans username and this bot's field is named
+`fansly_handle`. The handle is carried across as written, since the field only
+drives topic names and display.
+
+Migrated leads have no `granted_at`, so `/broadcast customers` skips them. Use
+`/broadcast all` to include them.
+
+### The part records cannot carry
+
+Telegram lets a bot send a private message only to someone who pressed Start
+on **that bot**, and that consent belongs to the bot token. Running this bot on
+the old bot's token reaches every migrated customer immediately. Running it on
+a new token gives you their full history and no way to open a conversation
+until each of them starts the new bot. Migrating records does not move the
+permission.
+
 ## Setup
 
 ### 1. The bot
