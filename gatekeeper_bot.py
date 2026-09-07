@@ -22,6 +22,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import Forbidden, RetryAfter
+
+import v1_migration
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -69,6 +71,10 @@ BROADCAST_AUDIENCES = {
 BROADCAST_SEND_DELAY_SECONDS = 0.05
 BROADCAST_MAX_MESSAGE_LENGTH = 3500
 BROADCAST_PREVIEW_RECIPIENTS = 10
+
+V1_IMPORT_MAX_BYTES = 20 * 1024 * 1024
+V1_IMPORT_PREVIEW_ROWS = 15
+V1_IMPORT_FILENAME = "v1_import_pending.json"
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +197,7 @@ def empty_state() -> dict[str, Any]:
         "topics": {},
         "delete_permission_warned": False,
         "broadcast_drafts": {},
+        "pending_v1_import": None,
     }
 
 
@@ -462,6 +469,76 @@ def get_paused(state: dict[str, Any]) -> list[tuple[int, dict[str, Any]]]:
 # ---------------------------------------------------------------------------
 # Forum topics
 # ---------------------------------------------------------------------------
+
+
+def get_v1_import_path() -> Path:
+    return get_data_dir() / V1_IMPORT_FILENAME
+
+
+def build_v1_import_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("\u2705 Import customers", callback_data="v1imp:customers")],
+            [InlineKeyboardButton("\U0001f465 Import everyone, leads included", callback_data="v1imp:everyone")],
+            [InlineKeyboardButton("\u274c Cancel", callback_data="v1imp:cancel")],
+        ]
+    )
+
+
+def format_v1_import_preview(plan: dict[str, Any], include_leads: bool) -> str:
+    counts = plan["counts"]
+    lines = [
+        "v1 state file read",
+        "",
+        f"Records in the file: {plan['source_total']}",
+        f"  Approved and still in date: {counts['active']}",
+        f"  Lapsed, expired, or revoked: {counts['paused']}",
+        f"  Never approved (leads): {counts['lead']}",
+        f"  Banned, trashed, rejected, sandbox: {counts['drop']}",
+    ]
+    if plan["skipped_existing"]:
+        lines.append(f"  Already here, left alone: {plan['skipped_existing']}")
+    lines.extend(
+        [
+            "",
+            f"Would import now: {len(plan['planned'])}"
+            + (" (leads included)" if include_leads else ""),
+            "",
+        ]
+    )
+    for user_id_text, verdict, record in plan["planned"][:V1_IMPORT_PREVIEW_ROWS]:
+        target_status = "active" if verdict == "active" else "paused"
+        handle = str(record.get("of_username") or "").strip() or "(no handle)"
+        lines.append(f"{user_id_text} | {v1_migration.label(record)} | {handle} | -> {target_status}")
+    remaining = len(plan["planned"]) - V1_IMPORT_PREVIEW_ROWS
+    if remaining > 0:
+        lines.append(f"...and {remaining} more.")
+    lines.extend(
+        [
+            "",
+            "Nothing is written until you tap a button.",
+            "Customers land without an access code and can message you straight away.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def format_v1_import_result(written: int, plan: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            "v1 import finished",
+            "",
+            f"Customers added: {written}",
+            f"Left alone because they were already here: {plan['skipped_existing']}",
+            "",
+            "Check them with /customers.",
+            "Reach them with /broadcast customers <message>.",
+            "",
+            "A customer only receives that message if they pressed Start on this",
+            "same bot before. Reissuing a token keeps the same bot; a bot made",
+            "with /newbot is a different one and reaches nobody until they start it.",
+        ]
+    )
 
 
 def get_broadcast_drafts(state: dict[str, Any]) -> dict[str, Any]:
@@ -818,6 +895,7 @@ ADMIN_HELP = "\n".join(
         "/revoke <user_id> - cut access now",
         "/expiring - who lapses soon, with buttons",
         "/broadcast <audience> <message> - message every customer in an audience",
+        "Send the old bot's bot_state.json here as a file to import its customers",
     ]
 )
 
@@ -1325,6 +1403,106 @@ async def revoke(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(f"{person_label(record)} revoked.")
 
 
+async def v1_state_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin drops the old bot's bot_state.json into the chat to import it."""
+    state = load_state()
+    if not is_admin_chat(state, update) or update.message is None or update.effective_user is None:
+        return
+
+    document = update.message.document
+    if document is None:
+        return
+
+    file_size = int(document.file_size or 0)
+    if file_size > V1_IMPORT_MAX_BYTES:
+        await update.message.reply_text(
+            f"That file is {file_size} bytes. Telegram caps bot downloads at "
+            f"{V1_IMPORT_MAX_BYTES} bytes, so send it to a machine and run "
+            "migrate_v1_state.py there instead."
+        )
+        return
+
+    try:
+        telegram_file = await context.bot.get_file(document.file_id)
+        raw = bytes(await telegram_file.download_as_bytearray())
+    except Exception:
+        LOGGER.exception("Could not download the uploaded v1 state file.")
+        await update.message.reply_text("I could not download that file. Try sending it again.")
+        return
+
+    try:
+        source = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        await update.message.reply_text(
+            "That file is not readable JSON. Send the old bot's bot_state.json as a file."
+        )
+        return
+
+    if not v1_migration.looks_like_v1_state(source):
+        await update.message.reply_text(
+            "That JSON has no users object, so it is not a v1 bot_state.json."
+        )
+        return
+
+    plan = v1_migration.plan_migration(source, state.get("users", {}))
+    if not plan["planned"] and plan["counts"]["lead"] == 0:
+        await update.message.reply_text(
+            f"Nothing to import from that file.\n\n{format_v1_import_preview(plan, False)}"
+        )
+        return
+
+    import_path = get_v1_import_path()
+    import_path.parent.mkdir(parents=True, exist_ok=True)
+    import_path.write_text(json.dumps(source, ensure_ascii=False), encoding="utf-8")
+
+    state["pending_v1_import"] = {
+        "admin_user_id": update.effective_user.id,
+        "file_name": document.file_name or "bot_state.json",
+        "uploaded_at": to_iso(utc_now()),
+    }
+    save_state(state)
+
+    await update.message.reply_text(
+        format_v1_import_preview(plan, False),
+        reply_markup=build_v1_import_keyboard(),
+    )
+
+
+async def run_v1_import(
+    query: Any,
+    context: ContextTypes.DEFAULT_TYPE,
+    state: dict[str, Any],
+    *,
+    include_leads: bool,
+) -> None:
+    pending = state.get("pending_v1_import")
+    import_path = get_v1_import_path()
+    if not pending or not import_path.exists():
+        await query.answer("That upload is gone. Send the file again.", show_alert=True)
+        return
+
+    try:
+        source = json.loads(import_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        LOGGER.exception("Stored v1 import file could not be read.")
+        state["pending_v1_import"] = None
+        save_state(state)
+        await query.answer("The stored upload is unreadable. Send it again.", show_alert=True)
+        return
+
+    users = state.setdefault("users", {})
+    plan = v1_migration.plan_migration(source, users, include_leads=include_leads)
+    written = v1_migration.apply_migration(users, plan)
+
+    state["pending_v1_import"] = None
+    save_state(state)
+    import_path.unlink(missing_ok=True)
+
+    LOGGER.info("Imported %s v1 customers (include_leads=%s).", written, include_leads)
+    await query.answer(f"Imported {written}.")
+    await query.edit_message_text(format_v1_import_result(written, plan))
+
+
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = load_state()
     if not is_admin_chat(state, update) or update.message is None or update.effective_user is None:
@@ -1413,6 +1591,24 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     data = query.data or ""
+
+    if data.startswith("v1imp:"):
+        import_action = data.partition(":")[2]
+
+        if import_action == "cancel":
+            state["pending_v1_import"] = None
+            save_state(state)
+            get_v1_import_path().unlink(missing_ok=True)
+            await query.edit_message_text("Import cancelled. Nothing was written.")
+            await query.answer("Cancelled.")
+            return
+
+        if import_action not in {"customers", "everyone"}:
+            await query.answer("Unknown import action.", show_alert=True)
+            return
+
+        await run_v1_import(query, context, state, include_leads=import_action == "everyone")
+        return
 
     if data.startswith("bcast:"):
         drafts = get_broadcast_drafts(state)
@@ -1558,6 +1754,9 @@ def main() -> None:
     app.add_handler(
         MessageHandler(filters.ChatType.SUPERGROUP & ~filters.COMMAND, relay_group_message),
         group=-1,
+    )
+    app.add_handler(
+        MessageHandler(filters.ChatType.PRIVATE & filters.Document.ALL, v1_state_upload)
     )
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, customer_message))
 

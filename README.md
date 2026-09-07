@@ -81,11 +81,19 @@ opened the bot.
 
 ## Bringing v1 customers over
 
-`migrate_v1_state.py` translates the old gatekeeper bot's records into this
-bot's shape and merges them into `bot_state.json`. Both bots key customers by
-Telegram user id, so a migrated buyer needs no access code: `/start` and any
-message they send relay straight through, and their forum topic is created the
-first time they write.
+Send the old bot's `bot_state.json` to this bot as a file attachment, in the
+admin chat. The bot reads it, replies with what it found — how many are still
+in date, how many lapsed, how many were never customers — and waits. Nothing is
+written until you tap **Import customers** (or **Import everyone** to include
+people who never got approved). **Cancel** discards the upload.
+
+Both bots key customers by Telegram user id, so a migrated buyer needs no
+access code: `/start` and any message they send relay straight through, and
+their forum topic is created the first time they write. Records already in this
+bot are left alone.
+
+Telegram caps bot file downloads at 20 MB. Past that, or if you would rather
+run it next to the file, `migrate_v1_state.py` does the same job from a shell:
 
 ```bash
 python migrate_v1_state.py path/to/v1_bot_state.json                 # preview
@@ -93,8 +101,8 @@ python migrate_v1_state.py path/to/v1_bot_state.json --apply         # write
 ```
 
 It previews by default and prints every record it would touch. `--apply`
-backs up the target state file first. Records already in this bot are left
-alone unless you pass `--overwrite`.
+backs up the target state file first, and `--overwrite` replaces records that
+already exist here.
 
 How v1 statuses land here:
 
