@@ -56,9 +56,28 @@ All admin commands only work in the registered admin chat.
 | `/extend <user_id> [days]` | Add time, reopening a paused topic |
 | `/revoke <user_id>` | Cut access now |
 | `/expiring` | Who lapses soon, with Extend/Cut buttons |
+| `/broadcast <audience> <message>` | Message every customer in an audience |
 
 Inside a customer's forum topic, a message starting with `//` stays in the
 topic and is not sent to the customer.
+
+### Broadcast
+
+`/broadcast` sends one message to every customer in an audience, in their
+private chat with the bot. Audiences are `customers` (everyone ever granted
+access), `active`, `paused`, `revoked`, and `all`. Send `/broadcast` on its
+own to see the live headcount for each.
+
+The command replies with a preview showing the audience, the recipient count,
+the exact message text, and the first ten recipients. Nothing goes out until
+you tap Send broadcast. Sending is paced at about twenty messages a second to
+stay under Telegram's rate limit, and it retries once when Telegram asks for a
+delay. Customers who blocked the bot are counted separately and stamped with
+`broadcast_blocked_at`; everyone who received it gets `last_broadcast_at`.
+
+A bot can only message someone who already started it, so a broadcast reaches
+the people who redeemed an access link. It cannot reach anyone who never
+opened the bot.
 
 ## Setup
 
