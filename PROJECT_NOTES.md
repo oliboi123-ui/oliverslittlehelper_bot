@@ -23,6 +23,7 @@ Main behavior:
 - `gatekeeper_bot.py`: main Telegram bot.
 - `sync_onlyfans.py`: Railway cron entrypoint for syncing active subscribers.
 - `weekly_low_priority_review.py`: Railway cron entrypoint for weekly low-priority review reminders.
+- `list_users.py`: prints the buyers stored in `bot_state.json`.
 - `.env.example`: safe template showing required environment variables.
 - `README_sv.md`: Swedish deployment notes.
 - `PRIVACY_POLICY.md`: privacy policy text used for OFAuth setup.
@@ -96,6 +97,21 @@ git push origin main
 
 Railway deploys from GitHub `main`, so a pushed commit can trigger a production redeploy.
 
+## Listing Stored Buyers
+
+`bot_state.json` is gitignored and never leaves the machine that runs the bot, so the buyer list only exists where the bot runs.
+
+```powershell
+& ".\.venv\Scripts\python.exe" list_users.py buyers
+& ".\.venv\Scripts\python.exe" list_users.py all --csv buyers.csv
+```
+
+On Railway, run it in a shell on the service that mounts the volume:
+
+```text
+python list_users.py buyers
+```
+
 ## Local Test Commands
 
 From the cloned project folder, create a virtual environment if needed:
@@ -144,6 +160,39 @@ Use a Railway Volume mounted at `/app/data` if you want `bot_state.json` to surv
 - `/syncsubs`
 - `/verifyof <onlyfans_username>`
 - `/ofdiag`
+- `/broadcast <audience> <message>`
+
+## Broadcast
+
+`/broadcast` sends one message to every buyer in an audience, in their private chat with the bot.
+
+Audiences:
+
+- `buyers`: everyone who was ever approved.
+- `approved`: approved with access still active.
+- `expired`: access has expired.
+- `paid`: confirmed at least one payment.
+- `all`: everyone who ever used the bot.
+
+Usage:
+
+```text
+/broadcast buyers The new group is open. Reply here and I will send you the invite link.
+```
+
+The command replies with a preview showing the audience, the recipient count, the exact message text, and the first ten recipients. Nothing is sent until you tap `Send broadcast`.
+
+Sending is paced at about twenty messages per second to stay under Telegram's rate limit, and it retries once when Telegram asks for a delay. Users who blocked the bot are counted separately and stamped with `broadcast_blocked_at`. Delivered users get a `last_broadcast_at` stamp.
+
+Banned users, trashed users, and test-mode sandbox records are always skipped.
+
+### Reaching People The Bot Cannot DM
+
+A Telegram bot can only DM someone who already pressed Start on it. The Bot API also has no method that lists a group's members, so admin rights in a supergroup give you the admin list, the member count, and single-member lookups by numeric user ID.
+
+To reach people who never opened the bot, post in the group the bot is already in and ask them to DM the bot. Once they do, `/broadcast` can reach them from then on.
+
+Never point `RELAY_ADMIN_GROUP_ID` at a buyer group. That variable is the admin console, and buyer group members would see the approval cards and relay topics.
 
 ## Relay Mode
 

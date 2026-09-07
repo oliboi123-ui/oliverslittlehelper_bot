@@ -22,6 +22,7 @@ from urllib import request as urllib_request
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import Forbidden, RetryAfter
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -499,6 +500,7 @@ def load_state() -> dict[str, Any]:
             "ppv_items": {},
             "paypal_orders": {},
             "test_sessions": {},
+            "broadcast_drafts": {},
         }
     try:
         state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -513,6 +515,7 @@ def load_state() -> dict[str, Any]:
             "ppv_items": {},
             "paypal_orders": {},
             "test_sessions": {},
+            "broadcast_drafts": {},
         }
     state.setdefault("admin_chat_id", None)
     state.setdefault("users", {})
@@ -522,6 +525,7 @@ def load_state() -> dict[str, Any]:
     state.setdefault("ppv_items", {})
     state.setdefault("paypal_orders", {})
     state.setdefault("test_sessions", {})
+    state.setdefault("broadcast_drafts", {})
     return state
 
 
@@ -546,6 +550,20 @@ def get_required_env(name: str) -> str:
 def get_optional_env(name: str) -> str | None:
     value = os.getenv(name, "").strip()
     return value or None
+
+
+BROADCAST_AUDIENCES = {
+    "buyers": "Everyone who was ever approved",
+    "approved": "Approved with access still active",
+    "expired": "Access has expired",
+    "paid": "Confirmed at least one payment",
+    "all": "Everyone who ever used the bot",
+}
+
+BROADCAST_SEND_DELAY_SECONDS = 0.05
+BROADCAST_MAX_MESSAGE_LENGTH = 3500
+BROADCAST_PREVIEW_RECIPIENTS = 10
+BROADCAST_SKIPPED_STATUSES = {"banned", "trash"}
 
 
 def normalize_username(value: str) -> str:
@@ -616,6 +634,8 @@ def default_user_record() -> dict[str, Any]:
         "clarification_requested_at": None,
         "clarification_response": None,
         "internal_label": None,
+        "last_broadcast_at": None,
+        "broadcast_blocked_at": None,
     }
 
 
@@ -2335,6 +2355,7 @@ def format_admin_help() -> str:
         "/status <user_id>\n"
         "/expiring\n"
         "/notifyunverified\n"
+        "/broadcast <audience> <message>\n"
         "/syncsubs\n"
         "/testmode\n"
         "/testmodefull\n"
@@ -2389,6 +2410,163 @@ def format_pending_line(user_id: int, record: dict[str, Any]) -> str:
     if record.get("review_priority") != "normal":
         parts.append(priority_label(record))
     return " | ".join(parts)
+
+
+def get_broadcast_drafts(state: dict[str, Any]) -> dict[str, Any]:
+    return state.setdefault("broadcast_drafts", {})
+
+
+def broadcast_audience_matches(audience: str, record: dict[str, Any]) -> bool:
+    status = record.get("status")
+    if status in BROADCAST_SKIPPED_STATUSES:
+        return False
+    if audience == "all":
+        return True
+    if audience == "approved":
+        return is_access_active(record)
+    if audience == "expired":
+        return status == "expired"
+    if audience == "paid":
+        return record.get("payment_status") == "paid" or bool(record.get("payment_confirmed_at"))
+    if audience == "buyers":
+        return bool(record.get("approved_at")) or status in {"approved", "expired"}
+    return False
+
+
+def get_broadcast_recipients(state: dict[str, Any], audience: str) -> list[tuple[int, dict[str, Any]]]:
+    recipients: list[tuple[int, dict[str, Any]]] = []
+    for user_id_text, record in state.get("users", {}).items():
+        if is_sandbox_record(record):
+            continue
+        if not broadcast_audience_matches(audience, record):
+            continue
+        recipients.append((int(user_id_text), record))
+    recipients.sort(key=lambda item: item[1].get("approved_at") or item[1].get("queued_at") or "")
+    return recipients
+
+
+def build_broadcast_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("\u2705 Send broadcast", callback_data="adm:broadcast:send"),
+                InlineKeyboardButton("\u274C Cancel", callback_data="adm:broadcast:cancel"),
+            ]
+        ]
+    )
+
+
+def format_broadcast_usage(state: dict[str, Any]) -> str:
+    lines = [
+        "Broadcast",
+        "",
+        "Sends one message to every buyer in an audience, in their private chat with the bot.",
+        "",
+        "Usage:",
+        "/broadcast <audience> <message>",
+        "",
+        "Audiences:",
+    ]
+    for key, description in BROADCAST_AUDIENCES.items():
+        lines.append(f"{key} - {description} ({len(get_broadcast_recipients(state, key))})")
+    lines.extend(
+        [
+            "",
+            "Example:",
+            "/broadcast buyers The new group is open. Reply here and I will send you the invite link.",
+            "",
+            "You get a preview and a confirm button before anything is sent.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def format_broadcast_preview(
+    audience: str,
+    message: str,
+    recipients: list[tuple[int, dict[str, Any]]],
+) -> str:
+    lines = [
+        "Broadcast preview",
+        "",
+        f"Audience: {audience} - {BROADCAST_AUDIENCES.get(audience, 'Unknown')}",
+        f"Recipients: {count_line(len(recipients), 'person', 'people')}",
+        "",
+        "Message buyers will see:",
+        "",
+        message,
+        "",
+        "Going to:",
+    ]
+    for user_id, record in recipients[:BROADCAST_PREVIEW_RECIPIENTS]:
+        lines.append(f"{user_id} | {format_person_label(record)}")
+    remaining = len(recipients) - BROADCAST_PREVIEW_RECIPIENTS
+    if remaining > 0:
+        lines.append(f"...and {remaining} more.")
+    lines.extend(["", "Nothing is sent until you tap Send broadcast."])
+    return "\n".join(lines)
+
+
+def format_broadcast_summary(summary: dict[str, Any]) -> str:
+    return (
+        "Broadcast finished\n\n"
+        f"Audience: {summary['audience']}\n"
+        f"Matched: {count_line(int(summary['recipients']), 'person', 'people')}\n"
+        f"Sent: {summary['sent']}\n"
+        f"Blocked the bot: {summary['blocked']}\n"
+        f"Failed: {summary['failed']}"
+    )
+
+
+async def send_broadcast(
+    bot: Any,
+    state: dict[str, Any],
+    audience: str,
+    message: str,
+) -> dict[str, Any]:
+    recipients = get_broadcast_recipients(state, audience)
+    sent = 0
+    blocked = 0
+    failed = 0
+    stamp = to_iso(utc_now())
+
+    for user_id, record in recipients:
+        chat_id = get_buyer_chat_id(record, user_id)
+        try:
+            await bot.send_message(chat_id=chat_id, text=message)
+        except RetryAfter as exc:
+            await asyncio.sleep(float(getattr(exc, "retry_after", 5)) + 1)
+            try:
+                await bot.send_message(chat_id=chat_id, text=message)
+            except Forbidden:
+                record["broadcast_blocked_at"] = stamp
+                blocked += 1
+                continue
+            except Exception:
+                LOGGER.exception("Broadcast retry failed for user %s.", user_id)
+                failed += 1
+                continue
+        except Forbidden:
+            record["broadcast_blocked_at"] = stamp
+            blocked += 1
+            continue
+        except Exception:
+            LOGGER.exception("Broadcast failed for user %s.", user_id)
+            failed += 1
+            continue
+
+        record["last_broadcast_at"] = stamp
+        record["broadcast_blocked_at"] = None
+        sent += 1
+        await asyncio.sleep(BROADCAST_SEND_DELAY_SECONDS)
+
+    return {
+        "audience": audience,
+        "recipients": len(recipients),
+        "sent": sent,
+        "blocked": blocked,
+        "failed": failed,
+    }
 
 
 def get_queue_records(state: dict[str, Any], mode: str) -> list[tuple[int, dict[str, Any]]]:
@@ -4246,6 +4424,65 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await query.answer("Unverified users notified.")
             return
 
+        if adm_action == "broadcast":
+            if not callback_is_from_admin_surface(state, query):
+                await query.answer("Not allowed.", show_alert=True)
+                return
+
+            drafts = get_broadcast_drafts(state)
+            draft_key = str(query.from_user.id)
+
+            if adm_arg == "cancel":
+                drafts.pop(draft_key, None)
+                save_state(state)
+                if query.message is not None:
+                    await query.edit_message_text(
+                        "Broadcast cancelled. Nothing was sent.",
+                        reply_markup=build_admin_home_keyboard(),
+                    )
+                await query.answer("Broadcast cancelled.")
+                return
+
+            if adm_arg != "send":
+                await query.answer("Unknown broadcast action.", show_alert=True)
+                return
+
+            draft = drafts.pop(draft_key, None)
+            if draft is None:
+                await query.answer(
+                    "That broadcast draft is gone. Run /broadcast again.",
+                    show_alert=True,
+                )
+                return
+
+            save_state(state)
+            await query.answer("Sending.")
+            if query.message is not None:
+                await query.edit_message_text("Sending broadcast...")
+
+            summary = await send_broadcast(
+                context.bot,
+                state,
+                str(draft.get("audience") or ""),
+                str(draft.get("message") or ""),
+            )
+            save_state(state)
+            log_event(
+                "broadcast_sent",
+                trigger="button",
+                audience=summary["audience"],
+                recipients=summary["recipients"],
+                sent=summary["sent"],
+                blocked=summary["blocked"],
+                failed=summary["failed"],
+            )
+            await context.bot.send_message(
+                chat_id=admin_chat_id,
+                text=format_broadcast_summary(summary),
+                reply_markup=build_admin_home_keyboard(),
+            )
+            return
+
         await query.answer("Unknown admin action.", show_alert=True)
         return
 
@@ -4755,6 +4992,71 @@ async def notify_unverified_manual(update: Update, context: ContextTypes.DEFAULT
         f"Sent: {summary['notified']}\n"
         f"Failed: {summary['failed']}",
         reply_markup=build_admin_home_keyboard(),
+    )
+
+
+async def broadcast_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.effective_chat or not update.message:
+        return
+    if update.effective_chat.type != "private":
+        return
+
+    state, gate_message = get_admin_private_command_state(update)
+    if state is None:
+        if gate_message:
+            await update.message.reply_text(gate_message)
+        return
+
+    command_parts = (update.message.text or "").split(None, 1)
+    remainder = command_parts[1] if len(command_parts) > 1 else ""
+    audience_parts = remainder.split(None, 1)
+    audience = audience_parts[0].strip().lower() if audience_parts else ""
+    message = audience_parts[1].strip() if len(audience_parts) > 1 else ""
+
+    if audience not in BROADCAST_AUDIENCES:
+        await update.message.reply_text(
+            format_broadcast_usage(state),
+            reply_markup=build_admin_home_keyboard(),
+        )
+        return
+
+    if not message:
+        await update.message.reply_text(
+            "Add the message after the audience.\n\n"
+            f"/broadcast {audience} The new group is open. Reply here for the invite link."
+        )
+        return
+
+    if len(message) > BROADCAST_MAX_MESSAGE_LENGTH:
+        await update.message.reply_text(
+            f"That message is {len(message)} characters. "
+            f"Keep it under {BROADCAST_MAX_MESSAGE_LENGTH}."
+        )
+        return
+
+    recipients = get_broadcast_recipients(state, audience)
+    if not recipients:
+        await update.message.reply_text(
+            f"Nobody matches the {audience} audience right now.",
+            reply_markup=build_admin_home_keyboard(),
+        )
+        return
+
+    get_broadcast_drafts(state)[str(update.effective_user.id)] = {
+        "audience": audience,
+        "message": message,
+        "created_at": to_iso(utc_now()),
+    }
+    save_state(state)
+    log_event(
+        "broadcast_drafted",
+        audience=audience,
+        recipients=len(recipients),
+        characters=len(message),
+    )
+    await update.message.reply_text(
+        format_broadcast_preview(audience, message, recipients),
+        reply_markup=build_broadcast_confirm_keyboard(),
     )
 
 
@@ -5823,6 +6125,7 @@ def main() -> None:
     app.add_handler(CommandHandler("details", details_command))
     app.add_handler(CommandHandler("expiring", expiring))
     app.add_handler(CommandHandler("notifyunverified", notify_unverified_manual))
+    app.add_handler(CommandHandler("broadcast", broadcast_manual))
     app.add_handler(CommandHandler("syncsubs", sync_subs))
     app.add_handler(CommandHandler("testmode", testmode))
     app.add_handler(CommandHandler("testmodefull", testmodefull))

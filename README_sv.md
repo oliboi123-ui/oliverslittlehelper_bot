@@ -27,6 +27,7 @@ Gor detta i `@BotFather`:
 - `gatekeeper_bot.py` - huvudboten
 - `sync_onlyfans.py` - OFAuth-sync som fornyar eller expires access
 - `weekly_low_priority_review.py` - veckovis paminnelse om lagprioriterade leads
+- `list_users.py` - skriver ut kopare som finns sparade i `bot_state.json`
 - `requirements.txt` - Python-paket
 - `.env.example` - exempel pa miljo variabler
 - `PRIVACY_POLICY.md` - enkel policy som kan anvandas i OFAuth setup
@@ -54,7 +55,22 @@ OFAUTH_MAX_PAGES=5
 - `/renew <user_id>`
 - `/status <user_id>`
 - `/expiring`
+- `/broadcast <audience> <meddelande>`
 - `/syncsubs`
+
+## Broadcast
+
+`/broadcast` skickar ett meddelande till alla kopare i en grupp, i deras privata chatt med boten.
+
+Grupper: `buyers`, `approved`, `expired`, `paid`, `all`.
+
+```text
+/broadcast buyers Nya gruppen ar oppen. Svara har sa skickar jag inbjudan.
+```
+
+Du far en forhandsvisning med antal mottagare och sjalva texten. Inget skickas forran du trycker `Send broadcast`.
+
+En bot kan bara skicka DM till personer som redan har tryckt Start pa boten. Bot API har inget satt att lista medlemmar i en grupp. For att na ovriga: posta i gruppen och be dem skriva till boten.
 
 ## Railway setup
 
