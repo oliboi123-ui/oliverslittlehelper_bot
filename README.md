@@ -43,6 +43,12 @@ day. Extending reopens the topic. No new link is ever needed.
 `/revoke` is the harder version: access is cut and the bot stops relaying in
 both directions.
 
+`/removeuser` goes further and forgets them: their record, their topic mapping
+and the access code they redeemed are all deleted. It shows you what it found
+and waits for a button, and offers to delete their forum topic as well or leave
+the conversation in the group. Nothing is undoable afterwards, and the next
+message they send is treated as coming from a stranger with no code.
+
 ## Commands
 
 All admin commands only work in the registered admin chat.
@@ -54,7 +60,8 @@ All admin commands only work in the registered admin chat.
 | `/customers` | People who actually bought, and their status |
 | `/who <user_id>` | One customer's full details |
 | `/extend <user_id> [days]` | Add time, reopening a paused topic |
-| `/revoke <user_id>` | Cut access now |
+| `/revoke <user_id>` | Cut access now, keeping their record |
+| `/removeuser <user_id>` | Delete them from the bot entirely |
 | `/leads` | Imported people who never bought, with budget and request |
 | `/expiring` | Who lapses soon, with Extend/Cut buttons |
 | `/broadcast <audience> <message>` | Message every customer in an audience |

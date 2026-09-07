@@ -198,6 +198,7 @@ def empty_state() -> dict[str, Any]:
         "delete_permission_warned": False,
         "broadcast_drafts": {},
         "pending_v1_import": None,
+        "pending_removal": None,
     }
 
 
@@ -542,6 +543,60 @@ def format_v1_import_result(result: dict[str, int], plan: dict[str, Any]) -> str
             "with /newbot is a different one and reaches nobody until they start it.",
         ]
     )
+
+
+def find_user_traces(state: dict[str, Any], user_id: int) -> dict[str, Any]:
+    """Everything the state file holds about one person."""
+    record = state.get("users", {}).get(str(user_id))
+    topic_ids = [
+        topic_id
+        for topic_id, owner in get_topics(state).items()
+        if str(owner) == str(user_id)
+    ]
+    codes = [
+        code
+        for code, entry in state.get("codes", {}).items()
+        if isinstance(entry, dict) and str(entry.get("redeemed_by")) == str(user_id)
+    ]
+    return {"record": record, "topic_ids": topic_ids, "codes": codes}
+
+
+def build_removal_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("\U0001f5d1 Delete everything, topic included", callback_data=f"rm:all:{user_id}")],
+            [InlineKeyboardButton("\U0001f4c1 Delete record, keep the topic", callback_data=f"rm:record:{user_id}")],
+            [InlineKeyboardButton("\u274c Cancel", callback_data=f"rm:cancel:{user_id}")],
+        ]
+    )
+
+
+def format_removal_preview(user_id: int, traces: dict[str, Any]) -> str:
+    record = traces["record"]
+    lines = [
+        "Remove this person?",
+        "",
+        format_customer_details(user_id, record),
+        "",
+        "This would delete:",
+        "  Their customer record",
+    ]
+    if traces["topic_ids"]:
+        lines.append(f"  Their topic mapping ({len(traces['topic_ids'])})")
+    if traces["codes"]:
+        lines.append(f"  The access code they redeemed ({', '.join(traces['codes'])})")
+    lines.extend(
+        [
+            "",
+            "Deleting the topic removes its whole message history from the group.",
+            "Keeping it leaves the conversation there, unlinked from anyone.",
+            "",
+            "This cannot be undone. Nothing happens until you tap a button.",
+            "They keep whatever access they already have until you delete them,",
+            "and afterwards the bot treats them as a stranger with no code.",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def get_broadcast_drafts(state: dict[str, Any]) -> dict[str, Any]:
@@ -896,7 +951,8 @@ ADMIN_HELP = "\n".join(
         "/leads - imported people who never bought, with budget and request",
         "/who <user_id> - one customer's details",
         "/extend <user_id> [days] - add time",
-        "/revoke <user_id> - cut access now",
+        "/revoke <user_id> - cut access now, keeping their record",
+        "/removeuser <user_id> - delete them from the bot entirely",
         "/expiring - who lapses soon, with buttons",
         "/broadcast <audience> <message> - message every customer in an audience",
         "Send the old bot's bot_state.json here as a file to import its customers",
@@ -1638,6 +1694,132 @@ async def run_v1_import(
     await query.edit_message_text(format_v1_import_result(result, plan))
 
 
+async def removeuser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Delete every trace of one person from the state file."""
+    state = load_state()
+    if not is_admin_chat(state, update) or update.message is None or update.effective_user is None:
+        return
+
+    if not context.args or not context.args[0].lstrip("-").isdigit():
+        await update.message.reply_text(
+            "Usage: /removeuser <user_id>\n\n"
+            "Find the id with /customers, /leads, or /who."
+        )
+        return
+
+    user_id = int(context.args[0])
+    traces = find_user_traces(state, user_id)
+    if traces["record"] is None:
+        extra = ""
+        if traces["topic_ids"] or traces["codes"]:
+            extra = (
+                "\n\nThere is leftover data under that id "
+                f"(topics: {len(traces['topic_ids'])}, codes: {len(traces['codes'])}). "
+                "Run the command again to clear it."
+            )
+            state["pending_removal"] = {
+                "user_id": user_id,
+                "admin_user_id": update.effective_user.id,
+                "requested_at": to_iso(utc_now()),
+            }
+            save_state(state)
+            await update.message.reply_text(
+                f"No record for {user_id}.{extra}",
+                reply_markup=build_removal_keyboard(user_id),
+            )
+            return
+        await update.message.reply_text(f"Nothing stored under {user_id}.")
+        return
+
+    state["pending_removal"] = {
+        "user_id": user_id,
+        "admin_user_id": update.effective_user.id,
+        "requested_at": to_iso(utc_now()),
+    }
+    save_state(state)
+    await update.message.reply_text(
+        format_removal_preview(user_id, traces),
+        reply_markup=build_removal_keyboard(user_id),
+    )
+
+
+async def run_removal(
+    query: Any,
+    context: ContextTypes.DEFAULT_TYPE,
+    state: dict[str, Any],
+    user_id: int,
+    *,
+    delete_topic: bool,
+) -> None:
+    pending = state.get("pending_removal") or {}
+    if int(pending.get("user_id") or 0) != user_id:
+        await query.answer("That removal is no longer pending. Run /removeuser again.", show_alert=True)
+        return
+
+    traces = find_user_traces(state, user_id)
+    record = traces["record"]
+    label = person_label(record) if record else str(user_id)
+
+    removed_topics = 0
+    if delete_topic:
+        relay_group_id = get_relay_group_id()
+        topic_id = record.get("topic_id") if record else None
+        if relay_group_id is not None and isinstance(topic_id, int):
+            try:
+                await context.bot.delete_forum_topic(
+                    chat_id=relay_group_id, message_thread_id=topic_id
+                )
+                removed_topics = 1
+            except Exception:
+                LOGGER.exception("Could not delete topic %s for user %s.", topic_id, user_id)
+
+    state.get("users", {}).pop(str(user_id), None)
+
+    topics = get_topics(state)
+    for topic_id_text in traces["topic_ids"]:
+        topics.pop(topic_id_text, None)
+
+    codes = state.get("codes", {})
+    for code in traces["codes"]:
+        codes.pop(code, None)
+
+    state["pending_removal"] = None
+    save_state(state)
+
+    LOGGER.info(
+        "Removed user %s (record=%s, topics=%s, codes=%s, topic_deleted=%s).",
+        user_id,
+        record is not None,
+        len(traces["topic_ids"]),
+        len(traces["codes"]),
+        bool(removed_topics),
+    )
+
+    lines = [
+        f"{label} removed.",
+        "",
+        f"Record deleted: {'yes' if record is not None else 'none was stored'}",
+        f"Topic mappings cleared: {len(traces['topic_ids'])}",
+        f"Access codes deleted: {len(traces['codes'])}",
+    ]
+    if delete_topic:
+        lines.append(
+            "Forum topic deleted: yes"
+            if removed_topics
+            else "Forum topic deleted: no (none linked, or the group refused)"
+        )
+    else:
+        lines.append("Forum topic: left in place")
+    lines.extend(
+        [
+            "",
+            "If they message the bot again they are treated as a stranger with no code.",
+        ]
+    )
+    await query.answer("Removed.")
+    await query.edit_message_text("\n".join(lines))
+
+
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = load_state()
     if not is_admin_chat(state, update) or update.message is None or update.effective_user is None:
@@ -1726,6 +1908,34 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     data = query.data or ""
+
+    if data.startswith("rm:"):
+        parts = data.split(":")
+        if len(parts) != 3 or not parts[2].lstrip("-").isdigit():
+            await query.answer("That removal button is outdated.", show_alert=True)
+            return
+        removal_action = parts[1]
+        target_user_id = int(parts[2])
+
+        if removal_action == "cancel":
+            state["pending_removal"] = None
+            save_state(state)
+            await query.edit_message_text("Removal cancelled. Nothing was deleted.")
+            await query.answer("Cancelled.")
+            return
+
+        if removal_action not in {"all", "record"}:
+            await query.answer("Unknown removal action.", show_alert=True)
+            return
+
+        await run_removal(
+            query,
+            context,
+            state,
+            target_user_id,
+            delete_topic=removal_action == "all",
+        )
+        return
 
     if data.startswith("v1imp:"):
         import_action = data.partition(":")[2]
@@ -1884,6 +2094,7 @@ def main() -> None:
     app.add_handler(CommandHandler("who", who))
     app.add_handler(CommandHandler("extend", extend))
     app.add_handler(CommandHandler("revoke", revoke))
+    app.add_handler(CommandHandler("removeuser", removeuser))
     app.add_handler(CommandHandler("expiring", expiring))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CallbackQueryHandler(button_click))
